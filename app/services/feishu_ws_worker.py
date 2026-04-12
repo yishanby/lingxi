@@ -12,6 +12,8 @@ import logging
 import sys
 import os
 import time
+import threading
+from collections import OrderedDict
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -22,6 +24,25 @@ from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 from lark_oapi.ws import Client as WsClient
 
 from app.config import settings
+
+# ── Event deduplication ──────────────────────────────────────────────────────
+_seen_events: OrderedDict[str, float] = OrderedDict()
+_seen_events_lock = threading.Lock()
+_MAX_SEEN = 500
+
+
+def _is_duplicate_event(event_id: str) -> bool:
+    """Return True if we've already processed this event_id."""
+    if not event_id:
+        return False
+    with _seen_events_lock:
+        if event_id in _seen_events:
+            return True
+        _seen_events[event_id] = time.time()
+        # Prune old entries
+        while len(_seen_events) > _MAX_SEEN:
+            _seen_events.popitem(last=False)
+        return False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -174,6 +195,12 @@ def _on_bot_added(data) -> None:
 
 def _on_message(data) -> None:
     try:
+        # Deduplicate events
+        event_id = getattr(data.header, 'event_id', '') if hasattr(data, 'header') else ''
+        if _is_duplicate_event(event_id):
+            logger.debug(f"Duplicate event {event_id}, skipping")
+            return
+
         msg = data.event.message
         sender = data.event.sender
         chat_id = msg.chat_id
@@ -200,7 +227,6 @@ def _on_message(data) -> None:
             return
 
         # Remove @bot mentions (Feishu uses @_user_N placeholders)
-        # Also handle mentions list from the event
         mentions = getattr(msg, 'mentions', None) or []
         for mention in mentions:
             key = getattr(mention, 'key', '')
@@ -210,8 +236,33 @@ def _on_message(data) -> None:
         if not text:
             return
 
+        # Ignore messages older than 30 seconds (stale events from reconnection)
+        msg_create_time = getattr(msg, 'create_time', '') or ''
+        if msg_create_time:
+            try:
+                msg_ts = int(msg_create_time) / 1000  # ms -> s
+                age = time.time() - msg_ts
+                if age > 30:
+                    logger.debug(f"Ignoring stale message (age={age:.0f}s) in {chat_id}")
+                    return
+            except (ValueError, TypeError):
+                pass
+
+        # Deduplicate by message_id too
+        msg_id = getattr(msg, 'message_id', '') or ''
+        if msg_id and _is_duplicate_event(f"msg:{msg_id}"):
+            logger.debug(f"Duplicate message_id {msg_id}, skipping")
+            return
+
         logger.info(f"Message from {sender_id} in {chat_id}: {text[:50]}")
-        _handle_message(chat_id, sender_id, text)
+
+        # Run in a thread so we don't block the WS event loop (LLM calls take 10-30s)
+        t = threading.Thread(
+            target=_handle_message,
+            args=(chat_id, sender_id, text),
+            daemon=True,
+        )
+        t.start()
     except Exception:
         logger.exception("Error in message handler")
 
