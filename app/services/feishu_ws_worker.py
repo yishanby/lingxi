@@ -69,9 +69,8 @@ def _escape(text: str) -> str:
 
 
 def send_text(chat_id: str, text: str):
-    url = f"{_FEISHU_BASE}/im/v1/messages"
+    url = f"{_FEISHU_BASE}/im/v1/messages?receive_id_type=chat_id"
     body = {
-        "receive_id_type": "chat_id",
         "receive_id": chat_id,
         "msg_type": "text",
         "content": f'{{"text":"{_escape(text)}"}}',
@@ -85,9 +84,8 @@ def send_text(chat_id: str, text: str):
 
 
 def send_card(chat_id: str, card: dict):
-    url = f"{_FEISHU_BASE}/im/v1/messages"
+    url = f"{_FEISHU_BASE}/im/v1/messages?receive_id_type=chat_id"
     body = {
-        "receive_id_type": "chat_id",
         "receive_id": chat_id,
         "msg_type": "interactive",
         "content": json.dumps(card, ensure_ascii=False),
@@ -206,6 +204,17 @@ def _on_message(data) -> None:
         _handle_message(chat_id, sender_id, text)
     except Exception:
         logger.exception("Error in message handler")
+
+
+def _on_p2p_entered(data):
+    """User opened the bot's 1-on-1 chat window."""
+    try:
+        chat_id = data.event.chat_id
+        logger.info(f"User entered P2P chat: {chat_id}")
+        # Send character selection card in P2P chat too
+        _handle_bot_added(chat_id)
+    except Exception:
+        logger.exception("Error in p2p_entered handler")
 
 
 def _on_card_action(data):
@@ -386,6 +395,7 @@ def main():
             settings.feishu_verification_token or "",
         )
         .register_p2_im_chat_member_bot_added_v1(_on_bot_added)
+        .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(_on_p2p_entered)
         .register_p2_im_message_receive_v1(_on_message)
         .register_p2_card_action_trigger(_on_card_action)
         .build()
