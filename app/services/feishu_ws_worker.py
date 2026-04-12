@@ -1,17 +1,17 @@
 """Feishu WebSocket long-connection — runs as a separate process.
 
 Started by main.py on startup. Communicates with the FastAPI app via its REST API.
-This avoids event-loop conflicts between lark-oapi SDK and uvicorn.
+All handlers are SYNCHRONOUS — SDK callbacks run inside the WS event loop,
+so we use synchronous httpx/requests calls everywhere.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import datetime
 import sys
 import os
+import time
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -31,25 +31,23 @@ logger = logging.getLogger("feishu_ws_worker")
 
 API_BASE = f"http://127.0.0.1:{settings.app_port}"
 
-
-# ── Feishu REST API helpers (reuse from feishu_client) ───────────────────────
+# ── Feishu REST API helpers (SYNCHRONOUS) ────────────────────────────────────
 
 _FEISHU_BASE = "https://open.feishu.cn/open-apis"
 _tenant_token: str = ""
 _tenant_token_expires: float = 0.0
 
 
-async def get_tenant_access_token() -> str:
+def get_tenant_access_token() -> str:
     global _tenant_token, _tenant_token_expires
-    import time
 
     if _tenant_token and time.time() < _tenant_token_expires - 60:
         return _tenant_token
 
     url = f"{_FEISHU_BASE}/auth/v3/tenant_access_token/internal"
     body = {"app_id": settings.feishu_app_id, "app_secret": settings.feishu_app_secret}
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(url, json=body)
+    with httpx.Client(timeout=10) as client:
+        resp = client.post(url, json=body)
         resp.raise_for_status()
         data = resp.json()
 
@@ -61,8 +59,8 @@ async def get_tenant_access_token() -> str:
     return _tenant_token
 
 
-async def _feishu_headers() -> dict[str, str]:
-    token = await get_tenant_access_token()
+def _feishu_headers() -> dict[str, str]:
+    token = get_tenant_access_token()
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
@@ -70,7 +68,7 @@ def _escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-async def send_text(chat_id: str, text: str):
+def send_text(chat_id: str, text: str):
     url = f"{_FEISHU_BASE}/im/v1/messages"
     body = {
         "receive_id_type": "chat_id",
@@ -78,12 +76,15 @@ async def send_text(chat_id: str, text: str):
         "msg_type": "text",
         "content": f'{{"text":"{_escape(text)}"}}',
     }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, headers=await _feishu_headers(), json=body)
-        return resp.json()
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(url, headers=_feishu_headers(), json=body)
+        r = resp.json()
+        if r.get("code") != 0:
+            logger.error(f"send_text failed: {r}")
+        return r
 
 
-async def send_card(chat_id: str, card: dict):
+def send_card(chat_id: str, card: dict):
     url = f"{_FEISHU_BASE}/im/v1/messages"
     body = {
         "receive_id_type": "chat_id",
@@ -91,9 +92,12 @@ async def send_card(chat_id: str, card: dict):
         "msg_type": "interactive",
         "content": json.dumps(card, ensure_ascii=False),
     }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, headers=await _feishu_headers(), json=body)
-        return resp.json()
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(url, headers=_feishu_headers(), json=body)
+        r = resp.json()
+        if r.get("code") != 0:
+            logger.error(f"send_card failed: {r}")
+        return r
 
 
 def build_character_selection_card(characters: list[dict]) -> dict:
@@ -140,30 +144,32 @@ def build_reply_card(char_name: str, content: str) -> dict:
     }
 
 
-# ── Internal API calls (to our own FastAPI backend) ──────────────────────────
+# ── Internal API calls (SYNCHRONOUS, to our own FastAPI backend) ─────────────
 
-async def api_get(path: str):
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(f"{API_BASE}{path}")
+def api_get(path: str):
+    with httpx.Client(timeout=30) as client:
+        resp = client.get(f"{API_BASE}{path}")
         resp.raise_for_status()
         return resp.json()
 
 
-async def api_post(path: str, data: dict):
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(f"{API_BASE}{path}", json=data)
+def api_post(path: str, data: dict):
+    with httpx.Client(timeout=120) as client:
+        resp = client.post(f"{API_BASE}{path}", json=data)
         resp.raise_for_status()
         return resp.json()
 
 
-# ── Event Handlers ───────────────────────────────────────────────────────────
+# ── Event Handlers (ALL SYNCHRONOUS) ─────────────────────────────────────────
 
 def _on_bot_added(data) -> None:
     try:
         chat_id = data.event.chat_id
         if not chat_id:
+            logger.warning("bot_added event missing chat_id")
             return
-        asyncio.get_event_loop().run_until_complete(_handle_bot_added(chat_id))
+        logger.info(f"Bot added to chat: {chat_id}")
+        _handle_bot_added(chat_id)
     except Exception:
         logger.exception("Error in bot_added handler")
 
@@ -177,6 +183,7 @@ def _on_message(data) -> None:
         sender_id = sender.sender_id.open_id if sender and sender.sender_id else ""
 
         if msg_type != "text":
+            logger.debug(f"Ignoring non-text message type: {msg_type}")
             return
 
         content_str = msg.content or "{}"
@@ -195,9 +202,8 @@ def _on_message(data) -> None:
             if not text:
                 return
 
-        asyncio.get_event_loop().run_until_complete(
-            _handle_message(chat_id, sender_id, text)
-        )
+        logger.info(f"Message from {sender_id} in {chat_id}: {text[:50]}")
+        _handle_message(chat_id, sender_id, text)
     except Exception:
         logger.exception("Error in message handler")
 
@@ -210,40 +216,41 @@ def _on_card_action(data):
         if hasattr(data.event, "context") and data.event.context:
             open_chat_id = getattr(data.event.context, "open_chat_id", "")
 
+        logger.info(f"Card action: option={option}, chat={open_chat_id}")
+
         if option and open_chat_id:
-            asyncio.get_event_loop().run_until_complete(
-                _handle_card_action(open_chat_id, option)
-            )
+            _handle_card_action(open_chat_id, option)
         return None
     except Exception:
         logger.exception("Error in card_action handler")
         return None
 
 
-# ── Async business logic ────────────────────────────────────────────────────
+# ── Business logic (ALL SYNCHRONOUS) ─────────────────────────────────────────
 
-async def _handle_bot_added(chat_id: str) -> None:
+def _handle_bot_added(chat_id: str) -> None:
     try:
-        characters = await api_get("/api/characters")
+        characters = api_get("/api/characters")
         if not characters:
-            await send_text(chat_id, "还没有角色卡。请先在 Web UI 中创建或导入角色！")
+            send_text(chat_id, "还没有角色卡。请先在 Web UI 中创建或导入角色！")
             return
         char_list = [{"id": c["id"], "name": c["name"]} for c in characters]
         card = build_character_selection_card(char_list)
-        await send_card(chat_id, card)
+        send_card(chat_id, card)
+        logger.info(f"Sent character selection card to {chat_id}")
     except Exception:
         logger.exception("handle_bot_added failed")
 
 
-async def _handle_message(chat_id: str, sender_id: str, text: str) -> None:
+def _handle_message(chat_id: str, sender_id: str, text: str) -> None:
     # Commands
     if text.startswith("/"):
-        await _handle_command(text, chat_id, sender_id)
+        _handle_command(text, chat_id, sender_id)
         return
 
     try:
         # Find active session for this chat
-        sessions = await api_get("/api/sessions")
+        sessions = api_get("/api/sessions")
         session = None
         for s in sessions:
             if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
@@ -251,11 +258,11 @@ async def _handle_message(chat_id: str, sender_id: str, text: str) -> None:
                 break
 
         if not session:
-            await send_text(chat_id, "当前没有活跃会话。请使用 /switch 选择角色。")
+            send_text(chat_id, "当前没有活跃会话。请使用 /switch 选择角色，或将机器人拉进新群。")
             return
 
         # Send message through our API
-        result = await api_post(
+        result = api_post(
             f"/api/sessions/{session['id']}/message",
             {"content": text},
         )
@@ -265,61 +272,63 @@ async def _handle_message(chat_id: str, sender_id: str, text: str) -> None:
         if messages:
             last_msg = messages[-1]
             if last_msg.get("role") == "assistant":
-                # Get character name
-                characters = await api_get("/api/characters")
+                # Look up character name
                 char_name = "角色"
-                for c in characters:
-                    if c["id"] == session.get("character_id"):
-                        char_name = c["name"]
-                        break
+                try:
+                    characters = api_get("/api/characters")
+                    for c in characters:
+                        if c["id"] == session.get("character_id"):
+                            char_name = c["name"]
+                            break
+                except Exception:
+                    pass
                 card = build_reply_card(char_name, last_msg["content"])
-                await send_card(chat_id, card)
+                send_card(chat_id, card)
+                logger.info(f"Sent reply from {char_name} in {chat_id}")
 
     except Exception as exc:
         logger.exception("handle_message failed")
-        await send_text(chat_id, f"处理消息出错: {exc}")
+        send_text(chat_id, f"处理消息出错: {exc}")
 
 
-async def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
+def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
     cmd = text.split()[0].lower()
 
     if cmd == "/reset":
-        sessions = await api_get("/api/sessions")
+        sessions = api_get("/api/sessions")
         for s in sessions:
             if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
-                # Reset via direct API call — we need a reset endpoint or delete + recreate
-                # For now just notify
-                await send_text(chat_id, "会话已重置。（功能完善中）")
+                send_text(chat_id, "会话已重置。（功能完善中）")
                 return
-        await send_text(chat_id, "没有活跃会话。")
+        send_text(chat_id, "没有活跃会话。")
 
     elif cmd == "/switch":
-        characters = await api_get("/api/characters")
+        characters = api_get("/api/characters")
         if characters:
             char_list = [{"id": c["id"], "name": c["name"]} for c in characters]
             card = build_character_selection_card(char_list)
-            await send_card(chat_id, card)
+            send_card(chat_id, card)
         else:
-            await send_text(chat_id, "没有可用角色。")
+            send_text(chat_id, "没有可用角色。")
 
     elif cmd == "/info":
-        sessions = await api_get("/api/sessions")
+        sessions = api_get("/api/sessions")
         for s in sessions:
             if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
                 msg_count = len(s.get("messages", []))
                 user = s.get("user_name", "用户")
-                await send_text(
+                send_text(
                     chat_id,
                     f"角色ID: {s.get('character_id')}\n主角: {user}\n消息数: {msg_count}",
                 )
                 return
-        await send_text(chat_id, "没有活跃会话。")
+        send_text(chat_id, "没有活跃会话。")
 
     else:
-        await send_text(chat_id, "可用命令: /reset /switch /info")
+        send_text(chat_id, "可用命令: /reset /switch /info")
 
 
-async def _handle_card_action(chat_id: str, option: str) -> None:
+def _handle_card_action(chat_id: str, option: str) -> None:
     try:
         char_id = int(option)
     except (ValueError, TypeError):
@@ -327,7 +336,7 @@ async def _handle_card_action(chat_id: str, option: str) -> None:
 
     try:
         # Create session via API
-        result = await api_post(
+        result = api_post(
             "/api/sessions",
             {
                 "character_id": char_id,
@@ -336,12 +345,10 @@ async def _handle_card_action(chat_id: str, option: str) -> None:
             },
         )
 
-        # If session has messages (first_message), send as card
-        messages = result.get("messages", [])
-        char_name = f"角色#{char_id}"
         # Look up character name
+        char_name = f"角色#{char_id}"
         try:
-            characters = await api_get("/api/characters")
+            characters = api_get("/api/characters")
             for c in characters:
                 if c["id"] == char_id:
                     char_name = c["name"]
@@ -349,14 +356,18 @@ async def _handle_card_action(chat_id: str, option: str) -> None:
         except Exception:
             pass
 
+        # If session has messages (first_message), send as card
+        messages = result.get("messages", [])
         if messages:
             card = build_reply_card(char_name, messages[0]["content"])
-            await send_card(chat_id, card)
+            send_card(chat_id, card)
         else:
-            await send_text(chat_id, f"已开始与 {char_name} 的对话！发送消息开始吧。")
+            send_text(chat_id, f"已开始与 {char_name} 的对话！发送消息开始吧。")
+
+        logger.info(f"Session created for {char_name} in {chat_id}")
     except Exception:
         logger.exception("handle_card_action failed")
-        await send_text(chat_id, "创建会话失败。")
+        send_text(chat_id, "创建会话失败。")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -367,6 +378,7 @@ def main():
         sys.exit(1)
 
     logger.info(f"🔌 Connecting to Feishu as app {settings.feishu_app_id}...")
+    logger.info(f"📡 Backend API at {API_BASE}")
 
     event_handler = (
         EventDispatcherHandler.builder(
