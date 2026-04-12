@@ -405,7 +405,7 @@ def main():
         app_id=settings.feishu_app_id,
         app_secret=settings.feishu_app_secret,
         event_handler=event_handler,
-        log_level=lark.LogLevel.INFO,
+        log_level=lark.LogLevel.DEBUG,
         auto_reconnect=True,
     )
 
