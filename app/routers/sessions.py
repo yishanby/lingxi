@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.tables import Backend, Character, Session, WorldBook
+from app.models.tables import Backend, Character, Persona, Session, WorldBook
 from app.schemas.api import (
     MessageItem,
     SessionCreate,
@@ -33,6 +33,7 @@ def _row_to_out(s: Session) -> SessionOut:
         worldbook_ids=json.loads(s.worldbook_ids) if s.worldbook_ids else [],
         feishu_chat_id=s.feishu_chat_id,
         user_id=s.user_id,
+        persona_id=s.persona_id,
         user_name=s.user_name or "用户",
         user_persona=s.user_persona or "",
         messages=[MessageItem(**m) for m in (json.loads(s.messages) if s.messages else [])],
@@ -46,10 +47,22 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
     char = await db.get(Character, body.character_id)
     if not char:
         raise HTTPException(404, "Character not found")
+
+    # Resolve persona: if persona_id is set, use it; otherwise use inline fields
+    user_name = body.user_name or "用户"
+    user_persona = body.user_persona or ""
+    persona_id = body.persona_id
+    if persona_id:
+        persona = await db.get(Persona, persona_id)
+        if not persona:
+            raise HTTPException(404, "Persona not found")
+        user_name = persona.name
+        user_persona = persona.description
+
     # Prepare initial messages with first_message if available
     initial_messages = []
     if char.first_message:
-        first_msg = char.first_message.replace("{{user}}", body.user_name or "用户").replace("{{char}}", char.name)
+        first_msg = char.first_message.replace("{{user}}", user_name).replace("{{char}}", char.name)
         now = datetime.datetime.utcnow().isoformat()
         initial_messages.append({"role": "assistant", "content": first_msg, "timestamp": now})
 
@@ -65,8 +78,9 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
         worldbook_ids=json.dumps(wb_ids),
         feishu_chat_id=body.feishu_chat_id,
         user_id=body.user_id,
-        user_name=body.user_name or "用户",
-        user_persona=body.user_persona or "",
+        persona_id=persona_id,
+        user_name=user_name,
+        user_persona=user_persona,
         messages=json.dumps(initial_messages, ensure_ascii=False),
         status="active",
     )

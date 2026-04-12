@@ -523,6 +523,9 @@ th{color:var(--text-tertiary);font-weight:500;font-size:.7rem;text-transform:upp
     <button :class="{active:page==='backends'}" @click="page='backends'">
       <span class="nav-icon">&#9881;</span>LLM Backends
     </button>
+    <button :class="{active:page==='personas'}" @click="page='personas'">
+      <span class="nav-icon">&#128100;</span>Personas
+    </button>
     <button :class="{active:page==='sessions'}" @click="page='sessions'">
       <span class="nav-icon">&#9993;</span>Sessions
     </button>
@@ -769,6 +772,67 @@ th{color:var(--text-tertiary);font-weight:500;font-size:.7rem;text-transform:upp
 </section>
 
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- PERSONAS PAGE                                                        -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section x-show="page==='personas'" x-cloak>
+  <div class="page-header">
+    <div>
+      <div class="page-title">主角 Personas</div>
+      <div class="page-subtitle">管理你的角色人设，创建 Session 时可直接选择</div>
+    </div>
+    <button class="btn btn-primary" @click="personaModal=true;editPersona={name:'',description:'',avatar:null};editPersonaId=null">
+      <span style="font-size:1.1rem">+</span> 新建主角
+    </button>
+  </div>
+
+  <div x-show="personas.length===0" class="empty-state">
+    <div class="empty-icon">&#128100;</div>
+    <div class="empty-title">还没有主角</div>
+    <div class="empty-desc">创建一个主角角色来开始你的 RP 之旅。</div>
+  </div>
+
+  <div class="grid-3">
+    <template x-for="p in personas" :key="p.id">
+      <div class="char-card" @click="editPersonaId=p.id;editPersona={name:p.name,description:p.description,avatar:p.avatar};personaModal=true">
+        <div class="char-card-inner">
+          <div class="char-card-head">
+            <div class="avatar-placeholder" x-text="p.name.charAt(0).toUpperCase()"></div>
+            <div>
+              <div class="char-card-name" x-text="p.name"></div>
+              <div class="char-card-meta" x-text="p.description?p.description.substring(0,60)+'...':'无描述'"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+  </div>
+</section>
+
+<!-- Persona Edit Modal -->
+<template x-if="personaModal">
+  <div class="modal-overlay" @click.self="personaModal=false">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title" x-text="editPersonaId?'编辑主角':'新建主角'"></div>
+        <button class="modal-close" @click="personaModal=false">&#10005;</button>
+      </div>
+      <div class="form-group"><label class="form-label">名称</label>
+        <input type="text" x-model="editPersona.name" placeholder="例如：李天赋、林逸风...">
+      </div>
+      <div class="form-group"><label class="form-label">角色描述 / 人设</label>
+        <textarea x-model="editPersona.description" rows="8" placeholder="描述背景、性格、外貌、技能等..."></textarea>
+      </div>
+      <div class="modal-actions">
+        <template x-if="editPersonaId">
+          <button class="btn btn-danger" @click="deletePersona(editPersonaId)">删除</button>
+        </template>
+        <button class="btn btn-ghost" @click="personaModal=false">取消</button>
+        <button class="btn btn-primary" @click="savePersona()" x-text="editPersonaId?'保存':'创建'"></button>
+      </div>
+    </div>
+  </div>
+</template>
+
 <!-- SESSIONS PAGE                                                         -->
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <section x-show="page==='sessions'" x-cloak>
@@ -825,12 +889,24 @@ th{color:var(--text-tertiary);font-weight:500;font-size:.7rem;text-transform:upp
             </template>
           </select>
         </div>
-        <div class="form-group"><label class="form-label">主角名称 (Your Character Name)</label>
-          <input type="text" x-model="sessionCreate.user_name" placeholder="例如：李天赋、林逸风...">
+        <div class="form-group"><label class="form-label">主角 (Persona)</label>
+          <select x-model.number="sessionCreate.persona_id">
+            <option value="">不选择 / 手动填写</option>
+            <template x-for="p in personas" :key="p.id">
+              <option :value="p.id" x-text="p.name"></option>
+            </template>
+          </select>
         </div>
-        <div class="form-group"><label class="form-label">主角设定 (Your Character Persona)</label>
-          <textarea x-model="sessionCreate.user_persona" rows="3" placeholder="描述你的角色背景、性格、外貌等..."></textarea>
-        </div>
+        <template x-if="!sessionCreate.persona_id">
+          <div>
+            <div class="form-group"><label class="form-label">主角名称</label>
+              <input type="text" x-model="sessionCreate.user_name" placeholder="例如：李天赋、林逸风...">
+            </div>
+            <div class="form-group"><label class="form-label">主角设定</label>
+              <textarea x-model="sessionCreate.user_persona" rows="3" placeholder="描述你的角色背景、性格、外貌等..."></textarea>
+            </div>
+          </div>
+        </template>
         <div class="modal-actions">
           <button class="btn btn-ghost" @click="sessionModal=false">Cancel</button>
           <button class="btn btn-primary" @click="createSession()">Start Session</button>
@@ -910,10 +986,16 @@ function app() {
     backendModal: false,
     backendEdit: {},
 
+    // Personas
+    personas: [],
+    personaModal: false,
+    editPersona: { name: '', description: '', avatar: null },
+    editPersonaId: null,
+
     // Sessions
     sessions: [],
     sessionModal: false,
-    sessionCreate: { character_id: '', user_name: '', user_persona: '' },
+    sessionCreate: { character_id: '', persona_id: '', user_name: '', user_persona: '' },
     chatModal: false,
     chatSession: null,
     chatInput: '',
@@ -924,6 +1006,7 @@ function app() {
         this.loadCharacters(),
         this.loadWorldbooks(),
         this.loadBackends(),
+        this.loadPersonas(),
         this.loadSessions(),
       ]);
     },
@@ -1094,6 +1177,33 @@ function app() {
       this.backendModal = false;
       this.toast('Backend deleted');
       await this.loadBackends();
+    },
+
+    // ── Personas ─────────────────────────────────────────────────────
+    async loadPersonas() {
+      this.personas = await this.api('/api/personas').catch(() => []);
+    },
+
+    async savePersona() {
+      const data = { name: this.editPersona.name, description: this.editPersona.description, avatar: this.editPersona.avatar };
+      if (!data.name) { this.toast('请输入名称', 'error'); return; }
+      if (this.editPersonaId) {
+        await this.api(`/api/personas/${this.editPersonaId}`, { method: 'PATCH', body: JSON.stringify(data) });
+        this.toast('主角已更新');
+      } else {
+        await this.api('/api/personas', { method: 'POST', body: JSON.stringify(data) });
+        this.toast('主角已创建');
+      }
+      this.personaModal = false;
+      await this.loadPersonas();
+    },
+
+    async deletePersona(id) {
+      if (!confirm('删除这个主角？')) return;
+      await this.api(`/api/personas/${id}`, { method: 'DELETE' });
+      this.personaModal = false;
+      this.toast('主角已删除');
+      await this.loadPersonas();
     },
 
     // ── Sessions ──────────────────────────────────────────────────────

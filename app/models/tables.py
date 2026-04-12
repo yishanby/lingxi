@@ -70,6 +70,7 @@ class Session(Base):
     worldbook_ids: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of ints
     feishu_chat_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True, index=True)
     user_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    persona_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("personas.id"), nullable=True)
     user_name: Mapped[str] = mapped_column(String(256), default="用户")  # protagonist name
     user_persona: Mapped[str] = mapped_column(Text, default="")  # protagonist description
     messages: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of message dicts
@@ -79,6 +80,7 @@ class Session(Base):
     )
 
     character: Mapped[Character] = relationship(back_populates="sessions")
+    persona: Mapped[Optional["Persona"]] = relationship()
 
 
 class Backend(Base):
@@ -91,6 +93,21 @@ class Backend(Base):
     model: Mapped[str] = mapped_column(String(256), default="")
     base_url: Mapped[str] = mapped_column(Text, default="")
     params: Mapped[str] = mapped_column(Text, default="{}")  # JSON dict
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class Persona(Base):
+    __tablename__ = "personas"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    avatar: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    description: Mapped[str] = mapped_column(Text, default="")  # full persona text
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now()
     )

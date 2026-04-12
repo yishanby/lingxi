@@ -95,8 +95,9 @@ class SessionCreate(BaseModel):
     worldbook_ids: list[int] = []
     feishu_chat_id: Optional[str] = None
     user_id: Optional[str] = None
-    user_name: str = "用户"  # protagonist name
-    user_persona: str = ""  # protagonist description/backstory
+    persona_id: Optional[int] = None  # select a saved persona
+    user_name: str = "用户"  # protagonist name (overridden by persona if set)
+    user_persona: str = ""  # protagonist description (overridden by persona if set)
 
 
 class SessionOut(BaseModel):
@@ -105,6 +106,7 @@ class SessionOut(BaseModel):
     worldbook_ids: list[int]
     feishu_chat_id: Optional[str]
     user_id: Optional[str]
+    persona_id: Optional[int]
     user_name: str
     user_persona: str
     messages: list[MessageItem]
@@ -149,5 +151,30 @@ class BackendOut(BaseModel):
     created_at: datetime.datetime
     updated_at: datetime.datetime
     # api_key intentionally excluded from output
+
+    model_config = {"from_attributes": True}
+
+
+# ── Persona ────────────────────────────────────────────────────────────────
+
+class PersonaCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=256)
+    avatar: Optional[str] = None
+    description: str = ""
+
+
+class PersonaUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=256)
+    avatar: Optional[str] = None
+    description: Optional[str] = None
+
+
+class PersonaOut(BaseModel):
+    id: int
+    name: str
+    avatar: Optional[str] = None
+    description: str
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
 
     model_config = {"from_attributes": True}

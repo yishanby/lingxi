@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import engine
 from app.models.tables import Base
-from app.routers import backends, characters, feishu, sessions, worldbooks
+from app.routers import backends, characters, feishu, personas, sessions, worldbooks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +43,7 @@ app = FastAPI(
 # ── Routers ──────────────────────────────────────────────────────────────────
 app.include_router(characters.router)
 app.include_router(worldbooks.router)
+app.include_router(personas.router)
 app.include_router(sessions.router)
 app.include_router(backends.router)
 app.include_router(feishu.router)
