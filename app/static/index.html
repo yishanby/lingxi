@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SillyTavern-Feishu Bridge</title>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
+<style>
+/* ── Reset & base ─────────────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f0f14;--bg2:#1a1a24;--bg3:#24243a;--border:#2e2e4a;
+  --text:#e0e0f0;--text2:#a0a0c0;--accent:#7c5cfc;--accent2:#9d7fff;
+  --danger:#ff4466;--success:#44cc88;--warn:#ffaa33;
+  --radius:8px;--shadow:0 2px 12px rgba(0,0,0,.4);
+}
+html{font-size:15px}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex}
+a{color:var(--accent2);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* ── Layout ───────────────────────────────────────────────────────────── */
+.sidebar{width:220px;background:var(--bg2);border-right:1px solid var(--border);padding:1rem 0;flex-shrink:0;display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:10}
+.sidebar h1{font-size:1rem;padding:0 1rem .75rem;border-bottom:1px solid var(--border);color:var(--accent2);letter-spacing:.5px}
+.sidebar nav{flex:1;padding:.5rem 0}
+.sidebar nav button{display:block;width:100%;text-align:left;background:none;border:none;color:var(--text2);padding:.6rem 1rem;font-size:.9rem;cursor:pointer;transition:all .15s}
+.sidebar nav button:hover,.sidebar nav button.active{background:var(--bg3);color:var(--text)}
+.sidebar nav button.active{border-left:3px solid var(--accent)}
+.main{margin-left:220px;flex:1;padding:1.5rem 2rem;max-width:960px}
+
+/* ── Typography ───────────────────────────────────────────────────────── */
+h2{font-size:1.3rem;margin-bottom:1rem;color:var(--accent2)}
+h3{font-size:1.05rem;margin-bottom:.5rem;color:var(--text)}
+.muted{color:var(--text2);font-size:.85rem}
+
+/* ── Cards / Panels ───────────────────────────────────────────────────── */
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;margin-bottom:.75rem;transition:border-color .15s}
+.card:hover{border-color:var(--accent)}
+.card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:.75rem}
+
+/* ── Forms ─────────────────────────────────────────────────────────────── */
+label{display:block;font-size:.85rem;color:var(--text2);margin-bottom:.25rem}
+input[type=text],input[type=password],input[type=url],input[type=number],
+select,textarea{
+  width:100%;padding:.5rem .65rem;background:var(--bg);border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--text);font-size:.9rem;outline:none;transition:border-color .15s;font-family:inherit
+}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+textarea{resize:vertical;min-height:80px}
+.form-row{margin-bottom:.75rem}
+.form-row-inline{display:flex;gap:.75rem;align-items:flex-end}
+.form-row-inline>*{flex:1}
+
+/* ── Buttons ──────────────────────────────────────────────────────────── */
+.btn{
+  display:inline-flex;align-items:center;gap:.35rem;
+  padding:.45rem .9rem;border:none;border-radius:var(--radius);
+  font-size:.85rem;cursor:pointer;transition:all .15s;font-weight:500
+}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent2)}
+.btn-danger{background:var(--danger);color:#fff}
+.btn-danger:hover{opacity:.85}
+.btn-secondary{background:var(--bg3);color:var(--text);border:1px solid var(--border)}
+.btn-secondary:hover{border-color:var(--accent)}
+.btn-sm{padding:.3rem .6rem;font-size:.8rem}
+.btn-group{display:flex;gap:.5rem;margin-top:.75rem;flex-wrap:wrap}
+
+/* ── Table ─────────────────────────────────────────────────────────────── */
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:.5rem .65rem;border-bottom:1px solid var(--border);font-size:.9rem}
+th{color:var(--text2);font-weight:500;font-size:.8rem;text-transform:uppercase;letter-spacing:.5px}
+
+/* ── Tags ──────────────────────────────────────────────────────────────── */
+.tag{display:inline-block;padding:.15rem .45rem;background:var(--bg3);border-radius:4px;font-size:.75rem;color:var(--text2);margin:.1rem}
+
+/* ── Modal ─────────────────────────────────────────────────────────────── */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;display:flex;align-items:center;justify-content:center}
+.modal{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:1.5rem;width:90%;max-width:640px;max-height:85vh;overflow-y:auto;box-shadow:var(--shadow)}
+.modal h2{margin-bottom:1rem}
+
+/* ── Toast ─────────────────────────────────────────────────────────────── */
+.toast-container{position:fixed;top:1rem;right:1rem;z-index:200;display:flex;flex-direction:column;gap:.5rem}
+.toast{padding:.6rem 1rem;border-radius:var(--radius);font-size:.85rem;box-shadow:var(--shadow);animation:slideIn .2s ease}
+.toast-success{background:var(--success);color:#000}
+.toast-error{background:var(--danger);color:#fff}
+@keyframes slideIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
+
+/* ── Avatar ────────────────────────────────────────────────────────────── */
+.avatar{width:48px;height:48px;border-radius:50%;object-fit:cover;background:var(--bg3);flex-shrink:0}
+.avatar-placeholder{width:48px;height:48px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;font-size:1.1rem;flex-shrink:0}
+
+/* ── Chat ──────────────────────────────────────────────────────────────── */
+.chat-messages{max-height:400px;overflow-y:auto;padding:.5rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);margin-bottom:.75rem}
+.chat-msg{margin-bottom:.5rem;padding:.4rem .6rem;border-radius:6px;font-size:.9rem;line-height:1.5;white-space:pre-wrap}
+.chat-msg.user{background:var(--bg3);margin-left:2rem}
+.chat-msg.assistant{background:rgba(124,92,252,.12);margin-right:2rem}
+.chat-msg .role{font-size:.75rem;color:var(--text2);margin-bottom:.15rem;text-transform:uppercase}
+
+/* ── Misc ──────────────────────────────────────────────────────────────── */
+.empty-state{text-align:center;padding:3rem 1rem;color:var(--text2)}
+.loading{opacity:.5;pointer-events:none}
+.flex-between{display:flex;justify-content:space-between;align-items:center}
+.mb-1{margin-bottom:.75rem}
+</style>
+</head>
+<body x-data="app()" x-init="init()">
+
+<!-- Toast notifications -->
+<div class="toast-container">
+  <template x-for="(t, i) in toasts" :key="i">
+    <div class="toast" :class="'toast-'+t.type" x-text="t.msg"
+         x-init="setTimeout(()=>toasts.splice(i,1),3000)"></div>
+  </template>
+</div>
+
+<!-- Sidebar -->
+<aside class="sidebar">
+  <h1>ST-Feishu</h1>
+  <nav>
+    <button :class="{active:page==='characters'}" @click="page='characters'">Characters</button>
+    <button :class="{active:page==='worldbooks'}" @click="page='worldbooks'">World Books</button>
+    <button :class="{active:page==='backends'}" @click="page='backends'">LLM Backends</button>
+    <button :class="{active:page==='sessions'}" @click="page='sessions'">Sessions</button>
+  </nav>
+</aside>
+
+<!-- Main content -->
+<main class="main">
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- CHARACTERS PAGE                                                       -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section x-show="page==='characters'" x-cloak>
+  <div class="flex-between mb-1">
+    <h2>Characters</h2>
+    <div class="btn-group" style="margin-top:0">
+      <button class="btn btn-secondary" @click="$refs.charImport.click()">Import Card</button>
+      <input type="file" accept=".json,.png" x-ref="charImport" style="display:none"
+             @change="importCharacter($event)">
+      <button class="btn btn-primary" @click="openCharModal()">+ New</button>
+    </div>
+  </div>
+  <div class="form-row">
+    <input type="text" placeholder="Search characters..." x-model="charSearch"
+           @input.debounce.300ms="loadCharacters()">
+  </div>
+
+  <div x-show="characters.length===0" class="empty-state">No characters yet. Create or import one!</div>
+  <div class="card-grid">
+    <template x-for="c in characters" :key="c.id">
+      <div class="card" style="cursor:pointer" @click="openCharModal(c)">
+        <div style="display:flex;gap:.75rem;align-items:center;margin-bottom:.5rem">
+          <template x-if="c.avatar">
+            <img :src="c.avatar" class="avatar">
+          </template>
+          <template x-if="!c.avatar">
+            <div class="avatar-placeholder" x-text="c.name.charAt(0).toUpperCase()"></div>
+          </template>
+          <div style="flex:1;min-width:0">
+            <h3 x-text="c.name" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></h3>
+            <div class="muted" x-text="c.source" style="font-size:.75rem;text-transform:uppercase"></div>
+          </div>
+        </div>
+        <p class="muted" x-text="(c.description||'').substring(0,100)+(c.description?.length>100?'...':'')"></p>
+        <div style="margin-top:.35rem">
+          <template x-for="t in c.tags||[]"><span class="tag" x-text="t"></span></template>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- Character Modal -->
+  <template x-if="charModal">
+    <div class="modal-overlay" @click.self="charModal=false">
+      <div class="modal">
+        <h2 x-text="charEdit.id?'Edit Character':'New Character'"></h2>
+        <div class="form-row"><label>Name</label><input type="text" x-model="charEdit.name"></div>
+        <div class="form-row"><label>Description</label><textarea x-model="charEdit.description" rows="3"></textarea></div>
+        <div class="form-row"><label>Personality</label><textarea x-model="charEdit.personality" rows="2"></textarea></div>
+        <div class="form-row"><label>Scenario</label><textarea x-model="charEdit.scenario" rows="2"></textarea></div>
+        <div class="form-row"><label>First Message</label><textarea x-model="charEdit.first_message" rows="3"></textarea></div>
+        <div class="form-row"><label>Example Dialogues</label><textarea x-model="charEdit.example_dialogues" rows="3"></textarea></div>
+        <div class="form-row"><label>System Prompt</label><textarea x-model="charEdit.system_prompt" rows="3"></textarea></div>
+        <div class="form-row"><label>Creator Notes</label><textarea x-model="charEdit.creator_notes" rows="2"></textarea></div>
+        <div class="form-row"><label>Tags (comma-separated)</label><input type="text" x-model="charEdit._tags"></div>
+        <div class="btn-group">
+          <button class="btn btn-primary" @click="saveCharacter()">Save</button>
+          <button class="btn btn-secondary" @click="charModal=false">Cancel</button>
+          <template x-if="charEdit.id">
+            <button class="btn btn-danger" @click="deleteCharacter(charEdit.id)">Delete</button>
+          </template>
+        </div>
+      </div>
+    </div>
+  </template>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- WORLDBOOKS PAGE                                                       -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section x-show="page==='worldbooks'" x-cloak>
+  <div class="flex-between mb-1">
+    <h2>World Books</h2>
+    <div class="btn-group" style="margin-top:0">
+      <button class="btn btn-secondary" @click="$refs.wbImport.click()">Import</button>
+      <input type="file" accept=".json" x-ref="wbImport" style="display:none"
+             @change="importWorldbook($event)">
+      <button class="btn btn-primary" @click="openWbModal()">+ New</button>
+    </div>
+  </div>
+
+  <div x-show="worldbooks.length===0" class="empty-state">No world books yet.</div>
+  <template x-for="wb in worldbooks" :key="wb.id">
+    <div class="card" style="cursor:pointer" @click="openWbModal(wb)">
+      <div class="flex-between">
+        <h3 x-text="wb.name"></h3>
+        <span class="muted" x-text="(wb.entries||[]).length+' entries'"></span>
+      </div>
+    </div>
+  </template>
+
+  <!-- WorldBook Modal -->
+  <template x-if="wbModal">
+    <div class="modal-overlay" @click.self="wbModal=false">
+      <div class="modal">
+        <h2 x-text="wbEdit.id?'Edit World Book':'New World Book'"></h2>
+        <div class="form-row"><label>Name</label><input type="text" x-model="wbEdit.name"></div>
+        <h3 style="margin-top:.75rem">Entries</h3>
+        <template x-for="(entry, idx) in wbEdit.entries" :key="idx">
+          <div class="card" style="padding:.65rem">
+            <div class="form-row-inline">
+              <div><label>Keyword(s)</label><input type="text" x-model="entry.keyword"></div>
+              <div style="max-width:140px"><label>Position</label>
+                <select x-model="entry.position">
+                  <option value="before_char">Before Char</option>
+                  <option value="after_char">After Char</option>
+                </select>
+              </div>
+              <div style="max-width:60px;align-self:flex-end">
+                <button class="btn btn-danger btn-sm" @click="wbEdit.entries.splice(idx,1)">X</button>
+              </div>
+            </div>
+            <div class="form-row" style="margin-top:.5rem"><label>Content</label><textarea x-model="entry.content" rows="2"></textarea></div>
+          </div>
+        </template>
+        <button class="btn btn-secondary btn-sm" @click="wbEdit.entries.push({keyword:'',content:'',position:'before_char',enabled:true})">+ Add Entry</button>
+        <div class="btn-group">
+          <button class="btn btn-primary" @click="saveWorldbook()">Save</button>
+          <button class="btn btn-secondary" @click="wbModal=false">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </template>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- BACKENDS PAGE                                                         -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section x-show="page==='backends'" x-cloak>
+  <div class="flex-between mb-1">
+    <h2>LLM Backends</h2>
+    <button class="btn btn-primary" @click="openBackendModal()">+ New</button>
+  </div>
+
+  <div x-show="backends.length===0" class="empty-state">No backends configured. Add one to start chatting!</div>
+  <template x-for="b in backends" :key="b.id">
+    <div class="card" style="cursor:pointer" @click="openBackendModal(b)">
+      <div class="flex-between">
+        <div>
+          <h3 x-text="b.name"></h3>
+          <span class="muted" x-text="b.provider+' / '+b.model"></span>
+        </div>
+        <span class="tag" x-text="b.provider"></span>
+      </div>
+    </div>
+  </template>
+
+  <!-- Backend Modal -->
+  <template x-if="backendModal">
+    <div class="modal-overlay" @click.self="backendModal=false">
+      <div class="modal">
+        <h2 x-text="backendEdit.id?'Edit Backend':'New Backend'"></h2>
+        <div class="form-row"><label>Name</label><input type="text" x-model="backendEdit.name"></div>
+        <div class="form-row"><label>Provider</label>
+          <select x-model="backendEdit.provider">
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="custom">Custom (OpenAI-compatible)</option>
+          </select>
+        </div>
+        <div class="form-row"><label>API Key</label><input type="password" x-model="backendEdit.api_key"></div>
+        <div class="form-row"><label>Model</label><input type="text" x-model="backendEdit.model" placeholder="gpt-4o / claude-sonnet-4-6 / ..."></div>
+        <div class="form-row"><label>Base URL</label><input type="url" x-model="backendEdit.base_url" placeholder="https://api.openai.com/v1"></div>
+        <div class="form-row-inline">
+          <div><label>Temperature</label><input type="number" step="0.1" min="0" max="2" x-model.number="backendEdit.temperature"></div>
+          <div><label>Max Tokens</label><input type="number" step="1" min="1" x-model.number="backendEdit.max_tokens"></div>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" @click="saveBackend()">Save</button>
+          <button class="btn btn-secondary" @click="backendModal=false">Cancel</button>
+          <template x-if="backendEdit.id">
+            <button class="btn btn-danger" @click="deleteBackend(backendEdit.id)">Delete</button>
+          </template>
+        </div>
+      </div>
+    </div>
+  </template>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- SESSIONS PAGE                                                         -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<section x-show="page==='sessions'" x-cloak>
+  <div class="flex-between mb-1">
+    <h2>Sessions</h2>
+    <button class="btn btn-primary" @click="openSessionModal()">+ New Session</button>
+  </div>
+
+  <div x-show="sessions.length===0" class="empty-state">No sessions yet.</div>
+  <template x-for="s in sessions" :key="s.id">
+    <div class="card" style="cursor:pointer" @click="openSessionChat(s.id)">
+      <div class="flex-between">
+        <div>
+          <h3 x-text="getCharName(s.character_id)"></h3>
+          <span class="muted" x-text="(s.messages||[]).length+' messages'"></span>
+          <template x-if="s.feishu_chat_id">
+            <span class="tag">Feishu</span>
+          </template>
+        </div>
+        <span class="tag" :style="s.status==='active'?'background:var(--success);color:#000':''" x-text="s.status"></span>
+      </div>
+    </div>
+  </template>
+
+  <!-- New Session Modal -->
+  <template x-if="sessionModal">
+    <div class="modal-overlay" @click.self="sessionModal=false">
+      <div class="modal">
+        <h2>New Session</h2>
+        <div class="form-row"><label>Character</label>
+          <select x-model.number="sessionCreate.character_id">
+            <option value="">Select...</option>
+            <template x-for="c in characters" :key="c.id">
+              <option :value="c.id" x-text="c.name"></option>
+            </template>
+          </select>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" @click="createSession()">Create</button>
+          <button class="btn btn-secondary" @click="sessionModal=false">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <!-- Session Chat Modal -->
+  <template x-if="chatModal">
+    <div class="modal-overlay" @click.self="chatModal=false">
+      <div class="modal" style="max-width:720px">
+        <div class="flex-between mb-1">
+          <h2 x-text="'Chat: '+getCharName(chatSession?.character_id)"></h2>
+          <div class="btn-group" style="margin-top:0">
+            <button class="btn btn-danger btn-sm" @click="deleteSession(chatSession.id)">Delete</button>
+            <button class="btn btn-secondary btn-sm" @click="chatModal=false">Close</button>
+          </div>
+        </div>
+        <div class="chat-messages" x-ref="chatBox">
+          <template x-for="(m, i) in chatSession?.messages||[]" :key="i">
+            <div class="chat-msg" :class="m.role">
+              <div class="role" x-text="m.role==='assistant'?getCharName(chatSession.character_id):m.role"></div>
+              <div x-text="m.content"></div>
+            </div>
+          </template>
+          <div x-show="!(chatSession?.messages||[]).length" class="muted" style="text-align:center;padding:1rem">
+            No messages yet. Start chatting!
+          </div>
+        </div>
+        <div style="display:flex;gap:.5rem">
+          <input type="text" x-model="chatInput" placeholder="Type a message..."
+                 @keydown.enter="sendChatMessage()" style="flex:1">
+          <button class="btn btn-primary" @click="sendChatMessage()" :disabled="chatSending">
+            <span x-show="!chatSending">Send</span>
+            <span x-show="chatSending">...</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </template>
+</section>
+
+</main>
+
+<script>
+function app() {
+  return {
+    page: 'characters',
+    toasts: [],
+
+    // Characters
+    characters: [],
+    charSearch: '',
+    charModal: false,
+    charEdit: {},
+
+    // Worldbooks
+    worldbooks: [],
+    wbModal: false,
+    wbEdit: {},
+
+    // Backends
+    backends: [],
+    backendModal: false,
+    backendEdit: {},
+
+    // Sessions
+    sessions: [],
+    sessionModal: false,
+    sessionCreate: { character_id: '' },
+    chatModal: false,
+    chatSession: null,
+    chatInput: '',
+    chatSending: false,
+
+    async init() {
+      await Promise.all([
+        this.loadCharacters(),
+        this.loadWorldbooks(),
+        this.loadBackends(),
+        this.loadSessions(),
+      ]);
+    },
+
+    toast(msg, type = 'success') {
+      this.toasts.push({ msg, type });
+    },
+
+    async api(url, opts = {}) {
+      try {
+        const resp = await fetch(url, {
+          headers: { 'Content-Type': 'application/json', ...opts.headers },
+          ...opts,
+        });
+        if (resp.status === 204) return null;
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+          throw new Error(err.detail || JSON.stringify(err));
+        }
+        return resp.json();
+      } catch (e) {
+        this.toast(e.message, 'error');
+        throw e;
+      }
+    },
+
+    // ── Characters ────────────────────────────────────────────────────
+    async loadCharacters() {
+      const q = this.charSearch ? `?search=${encodeURIComponent(this.charSearch)}` : '';
+      this.characters = await this.api(`/api/characters${q}`).catch(() => []);
+    },
+
+    openCharModal(c) {
+      if (c) {
+        this.charEdit = { ...c, _tags: (c.tags || []).join(', ') };
+      } else {
+        this.charEdit = { name: '', description: '', personality: '', scenario: '',
+          first_message: '', example_dialogues: '', system_prompt: '', creator_notes: '', _tags: '' };
+      }
+      this.charModal = true;
+    },
+
+    async saveCharacter() {
+      const data = { ...this.charEdit };
+      data.tags = data._tags ? data._tags.split(',').map(t => t.trim()).filter(Boolean) : [];
+      delete data._tags;
+      delete data.created_at; delete data.updated_at; delete data.source;
+
+      if (data.id) {
+        const id = data.id; delete data.id;
+        await this.api(`/api/characters/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+        this.toast('Character updated');
+      } else {
+        await this.api('/api/characters', { method: 'POST', body: JSON.stringify(data) });
+        this.toast('Character created');
+      }
+      this.charModal = false;
+      await this.loadCharacters();
+    },
+
+    async deleteCharacter(id) {
+      if (!confirm('Delete this character?')) return;
+      await this.api(`/api/characters/${id}`, { method: 'DELETE' });
+      this.charModal = false;
+      this.toast('Character deleted');
+      await this.loadCharacters();
+    },
+
+    async importCharacter(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        await fetch('/api/characters/import', { method: 'POST', body: form });
+        this.toast('Character imported');
+        await this.loadCharacters();
+      } catch (e) {
+        this.toast('Import failed: ' + e.message, 'error');
+      }
+      event.target.value = '';
+    },
+
+    // ── Worldbooks ────────────────────────────────────────────────────
+    async loadWorldbooks() {
+      this.worldbooks = await this.api('/api/worldbooks').catch(() => []);
+    },
+
+    openWbModal(wb) {
+      if (wb) {
+        this.wbEdit = JSON.parse(JSON.stringify(wb));
+      } else {
+        this.wbEdit = { name: '', entries: [] };
+      }
+      this.wbModal = true;
+    },
+
+    async saveWorldbook() {
+      const data = { ...this.wbEdit };
+      delete data.created_at; delete data.updated_at;
+      if (data.id) {
+        const id = data.id; delete data.id;
+        await this.api(`/api/worldbooks/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+        this.toast('World Book updated');
+      } else {
+        await this.api('/api/worldbooks', { method: 'POST', body: JSON.stringify(data) });
+        this.toast('World Book created');
+      }
+      this.wbModal = false;
+      await this.loadWorldbooks();
+    },
+
+    async importWorldbook(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        await fetch('/api/worldbooks/import', { method: 'POST', body: form });
+        this.toast('World Book imported');
+        await this.loadWorldbooks();
+      } catch (e) {
+        this.toast('Import failed: ' + e.message, 'error');
+      }
+      event.target.value = '';
+    },
+
+    // ── Backends ──────────────────────────────────────────────────────
+    async loadBackends() {
+      this.backends = await this.api('/api/backends').catch(() => []);
+    },
+
+    openBackendModal(b) {
+      if (b) {
+        this.backendEdit = { ...b, api_key: '', temperature: b.params?.temperature ?? 0.7, max_tokens: b.params?.max_tokens ?? 4096 };
+      } else {
+        this.backendEdit = { name: '', provider: 'openai', api_key: '', model: 'gpt-4o',
+          base_url: 'https://api.openai.com/v1', temperature: 0.7, max_tokens: 4096 };
+      }
+      this.backendModal = true;
+    },
+
+    async saveBackend() {
+      const data = {
+        name: this.backendEdit.name,
+        provider: this.backendEdit.provider,
+        model: this.backendEdit.model,
+        base_url: this.backendEdit.base_url,
+        params: { temperature: this.backendEdit.temperature, max_tokens: this.backendEdit.max_tokens },
+      };
+      if (this.backendEdit.api_key) data.api_key = this.backendEdit.api_key;
+
+      if (this.backendEdit.id) {
+        await this.api(`/api/backends/${this.backendEdit.id}`, { method: 'PUT', body: JSON.stringify(data) });
+        this.toast('Backend updated');
+      } else {
+        data.api_key = this.backendEdit.api_key || '';
+        await this.api('/api/backends', { method: 'POST', body: JSON.stringify(data) });
+        this.toast('Backend created');
+      }
+      this.backendModal = false;
+      await this.loadBackends();
+    },
+
+    async deleteBackend(id) {
+      if (!confirm('Delete this backend?')) return;
+      await this.api(`/api/backends/${id}`, { method: 'DELETE' });
+      this.backendModal = false;
+      this.toast('Backend deleted');
+      await this.loadBackends();
+    },
+
+    // ── Sessions ──────────────────────────────────────────────────────
+    async loadSessions() {
+      this.sessions = await this.api('/api/sessions').catch(() => []);
+    },
+
+    getCharName(id) {
+      return this.characters.find(c => c.id === id)?.name || `Character #${id}`;
+    },
+
+    openSessionModal() {
+      this.sessionCreate = { character_id: '' };
+      this.sessionModal = true;
+    },
+
+    async createSession() {
+      if (!this.sessionCreate.character_id) { this.toast('Select a character', 'error'); return; }
+      await this.api('/api/sessions', { method: 'POST', body: JSON.stringify(this.sessionCreate) });
+      this.sessionModal = false;
+      this.toast('Session created');
+      await this.loadSessions();
+    },
+
+    async openSessionChat(id) {
+      this.chatSession = await this.api(`/api/sessions/${id}`).catch(() => null);
+      if (this.chatSession) {
+        this.chatModal = true;
+        this.$nextTick(() => {
+          if (this.$refs.chatBox) this.$refs.chatBox.scrollTop = this.$refs.chatBox.scrollHeight;
+        });
+      }
+    },
+
+    async sendChatMessage() {
+      if (!this.chatInput.trim() || this.chatSending) return;
+      this.chatSending = true;
+      try {
+        this.chatSession = await this.api(`/api/sessions/${this.chatSession.id}/message`, {
+          method: 'POST', body: JSON.stringify({ content: this.chatInput }),
+        });
+        this.chatInput = '';
+        this.$nextTick(() => {
+          if (this.$refs.chatBox) this.$refs.chatBox.scrollTop = this.$refs.chatBox.scrollHeight;
+        });
+        await this.loadSessions();
+      } finally {
+        this.chatSending = false;
+      }
+    },
+
+    async deleteSession(id) {
+      if (!confirm('Delete this session and all history?')) return;
+      await this.api(`/api/sessions/${id}`, { method: 'DELETE' });
+      this.chatModal = false;
+      this.toast('Session deleted');
+      await this.loadSessions();
+    },
+  };
+}
+</script>
+</body>
+</html>
