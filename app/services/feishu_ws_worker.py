@@ -268,25 +268,12 @@ def _on_message(data) -> None:
 
 
 def _on_p2p_entered(data):
-    """User opened the bot's 1-on-1 chat window."""
+    """User opened the bot's 1-on-1 chat window. Do nothing — avoid spamming cards."""
     try:
         chat_id = data.event.chat_id
-        logger.info(f"User entered P2P chat: {chat_id}")
-        # Only send character selection if no active session exists
-        try:
-            sessions = api_get("/api/sessions")
-            has_active = any(
-                s.get("feishu_chat_id") == chat_id and s.get("status") == "active"
-                for s in sessions
-            )
-            if not has_active:
-                _handle_bot_added(chat_id)
-            else:
-                logger.debug(f"P2P chat {chat_id} already has active session, skipping card")
-        except Exception:
-            _handle_bot_added(chat_id)
+        logger.debug(f"User entered P2P chat: {chat_id} (ignored)")
     except Exception:
-        logger.exception("Error in p2p_entered handler")
+        pass
 
 
 def _on_card_action(data):
