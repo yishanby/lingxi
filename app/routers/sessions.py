@@ -44,12 +44,19 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
     char = await db.get(Character, body.character_id)
     if not char:
         raise HTTPException(404, "Character not found")
+    # Prepare initial messages with first_message if available
+    initial_messages = []
+    if char.first_message:
+        first_msg = char.first_message.replace("{{user}}", "User").replace("{{char}}", char.name)
+        now = datetime.datetime.utcnow().isoformat()
+        initial_messages.append({"role": "assistant", "content": first_msg, "timestamp": now})
+
     session = Session(
         character_id=body.character_id,
         worldbook_ids=json.dumps(body.worldbook_ids),
         feishu_chat_id=body.feishu_chat_id,
         user_id=body.user_id,
-        messages="[]",
+        messages=json.dumps(initial_messages, ensure_ascii=False),
         status="active",
     )
     db.add(session)

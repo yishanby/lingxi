@@ -1106,10 +1106,13 @@ function app() {
 
     async createSession() {
       if (!this.sessionCreate.character_id) { this.toast('Select a character', 'error'); return; }
-      await this.api('/api/sessions', { method: 'POST', body: JSON.stringify(this.sessionCreate) });
+      const newSession = await this.api('/api/sessions', { method: 'POST', body: JSON.stringify(this.sessionCreate) });
       this.sessionModal = false;
       this.toast('Session created');
       await this.loadSessions();
+      if (newSession && newSession.id) {
+        await this.openSessionChat(newSession.id);
+      }
     },
 
     async openSessionChat(id) {
