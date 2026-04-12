@@ -30,7 +30,18 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables ready")
+
+    # Start Feishu WebSocket client
+    from app.database import async_session
+    from app.services.feishu_ws import set_session_factory, start_ws_client
+    set_session_factory(async_session)
+    start_ws_client()
+
     yield
+
+    # Cleanup
+    from app.services.feishu_ws import stop_ws_client
+    stop_ws_client()
 
 
 app = FastAPI(
