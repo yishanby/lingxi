@@ -179,6 +179,12 @@ def _on_message(data) -> None:
         chat_id = msg.chat_id
         msg_type = msg.message_type
         sender_id = sender.sender_id.open_id if sender and sender.sender_id else ""
+        sender_type = sender.sender_type if sender else ""
+
+        # Ignore messages sent by bots (including ourselves)
+        if sender_type == "app":
+            logger.debug(f"Ignoring bot message in {chat_id}")
+            return
 
         if msg_type != "text":
             logger.debug(f"Ignoring non-text message type: {msg_type}")
@@ -193,12 +199,16 @@ def _on_message(data) -> None:
         if not text:
             return
 
-        # Remove @bot mention
-        if text.startswith("@"):
-            parts = text.split(" ", 1)
-            text = parts[1].strip() if len(parts) > 1 else ""
-            if not text:
-                return
+        # Remove @bot mentions (Feishu uses @_user_N placeholders)
+        # Also handle mentions list from the event
+        mentions = getattr(msg, 'mentions', None) or []
+        for mention in mentions:
+            key = getattr(mention, 'key', '')
+            if key:
+                text = text.replace(key, '').strip()
+
+        if not text:
+            return
 
         logger.info(f"Message from {sender_id} in {chat_id}: {text[:50]}")
         _handle_message(chat_id, sender_id, text)
@@ -211,8 +221,19 @@ def _on_p2p_entered(data):
     try:
         chat_id = data.event.chat_id
         logger.info(f"User entered P2P chat: {chat_id}")
-        # Send character selection card in P2P chat too
-        _handle_bot_added(chat_id)
+        # Only send character selection if no active session exists
+        try:
+            sessions = api_get("/api/sessions")
+            has_active = any(
+                s.get("feishu_chat_id") == chat_id and s.get("status") == "active"
+                for s in sessions
+            )
+            if not has_active:
+                _handle_bot_added(chat_id)
+            else:
+                logger.debug(f"P2P chat {chat_id} already has active session, skipping card")
+        except Exception:
+            _handle_bot_added(chat_id)
     except Exception:
         logger.exception("Error in p2p_entered handler")
 
