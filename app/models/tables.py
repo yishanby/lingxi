@@ -26,6 +26,7 @@ class Character(Base):
     system_prompt: Mapped[str] = mapped_column(Text, default="")
     creator_notes: Mapped[str] = mapped_column(Text, default="")
     tags: Mapped[str] = mapped_column(Text, default="[]")  # JSON array
+    linked_worldbook_ids: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of worldbook IDs
     source: Mapped[str] = mapped_column(String(32), default="manual")  # imported / manual
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now()

@@ -51,9 +51,16 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
         now = datetime.datetime.utcnow().isoformat()
         initial_messages.append({"role": "assistant", "content": first_msg, "timestamp": now})
 
+    # Merge user-specified worldbook_ids with character's linked worldbooks
+    wb_ids = list(body.worldbook_ids)
+    char_linked = json.loads(char.linked_worldbook_ids) if char.linked_worldbook_ids else []
+    for wid in char_linked:
+        if wid not in wb_ids:
+            wb_ids.append(wid)
+
     session = Session(
         character_id=body.character_id,
-        worldbook_ids=json.dumps(body.worldbook_ids),
+        worldbook_ids=json.dumps(wb_ids),
         feishu_chat_id=body.feishu_chat_id,
         user_id=body.user_id,
         messages=json.dumps(initial_messages, ensure_ascii=False),

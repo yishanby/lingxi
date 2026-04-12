@@ -10,9 +10,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.tables import Character
+from app.models.tables import Character, WorldBook
 from app.schemas.api import CharacterCreate, CharacterOut, CharacterUpdate
-from app.services.character_import import parse_character_card
+from app.services.character_import import (
+    parse_character_card,
+    parse_raw_card,
+    extract_character_book,
+    extract_linked_world_name,
+)
 
 router = APIRouter(prefix="/api/characters", tags=["characters"])
 
@@ -110,12 +115,39 @@ async def import_character(
     contents = await file.read()
     try:
         card_data = parse_character_card(contents, file.filename or "card.json")
+        raw = parse_raw_card(contents, file.filename or "card.json")
     except (ValueError, Exception) as exc:
         raise HTTPException(400, f"Failed to parse character card: {exc}")
 
     tags = card_data.pop("tags", [])
     char = Character(**card_data, tags=json.dumps(tags, ensure_ascii=False))
     db.add(char)
+    await db.flush()  # get char.id before commit
+
+    linked_wb_ids: list[int] = []
+
+    # 1. Handle embedded character_book -> create a worldbook from it
+    embedded_entries = extract_character_book(raw)
+    if embedded_entries:
+        wb = WorldBook(
+            name=f"{char.name} (Embedded)",
+            entries=json.dumps(embedded_entries, ensure_ascii=False),
+        )
+        db.add(wb)
+        await db.flush()
+        linked_wb_ids.append(wb.id)
+
+    # 2. Handle extensions.world -> find matching worldbook by name
+    world_name = extract_linked_world_name(raw)
+    if world_name:
+        result = await db.execute(
+            select(WorldBook).where(WorldBook.name.ilike(f"%{world_name}%"))
+        )
+        matched_wb = result.scalar_one_or_none()
+        if matched_wb and matched_wb.id not in linked_wb_ids:
+            linked_wb_ids.append(matched_wb.id)
+
+    char.linked_worldbook_ids = json.dumps(linked_wb_ids)
     await db.commit()
     await db.refresh(char)
     return _row_to_out(char)
