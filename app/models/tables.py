@@ -108,6 +108,11 @@ class Persona(Base):
     name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
     avatar: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     description: Mapped[str] = mapped_column(Text, default="")  # full persona text
+    description_position: Mapped[str] = mapped_column(
+        String(32), default="in_prompt"  # in_prompt / after_scenario / top_an / bottom_an / none
+    )
+    is_default: Mapped[bool] = mapped_column(Integer, default=False)  # default persona
+    linked_character_ids: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of char IDs
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now()
     )

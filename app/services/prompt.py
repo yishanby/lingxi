@@ -37,6 +37,7 @@ def assemble_prompt(
     user_message: str,
     user_name: str = "用户",
     user_persona: str = "",
+    persona_position: str = "in_prompt",  # in_prompt / after_scenario / none
 ) -> list[dict[str, str]]:
     """Build the full messages payload for an LLM chat-completion call.
 
@@ -60,8 +61,11 @@ def assemble_prompt(
     if character.get("scenario"):
         system_parts.append(f"Scenario: {character['scenario'].replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
 
-    # User persona / protagonist definition
-    if user_persona:
+    # User persona (position: after_scenario)
+    if user_persona and persona_position == "after_scenario":
+        system_parts.append(f"[User Character: {user_name}]\n{user_persona.replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
+    # User persona / protagonist definition (position: in_prompt)
+    if user_persona and persona_position == "in_prompt":
         system_parts.append(f"[User Character: {user_name}]\n{user_persona.replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
 
     # ── 2 & 4. Worldbook entries ─────────────────────────────────────────

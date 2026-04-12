@@ -780,7 +780,7 @@ th{color:var(--text-tertiary);font-weight:500;font-size:.7rem;text-transform:upp
       <div class="page-title">主角 Personas</div>
       <div class="page-subtitle">管理你的角色人设，创建 Session 时可直接选择</div>
     </div>
-    <button class="btn btn-primary" @click="personaModal=true;editPersona={name:'',description:'',avatar:null};editPersonaId=null">
+    <button class="btn btn-primary" @click="personaModal=true;editPersona={name:'',description:'',avatar:null,description_position:'in_prompt',is_default:false,linked_character_ids:[]};editPersonaId=null">
       <span style="font-size:1.1rem">+</span> 新建主角
     </button>
   </div>
@@ -793,13 +793,13 @@ th{color:var(--text-tertiary);font-weight:500;font-size:.7rem;text-transform:upp
 
   <div class="grid-3">
     <template x-for="p in personas" :key="p.id">
-      <div class="char-card" @click="editPersonaId=p.id;editPersona={name:p.name,description:p.description,avatar:p.avatar};personaModal=true">
+      <div class="char-card" @click="editPersonaId=p.id;editPersona={name:p.name,description:p.description,avatar:p.avatar,description_position:p.description_position||'in_prompt',is_default:p.is_default||false,linked_character_ids:p.linked_character_ids||[]};personaModal=true">
         <div class="char-card-inner">
           <div class="char-card-head">
             <div class="avatar-placeholder" x-text="p.name.charAt(0).toUpperCase()"></div>
             <div>
               <div class="char-card-name" x-text="p.name"></div>
-              <div class="char-card-meta" x-text="p.description?p.description.substring(0,60)+'...':'无描述'"></div>
+              <div class="char-card-meta" x-text="(p.is_default?'⭐ 默认 · ':'') + (p.description?p.description.substring(0,50)+'...':'无描述')"></div>
             </div>
           </div>
         </div>
@@ -820,7 +820,26 @@ th{color:var(--text-tertiary);font-weight:500;font-size:.7rem;text-transform:upp
         <input type="text" x-model="editPersona.name" placeholder="例如：李天赋、林逸风...">
       </div>
       <div class="form-group"><label class="form-label">角色描述 / 人设</label>
-        <textarea x-model="editPersona.description" rows="8" placeholder="描述背景、性格、外貌、技能等..."></textarea>
+        <textarea x-model="editPersona.description" rows="8" placeholder="描述背景、性格、外貌、技能等...支持 {{char}} 和 {{user}} 宏"></textarea>
+      </div>
+      <div class="form-group"><label class="form-label">描述注入位置</label>
+        <select x-model="editPersona.description_position">
+          <option value="in_prompt">在系统提示中 (默认)</option>
+          <option value="after_scenario">场景描述之后</option>
+          <option value="none">不注入</option>
+        </select>
+      </div>
+      <div class="form-group"><label class="form-label">绑定角色 (选择该角色时自动使用此人设)</label>
+        <select x-model="editPersona.linked_character_ids" multiple style="min-height:80px">
+          <template x-for="c in characters" :key="c.id">
+            <option :value="c.id" x-text="c.name"></option>
+          </template>
+        </select>
+        <div style="font-size:.7rem;color:var(--text-tertiary);margin-top:.25rem">按住 Ctrl 多选</div>
+      </div>
+      <div class="form-group" style="display:flex;align-items:center;gap:.5rem">
+        <input type="checkbox" x-model="editPersona.is_default" id="persona-default" style="width:auto">
+        <label for="persona-default" class="form-label" style="margin:0">设为默认主角</label>
       </div>
       <div class="modal-actions">
         <template x-if="editPersonaId">
@@ -989,7 +1008,7 @@ function app() {
     // Personas
     personas: [],
     personaModal: false,
-    editPersona: { name: '', description: '', avatar: null },
+    editPersona: { name: '', description: '', avatar: null, description_position: 'in_prompt', is_default: false, linked_character_ids: [] },
     editPersonaId: null,
 
     // Sessions
@@ -1185,7 +1204,14 @@ function app() {
     },
 
     async savePersona() {
-      const data = { name: this.editPersona.name, description: this.editPersona.description, avatar: this.editPersona.avatar };
+      const data = {
+        name: this.editPersona.name,
+        description: this.editPersona.description,
+        avatar: this.editPersona.avatar,
+        description_position: this.editPersona.description_position,
+        is_default: this.editPersona.is_default,
+        linked_character_ids: (this.editPersona.linked_character_ids||[]).map(Number),
+      };
       if (!data.name) { this.toast('请输入名称', 'error'); return; }
       if (this.editPersonaId) {
         await this.api(`/api/personas/${this.editPersonaId}`, { method: 'PATCH', body: JSON.stringify(data) });

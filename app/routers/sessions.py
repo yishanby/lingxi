@@ -48,16 +48,32 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
     if not char:
         raise HTTPException(404, "Character not found")
 
-    # Resolve persona: if persona_id is set, use it; otherwise use inline fields
+    # Resolve persona: if persona_id is set, use it; otherwise auto-detect from character link, or use inline fields
     user_name = body.user_name or "用户"
     user_persona = body.user_persona or ""
     persona_id = body.persona_id
+
+    if not persona_id:
+        # Try to auto-find persona linked to this character
+        result = await db.execute(select(Persona))
+        all_personas = result.scalars().all()
+        for p in all_personas:
+            linked = json.loads(p.linked_character_ids) if p.linked_character_ids else []
+            if body.character_id in linked:
+                persona_id = p.id
+                break
+        # Fall back to default persona
+        if not persona_id:
+            for p in all_personas:
+                if p.is_default:
+                    persona_id = p.id
+                    break
+
     if persona_id:
         persona = await db.get(Persona, persona_id)
-        if not persona:
-            raise HTTPException(404, "Persona not found")
-        user_name = persona.name
-        user_persona = persona.description
+        if persona:
+            user_name = persona.name
+            user_persona = persona.description
 
     # Prepare initial messages with first_message if available
     initial_messages = []
@@ -159,6 +175,13 @@ async def send_message(
         "system_prompt": char.system_prompt,
     }
 
+    # Resolve persona position
+    persona_position = "in_prompt"
+    if session.persona_id:
+        persona = await db.get(Persona, session.persona_id)
+        if persona:
+            persona_position = persona.description_position or "in_prompt"
+
     # Assemble prompt
     llm_messages = assemble_prompt(
         character=char_dict,
@@ -167,6 +190,7 @@ async def send_message(
         user_message=body.content,
         user_name=session.user_name or "用户",
         user_persona=session.user_persona or "",
+        persona_position=persona_position,
     )
 
     # Call LLM

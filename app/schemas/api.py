@@ -161,12 +161,18 @@ class PersonaCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=256)
     avatar: Optional[str] = None
     description: str = ""
+    description_position: str = "in_prompt"  # in_prompt / after_scenario / none
+    is_default: bool = False
+    linked_character_ids: list[int] = []
 
 
 class PersonaUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=256)
     avatar: Optional[str] = None
     description: Optional[str] = None
+    description_position: Optional[str] = None
+    is_default: Optional[bool] = None
+    linked_character_ids: Optional[list[int]] = None
 
 
 class PersonaOut(BaseModel):
@@ -174,6 +180,9 @@ class PersonaOut(BaseModel):
     name: str
     avatar: Optional[str] = None
     description: str
+    description_position: str
+    is_default: bool
+    linked_character_ids: list[int]
     created_at: datetime.datetime
     updated_at: datetime.datetime
 
