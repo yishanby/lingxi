@@ -33,6 +33,8 @@ def _row_to_out(s: Session) -> SessionOut:
         worldbook_ids=json.loads(s.worldbook_ids) if s.worldbook_ids else [],
         feishu_chat_id=s.feishu_chat_id,
         user_id=s.user_id,
+        user_name=s.user_name or "用户",
+        user_persona=s.user_persona or "",
         messages=[MessageItem(**m) for m in (json.loads(s.messages) if s.messages else [])],
         status=s.status,
         created_at=s.created_at,
@@ -47,7 +49,7 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
     # Prepare initial messages with first_message if available
     initial_messages = []
     if char.first_message:
-        first_msg = char.first_message.replace("{{user}}", "User").replace("{{char}}", char.name)
+        first_msg = char.first_message.replace("{{user}}", body.user_name or "用户").replace("{{char}}", char.name)
         now = datetime.datetime.utcnow().isoformat()
         initial_messages.append({"role": "assistant", "content": first_msg, "timestamp": now})
 
@@ -63,6 +65,8 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
         worldbook_ids=json.dumps(wb_ids),
         feishu_chat_id=body.feishu_chat_id,
         user_id=body.user_id,
+        user_name=body.user_name or "用户",
+        user_persona=body.user_persona or "",
         messages=json.dumps(initial_messages, ensure_ascii=False),
         status="active",
     )
@@ -147,6 +151,8 @@ async def send_message(
         worldbook_entries=all_entries,
         chat_history=messages,
         user_message=body.content,
+        user_name=session.user_name or "用户",
+        user_persona=session.user_persona or "",
     )
 
     # Call LLM

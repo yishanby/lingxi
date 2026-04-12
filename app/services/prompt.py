@@ -35,11 +35,13 @@ def assemble_prompt(
     worldbook_entries: list[WorldBookEntry],
     chat_history: list[MessageItem],
     user_message: str,
+    user_name: str = "用户",
+    user_persona: str = "",
 ) -> list[dict[str, str]]:
     """Build the full messages payload for an LLM chat-completion call.
 
     Order:
-      1. System prompt (character system_prompt + personality + scenario)
+      1. System prompt (character system_prompt + personality + scenario + user persona)
       2. Worldbook entries (position=before_char)
       3. Character description block
       4. Worldbook entries (position=after_char)
@@ -52,11 +54,15 @@ def assemble_prompt(
     # ── 1. System prompt ─────────────────────────────────────────────────
     system_parts: list[str] = []
     if character.get("system_prompt"):
-        system_parts.append(character["system_prompt"])
+        system_parts.append(character["system_prompt"].replace("{{user}}", user_name).replace("{{char}}", character["name"]))
     if character.get("personality"):
-        system_parts.append(f"Personality: {character['personality']}")
+        system_parts.append(f"Personality: {character['personality'].replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
     if character.get("scenario"):
-        system_parts.append(f"Scenario: {character['scenario']}")
+        system_parts.append(f"Scenario: {character['scenario'].replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
+
+    # User persona / protagonist definition
+    if user_persona:
+        system_parts.append(f"[User Character: {user_name}]\n{user_persona.replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
 
     # ── 2 & 4. Worldbook entries ─────────────────────────────────────────
     recent_text = " ".join(
@@ -69,7 +75,8 @@ def assemble_prompt(
 
     # ── 3. Description ───────────────────────────────────────────────────
     if character.get("description"):
-        system_parts.append(f"[Character: {character['name']}]\n{character['description']}")
+        desc = character["description"].replace("{{user}}", user_name).replace("{{char}}", character["name"])
+        system_parts.append(f"[Character: {character['name']}]\n{desc}")
 
     if wb_after:
         system_parts.append("[Additional World Info]\n" + "\n".join(wb_after))
@@ -80,7 +87,7 @@ def assemble_prompt(
     # ── 5. Example dialogues (simple {{user}}/{{char}} parsing) ──────────
     if character.get("example_dialogues"):
         examples = _parse_example_dialogues(
-            character["example_dialogues"], character["name"]
+            character["example_dialogues"], character["name"], user_name
         )
         messages.extend(examples)
 
@@ -95,7 +102,7 @@ def assemble_prompt(
 
 
 def _parse_example_dialogues(
-    text: str, char_name: str
+    text: str, char_name: str, user_name: str = "用户"
 ) -> list[dict[str, str]]:
     """Parse SillyTavern example dialogue format into user/assistant message pairs.
 
@@ -116,7 +123,7 @@ def _parse_example_dialogues(
             line = line.strip()
             if not line:
                 continue
-            line = line.replace("{{char}}", char_name).replace("{{user}}", "User")
+            line = line.replace("{{char}}", char_name).replace("{{user}}", user_name)
             if line.startswith(f"{char_name}:"):
                 messages.append(
                     {"role": "assistant", "content": line[len(char_name) + 1 :].strip()}

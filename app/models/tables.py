@@ -70,6 +70,8 @@ class Session(Base):
     worldbook_ids: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of ints
     feishu_chat_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True, index=True)
     user_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    user_name: Mapped[str] = mapped_column(String(256), default="用户")  # protagonist name
+    user_persona: Mapped[str] = mapped_column(Text, default="")  # protagonist description
     messages: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of message dicts
     status: Mapped[str] = mapped_column(String(32), default="active")  # active / archived
     created_at: Mapped[datetime.datetime] = mapped_column(

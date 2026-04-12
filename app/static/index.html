@@ -825,6 +825,12 @@ th{color:var(--text-tertiary);font-weight:500;font-size:.7rem;text-transform:upp
             </template>
           </select>
         </div>
+        <div class="form-group"><label class="form-label">主角名称 (Your Character Name)</label>
+          <input type="text" x-model="sessionCreate.user_name" placeholder="例如：李天赋、林逸风...">
+        </div>
+        <div class="form-group"><label class="form-label">主角设定 (Your Character Persona)</label>
+          <textarea x-model="sessionCreate.user_persona" rows="3" placeholder="描述你的角色背景、性格、外貌等..."></textarea>
+        </div>
         <div class="modal-actions">
           <button class="btn btn-ghost" @click="sessionModal=false">Cancel</button>
           <button class="btn btn-primary" @click="createSession()">Start Session</button>
@@ -842,7 +848,7 @@ th{color:var(--text-tertiary);font-weight:500;font-size:.7rem;text-transform:upp
             <div class="avatar-placeholder avatar-sm" x-text="getCharName(chatSession?.character_id).charAt(0).toUpperCase()"></div>
             <div>
               <div class="modal-title" x-text="getCharName(chatSession?.character_id)"></div>
-              <div style="font-size:.7rem;color:var(--text-tertiary)" x-text="(chatSession?.messages||[]).length+' messages'"></div>
+              <div style="font-size:.7rem;color:var(--text-tertiary)" x-text="(chatSession?.user_name ? '扮演: ' + chatSession.user_name + ' · ' : '') + (chatSession?.messages||[]).length+' messages'"></div>
             </div>
           </div>
           <div class="btn-group">
@@ -856,7 +862,7 @@ th{color:var(--text-tertiary);font-weight:500;font-size:.7rem;text-transform:upp
               <div class="chat-msg" :class="m.role">
                 <div class="chat-bubble" x-text="m.content"></div>
                 <div class="chat-meta">
-                  <span x-text="m.role==='assistant'?getCharName(chatSession.character_id):'You'"></span>
+                  <span x-text="m.role==='assistant'?getCharName(chatSession.character_id):(chatSession.user_name||'You')"></span>
                 </div>
               </div>
             </template>
@@ -907,7 +913,7 @@ function app() {
     // Sessions
     sessions: [],
     sessionModal: false,
-    sessionCreate: { character_id: '' },
+    sessionCreate: { character_id: '', user_name: '', user_persona: '' },
     chatModal: false,
     chatSession: null,
     chatInput: '',

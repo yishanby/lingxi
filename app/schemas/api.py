@@ -95,6 +95,8 @@ class SessionCreate(BaseModel):
     worldbook_ids: list[int] = []
     feishu_chat_id: Optional[str] = None
     user_id: Optional[str] = None
+    user_name: str = "用户"  # protagonist name
+    user_persona: str = ""  # protagonist description/backstory
 
 
 class SessionOut(BaseModel):
@@ -103,6 +105,8 @@ class SessionOut(BaseModel):
     worldbook_ids: list[int]
     feishu_chat_id: Optional[str]
     user_id: Optional[str]
+    user_name: str
+    user_persona: str
     messages: list[MessageItem]
     status: str
     created_at: datetime.datetime
