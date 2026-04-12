@@ -141,7 +141,7 @@ async def import_character(
     world_name = extract_linked_world_name(raw)
     if world_name:
         result = await db.execute(
-            select(WorldBook).where(WorldBook.name.ilike(f"%{world_name}%"))
+            select(WorldBook).where(WorldBook.name.ilike(f"%{world_name}%")).limit(1)
         )
         matched_wb = result.scalar_one_or_none()
         if matched_wb and matched_wb.id not in linked_wb_ids:
