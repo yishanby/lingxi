@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import httpx
 
@@ -124,6 +124,137 @@ async def _anthropic(
         data = resp.json()
         return data["content"][0]["text"]
 
+
+# ── Streaming variants ────────────────────────────────────────────────────────
+
+async def chat_completion_stream(
+    *,
+    provider: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+    messages: list[dict[str, str]],
+    params: dict[str, Any] | None = None,
+) -> AsyncGenerator[str, None]:
+    """Yield text chunks as they stream from the LLM."""
+    params = params or {}
+    timeout = httpx.Timeout(120.0, connect=10.0)
+
+    if provider in ("openai", "custom"):
+        async for chunk in _openai_compatible_stream(
+            api_key=api_key,
+            model=model,
+            base_url=base_url.rstrip("/"),
+            messages=messages,
+            params=params,
+            timeout=timeout,
+        ):
+            yield chunk
+    elif provider == "anthropic":
+        async for chunk in _anthropic_stream(
+            api_key=api_key,
+            model=model,
+            base_url=base_url.rstrip("/") if base_url else "https://api.anthropic.com",
+            messages=messages,
+            params=params,
+            timeout=timeout,
+        ):
+            yield chunk
+    else:
+        raise LLMError(f"Unknown provider: {provider}")
+
+
+async def _openai_compatible_stream(
+    *,
+    api_key: str,
+    model: str,
+    base_url: str,
+    messages: list[dict[str, str]],
+    params: dict[str, Any],
+    timeout: httpx.Timeout,
+) -> AsyncGenerator[str, None]:
+    url = f"{base_url}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body: dict[str, Any] = {"model": model, "messages": messages, "stream": True, **params}
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", url, headers=headers, json=body) as resp:
+            if resp.status_code != 200:
+                text = await resp.aread()
+                raise LLMError(f"OpenAI API error {resp.status_code}: {text.decode()}")
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_str)
+                    delta = data["choices"][0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        yield content
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+
+
+async def _anthropic_stream(
+    *,
+    api_key: str,
+    model: str,
+    base_url: str,
+    messages: list[dict[str, str]],
+    params: dict[str, Any],
+    timeout: httpx.Timeout,
+) -> AsyncGenerator[str, None]:
+    url = f"{base_url}/v1/messages"
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+
+    system_text = ""
+    api_messages: list[dict[str, str]] = []
+    for m in messages:
+        if m["role"] == "system":
+            system_text += ("\n\n" if system_text else "") + m["content"]
+        else:
+            api_messages.append(m)
+
+    api_messages = _merge_consecutive_roles(api_messages)
+
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": api_messages,
+        "max_tokens": params.pop("max_tokens", 4096),
+        "stream": True,
+        **params,
+    }
+    if system_text:
+        body["system"] = system_text
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", url, headers=headers, json=body) as resp:
+            if resp.status_code != 200:
+                text = await resp.aread()
+                raise LLMError(f"Anthropic API error {resp.status_code}: {text.decode()}")
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                try:
+                    data = json.loads(data_str)
+                    if data.get("type") == "content_block_delta":
+                        delta = data.get("delta", {})
+                        text = delta.get("text")
+                        if text:
+                            yield text
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _merge_consecutive_roles(
     messages: list[dict[str, str]],

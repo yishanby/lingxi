@@ -95,8 +95,20 @@ def assemble_prompt(
         )
         messages.extend(examples)
 
-    # ── 6. Chat history ──────────────────────────────────────────────────
-    for m in chat_history:
+    # ── 6. Chat history (truncated to fit context budget) ─────────────
+    from app.config import settings
+    max_history_chars = settings.prompt_history_max_chars
+    truncated_history: list[MessageItem] = []
+    char_count = 0
+    for m in reversed(chat_history):
+        msg_len = len(m.content)
+        if char_count + msg_len > max_history_chars:
+            break
+        truncated_history.append(m)
+        char_count += msg_len
+    truncated_history.reverse()
+
+    for m in truncated_history:
         messages.append({"role": m.role, "content": m.content})
 
     # ── 7. Current user message ──────────────────────────────────────────

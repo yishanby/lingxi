@@ -7,6 +7,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,7 +20,7 @@ from app.schemas.api import (
     SessionOut,
     WorldBookEntry,
 )
-from app.services.llm import LLMError, chat_completion
+from app.services.llm import LLMError, chat_completion, chat_completion_stream
 from app.services.prompt import assemble_prompt
 
 logger = logging.getLogger(__name__)
@@ -254,3 +255,99 @@ async def _resolve_backend(
         "base_url": settings.default_llm_base_url,
         "params": {},
     }
+
+
+@router.post("/{session_id}/message/stream")
+async def send_message_stream(
+    session_id: int,
+    body: SessionMessageIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """Streaming chat endpoint: yields SSE chunks as LLM generates."""
+    session = await db.get(Session, session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.status != "active":
+        raise HTTPException(400, "Session is archived")
+
+    char = await db.get(Character, session.character_id)
+    if not char:
+        raise HTTPException(500, "Character associated with session not found")
+
+    wb_ids = json.loads(session.worldbook_ids) if session.worldbook_ids else []
+    all_entries: list[WorldBookEntry] = []
+    for wid in wb_ids:
+        wb = await db.get(WorldBook, wid)
+        if wb:
+            for e in json.loads(wb.entries) if wb.entries else []:
+                all_entries.append(WorldBookEntry(**e))
+
+    backend = await _resolve_backend(body.backend_id, db)
+
+    messages = [
+        MessageItem(**m) for m in (json.loads(session.messages) if session.messages else [])
+    ]
+
+    char_dict = {
+        "name": char.name,
+        "description": char.description,
+        "personality": char.personality,
+        "scenario": char.scenario,
+        "first_message": char.first_message,
+        "example_dialogues": char.example_dialogues,
+        "system_prompt": char.system_prompt,
+    }
+
+    persona_position = "in_prompt"
+    if session.persona_id:
+        persona = await db.get(Persona, session.persona_id)
+        if persona:
+            persona_position = persona.description_position or "in_prompt"
+
+    llm_messages = assemble_prompt(
+        character=char_dict,
+        worldbook_entries=all_entries,
+        chat_history=messages,
+        user_message=body.content,
+        user_name=session.user_name or "用户",
+        user_persona=session.user_persona or "",
+        persona_position=persona_position,
+    )
+
+    # Capture values needed for DB save after streaming
+    _session_id = session.id
+    _user_content = body.content
+    _current_messages = messages
+
+    async def generate():
+        full_reply = ""
+        try:
+            async for chunk in chat_completion_stream(
+                provider=backend["provider"],
+                api_key=backend["api_key"],
+                model=backend["model"],
+                base_url=backend["base_url"],
+                messages=llm_messages,
+                params=backend["params"],
+            ):
+                full_reply += chunk
+                yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            logger.error(f"Streaming LLM error: {exc}")
+            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+
+        # Save messages to DB
+        try:
+            now = datetime.datetime.utcnow().isoformat()
+            _current_messages.append(MessageItem(role="user", content=_user_content, timestamp=now))
+            _current_messages.append(MessageItem(role="assistant", content=full_reply, timestamp=now))
+            session.messages = json.dumps(
+                [m.model_dump(mode="json") for m in _current_messages], ensure_ascii=False
+            )
+            await db.commit()
+        except Exception as exc:
+            logger.error(f"Failed to save streaming messages: {exc}")
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")

@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     default_llm_model: str = "gpt-4o"
     default_llm_base_url: str = "https://api.openai.com/v1"
 
+    # Prompt context limit (max chars of chat history to include in prompt)
+    prompt_history_max_chars: int = 100000
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

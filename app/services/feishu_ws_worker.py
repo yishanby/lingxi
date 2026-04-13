@@ -163,6 +163,214 @@ def build_reply_card(char_name: str, content: str) -> dict:
     }
 
 
+# ── Streaming Card (CardKit) ────────────────────────────────────────────────
+
+_CARDKIT_BASE = "https://open.feishu.cn/open-apis/cardkit/v1/cards"
+
+# Persistent HTTP client for CardKit API — avoids repeated TLS handshakes (~300ms saved per call)
+_cardkit_client = httpx.Client(timeout=10, limits=httpx.Limits(max_keepalive_connections=5))
+
+
+def create_streaming_card(chat_id: str, char_name: str) -> tuple[str, str] | None:
+    """Create a CardKit streaming card. Returns (card_id, message_id) or None."""
+    try:
+        token = get_tenant_access_token()
+        card_json = {
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": True,
+                "summary": {"content": "[生成中...]"},
+                "streaming_config": {
+                    "print_frequency_ms": {"default": 50},
+                    "print_step": {"default": 1},
+                },
+            },
+            "header": {
+                "title": {"tag": "plain_text", "content": char_name},
+                "template": "violet",
+            },
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": "┃", "element_id": "content"}
+                ]
+            },
+        }
+
+        # Step 1: Create card
+        resp = _cardkit_client.post(
+            _CARDKIT_BASE,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"type": "card_json", "data": json.dumps(card_json, ensure_ascii=False)},
+        )
+        data = resp.json()
+        if data.get("code") != 0 or not data.get("data", {}).get("card_id"):
+            logger.error(f"Create streaming card failed: {data}")
+            return None
+        card_id = data["data"]["card_id"]
+
+        # Step 2: Send card as message
+        card_content = json.dumps({"type": "card", "data": {"card_id": card_id}})
+        msg_resp = _cardkit_client.post(
+            f"{_FEISHU_BASE}/im/v1/messages?receive_id_type=chat_id",
+            headers=_feishu_headers(),
+            json={
+                "receive_id": chat_id,
+                "msg_type": "interactive",
+                "content": card_content,
+                },
+            )
+        msg_data = msg_resp.json()
+        if msg_data.get("code") != 0:
+            logger.error(f"Send streaming card failed: {msg_data}")
+            return None
+        message_id = msg_data["data"]["message_id"]
+        logger.info(f"Streaming card created: card_id={card_id}, msg_id={message_id}")
+        return card_id, message_id
+    except Exception:
+        logger.exception("create_streaming_card failed")
+        return None
+
+
+def update_streaming_card(card_id: str, text: str, sequence: int) -> None:
+    """Update the content element of a streaming card."""
+    try:
+        token = get_tenant_access_token()
+        _cardkit_client.put(
+            f"{_CARDKIT_BASE}/{card_id}/elements/content/content",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "content": text,
+                "sequence": sequence,
+                "uuid": f"s_{card_id}_{sequence}",
+            },
+        )
+    except Exception as e:
+        logger.warning(f"update_streaming_card failed: {e}")
+
+
+def close_streaming_card(card_id: str, final_text: str, sequence: int) -> None:
+    """Close the streaming card (set streaming_mode=false)."""
+    try:
+        token = get_tenant_access_token()
+        # Final content update
+        update_streaming_card(card_id, final_text, sequence)
+        # Close streaming mode
+        _cardkit_client.patch(
+            f"{_CARDKIT_BASE}/{card_id}/settings",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "settings": json.dumps({"config": {
+                    "streaming_mode": False,
+                    "summary": {"content": (final_text or "")[:50]},
+                }}),
+                "sequence": sequence + 1,
+                "uuid": f"c_{card_id}_{sequence + 1}",
+            },
+            )
+        logger.info(f"Streaming card closed: card_id={card_id}")
+    except Exception:
+        logger.exception("close_streaming_card failed")
+
+
+def _async_card_updater(card_id: str):
+    """Background thread that processes card updates.
+
+    Uses a 'latest value' pattern: if multiple updates queue while one is
+    in-flight, only the most recent text is sent next. This prevents queue
+    buildup when Feishu API latency (~600ms) exceeds the send interval.
+    """
+    _lock = threading.Lock()
+    _pending_text = [None]  # latest text waiting to be sent (None = nothing)
+    _final = [None]         # final text to send + close (None = not yet)
+    _seq = [1]
+    _stop = threading.Event()
+    _has_work = threading.Event()
+
+    def _worker():
+        while not _stop.is_set():
+            _has_work.wait(timeout=0.5)
+            _has_work.clear()
+
+            # Grab whatever is pending
+            with _lock:
+                text = _pending_text[0]
+                _pending_text[0] = None
+                final_text = _final[0]
+
+            if final_text is not None:
+                # Final: update content + close
+                _seq[0] += 1
+                close_streaming_card(card_id, final_text, _seq[0])
+                return
+            elif text is not None:
+                _seq[0] += 1
+                update_streaming_card(card_id, text, _seq[0])
+
+    worker_thread = threading.Thread(target=_worker, daemon=True)
+    worker_thread.start()
+
+    def enqueue_update(text: str):
+        with _lock:
+            _pending_text[0] = text
+        _has_work.set()
+
+    def enqueue_final(text: str):
+        with _lock:
+            _final[0] = text
+        _has_work.set()
+
+    return enqueue_update, enqueue_final, worker_thread
+
+
+def _stream_llm_to_card(session_id: int, user_text: str, card_id: str) -> str:
+    """Call the streaming endpoint and update the card as chunks arrive.
+
+    Card updates run in a background thread. When the Feishu API is slow,
+    intermediate updates are dropped (only the latest snapshot is sent).
+    This ensures the card always catches up quickly.
+    """
+    full_text = ""
+    last_enqueue_time = 0.0
+    ENQUEUE_INTERVAL = 0.3  # how often we push a snapshot to the updater
+
+    enqueue_update, enqueue_final, worker_thread = _async_card_updater(card_id)
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+            with client.stream(
+                "POST",
+                f"{API_BASE}/api/sessions/{session_id}/message/stream",
+                json={"content": user_text},
+            ) as response:
+                for line in response.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                        if "error" in data:
+                            logger.error(f"Stream error: {data['error']}")
+                            break
+                        delta = data.get("delta", "")
+                        if delta:
+                            full_text += delta
+                            now = time.time()
+                            if now - last_enqueue_time >= ENQUEUE_INTERVAL:
+                                enqueue_update(full_text)
+                                last_enqueue_time = now
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+    except Exception:
+        logger.exception("_stream_llm_to_card failed")
+
+    # Final close (waits for at most one in-flight update then closes)
+    enqueue_final(full_text)
+    worker_thread.join(timeout=10)
+    return full_text
+
+
 # ── Internal API calls (SYNCHRONOUS, to our own FastAPI backend) ─────────────
 
 def api_get(path: str):
@@ -329,30 +537,40 @@ def _handle_message(chat_id: str, sender_id: str, text: str) -> None:
             send_text(chat_id, "当前没有活跃会话。请使用 /switch 选择角色，或将机器人拉进新群。")
             return
 
-        # Send message through our API
-        result = api_post(
-            f"/api/sessions/{session['id']}/message",
-            {"content": text},
-        )
+        # Look up character name
+        char_name = "角色"
+        try:
+            characters = api_get("/api/characters")
+            for c in characters:
+                if c["id"] == session.get("character_id"):
+                    char_name = c["name"]
+                    break
+        except Exception:
+            pass
 
-        # Get the latest assistant message
-        messages = result.get("messages", [])
-        if messages:
-            last_msg = messages[-1]
-            if last_msg.get("role") == "assistant":
-                # Look up character name
-                char_name = "角色"
-                try:
-                    characters = api_get("/api/characters")
-                    for c in characters:
-                        if c["id"] == session.get("character_id"):
-                            char_name = c["name"]
-                            break
-                except Exception:
-                    pass
-                card = build_reply_card(char_name, last_msg["content"])
-                send_card(chat_id, card)
-                logger.info(f"Sent reply from {char_name} in {chat_id}")
+        # Try streaming card approach
+        card_info = create_streaming_card(chat_id, char_name)
+        if card_info:
+            card_id, message_id = card_info
+            reply_text = _stream_llm_to_card(session["id"], text, card_id)
+            if reply_text:
+                logger.info(f"Streamed reply from {char_name} in {chat_id} ({len(reply_text)} chars)")
+            else:
+                logger.warning(f"Empty streaming reply in {chat_id}")
+        else:
+            # Fallback to non-streaming
+            logger.info(f"Streaming card failed, falling back to non-streaming")
+            result = api_post(
+                f"/api/sessions/{session['id']}/message",
+                {"content": text},
+            )
+            messages = result.get("messages", [])
+            if messages:
+                last_msg = messages[-1]
+                if last_msg.get("role") == "assistant":
+                    card = build_reply_card(char_name, last_msg["content"])
+                    send_card(chat_id, card)
+                    logger.info(f"Sent reply from {char_name} in {chat_id}")
 
     except Exception as exc:
         logger.exception("handle_message failed")
