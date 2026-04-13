@@ -387,6 +387,12 @@ def api_post(path: str, data: dict):
         return resp.json()
 
 
+def api_delete(path: str):
+    with httpx.Client(timeout=30) as client:
+        resp = client.delete(f"{API_BASE}{path}")
+        resp.raise_for_status()
+
+
 # ── Event Handlers (ALL SYNCHRONOUS) ─────────────────────────────────────────
 
 def _on_bot_added(data) -> None:
@@ -584,7 +590,37 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
         sessions = api_get("/api/sessions")
         for s in sessions:
             if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
-                send_text(chat_id, "会话已重置。（功能完善中）")
+                # Delete the old session
+                try:
+                    api_delete(f"/api/sessions/{s['id']}")
+                except Exception:
+                    pass
+                # Look up character to recreate
+                char_id = s.get("character_id")
+                char_name = "角色"
+                try:
+                    characters = api_get("/api/characters")
+                    for c in characters:
+                        if c["id"] == char_id:
+                            char_name = c["name"]
+                            break
+                except Exception:
+                    pass
+                # Create a fresh session
+                try:
+                    result = api_post("/api/sessions", {
+                        "character_id": char_id,
+                        "feishu_chat_id": chat_id,
+                        "worldbook_ids": [],
+                    })
+                    messages = result.get("messages", [])
+                    if messages:
+                        card = build_reply_card(char_name, messages[0]["content"])
+                        send_card(chat_id, card)
+                    else:
+                        send_text(chat_id, f"会话已重置！与 {char_name} 的对话重新开始。")
+                except Exception:
+                    send_text(chat_id, "重置成功，但创建新会话失败。请用 /switch 选择角色。")
                 return
         send_text(chat_id, "没有活跃会话。")
 
