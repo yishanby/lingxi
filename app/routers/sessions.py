@@ -336,15 +336,21 @@ async def send_message_stream(
             logger.error(f"Streaming LLM error: {exc}")
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
-        # Save messages to DB
+        # Save messages to DB using a fresh session (the dependency session
+        # may already be closed by the time the generator finishes)
         try:
+            from app.database import async_session as _session_factory
             now = datetime.datetime.utcnow().isoformat()
             _current_messages.append(MessageItem(role="user", content=_user_content, timestamp=now))
             _current_messages.append(MessageItem(role="assistant", content=full_reply, timestamp=now))
-            session.messages = json.dumps(
-                [m.model_dump(mode="json") for m in _current_messages], ensure_ascii=False
-            )
-            await db.commit()
+            async with _session_factory() as save_db:
+                s = await save_db.get(Session, _session_id)
+                if s:
+                    s.messages = json.dumps(
+                        [m.model_dump(mode="json") for m in _current_messages], ensure_ascii=False
+                    )
+                    await save_db.commit()
+                    logger.info(f"Saved streaming messages: session={_session_id}, msgs={len(_current_messages)}")
         except Exception as exc:
             logger.error(f"Failed to save streaming messages: {exc}")
 

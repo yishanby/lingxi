@@ -299,12 +299,19 @@ def _async_card_updater(card_id: str):
 
             if final_text is not None:
                 # Final: update content + close
-                _seq[0] += 1
-                close_streaming_card(card_id, final_text, _seq[0])
+                try:
+                    _seq[0] += 1
+                    close_streaming_card(card_id, final_text, _seq[0])
+                except Exception:
+                    logger.exception("Card updater: close failed")
                 return
             elif text is not None:
-                _seq[0] += 1
-                update_streaming_card(card_id, text, _seq[0])
+                try:
+                    _seq[0] += 1
+                    update_streaming_card(card_id, text, _seq[0])
+                    logger.debug(f"Card update seq={_seq[0]} len={len(text)}")
+                except Exception:
+                    logger.exception("Card updater: update failed")
 
     worker_thread = threading.Thread(target=_worker, daemon=True)
     worker_thread.start()
@@ -334,6 +341,7 @@ def _stream_llm_to_card(session_id: int, user_text: str, card_id: str) -> str:
     ENQUEUE_INTERVAL = 0.3  # how often we push a snapshot to the updater
 
     enqueue_update, enqueue_final, worker_thread = _async_card_updater(card_id)
+    logger.info(f"Starting stream: session={session_id}, card={card_id}")
 
     try:
         with httpx.Client(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
@@ -365,6 +373,7 @@ def _stream_llm_to_card(session_id: int, user_text: str, card_id: str) -> str:
     except Exception:
         logger.exception("_stream_llm_to_card failed")
 
+    logger.info(f"Stream done: {len(full_text)} chars, closing card")
     # Final close (waits for at most one in-flight update then closes)
     enqueue_final(full_text)
     worker_thread.join(timeout=10)
