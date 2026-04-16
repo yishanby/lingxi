@@ -497,19 +497,29 @@ async def _handle_command(
             else:
                 response = "❌ 没有待应用的预览。请先运行 /memory rebuild 或 /memory compact"
         elif sub_cmd == "compact":
-            backend = await _resolve_backend(backend_id, db)
-            try:
-                compacted, old_len, new_len, backup_name = await compact_memory(session_id, backend)
-                preview = compacted[:800] + ("…" if len(compacted) > 800 else "")
-                response = (
-                    f"📦 记忆压缩预览：{old_len}字 → {new_len}字 ({new_len*100//old_len}%)\n"
-                    f"备份: {backup_name}\n\n{preview}\n\n"
-                    f"使用 /memory apply 确认替换，或忽略保留原记忆。"
-                )
-            except ValueError as exc:
-                response = f"⚠️ {exc}"
-            except Exception as exc:
-                response = f"❌ 压缩失败: {exc}"
+            if sub_arg.lower() == "preview":
+                from pathlib import Path
+                import aiofiles
+                preview_path = Path(f"data/memory/{session_id}/memory_compact_preview.md")
+                if preview_path.exists():
+                    async with aiofiles.open(preview_path, mode="r", encoding="utf-8") as f:
+                        preview_content = await f.read()
+                    response = f"📋 Compact预览（{len(preview_content)}字）：\n\n{preview_content}"
+                else:
+                    response = "❌ 没有compact预览。请先运行 /memory compact"
+            else:
+                backend = await _resolve_backend(backend_id, db)
+                try:
+                    compacted, old_len, new_len, backup_name = await compact_memory(session_id, backend)
+                    response = (
+                        f"📦 记忆压缩预览：{old_len}字 → {new_len}字 ({new_len*100//old_len}%)\n"
+                        f"备份: {backup_name}\n\n{compacted}\n\n"
+                        f"使用 /memory apply 确认替换，或忽略保留原记忆。"
+                    )
+                except ValueError as exc:
+                    response = f"⚠️ {exc}"
+                except Exception as exc:
+                    response = f"❌ 压缩失败: {exc}"
         elif sub_cmd == "clear":
             await save_memory(session_id, "")
             response = "🗑️ Memory cleared."
