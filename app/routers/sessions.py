@@ -158,14 +158,13 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
     return await _row_to_out(session)
 
 
-@router.get("", response_model=list[SessionOut])
+@router.get("")
 async def list_sessions(
     lite: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(select(Session).order_by(Session.created_at.desc()))
     if lite:
-        # Lightweight: only metadata + message count + last message summary
         sessions = []
         for s in result.scalars().all():
             raw = await load_chat_md(s.id)
@@ -179,12 +178,13 @@ async def list_sessions(
                 "character_id": s.character_id,
                 "feishu_chat_id": s.feishu_chat_id,
                 "status": s.status,
-                "created_at": s.created_at,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
                 "user_name": s.user_name or "用户",
                 "msg_count": msg_count,
                 "last_summary": last_summary,
             })
-        return sessions
+        from fastapi.responses import JSONResponse
+        return JSONResponse(content=sessions)
     return [await _row_to_out(s) for s in result.scalars().all()]
 
 
