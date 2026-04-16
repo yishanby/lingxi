@@ -642,18 +642,35 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             except Exception:
                 char_map = {}
 
+            # Find the most recent active session (highest id)
+            active_sessions = [s for s in chat_sessions if s.get("status") == "active"]
+            current_id = max((s["id"] for s in active_sessions), default=None) if active_sessions else None
+
             lines = ["📋 本群会话列表：\n"]
             for s in chat_sessions:
                 sid = s["id"]
                 char_name = char_map.get(s.get("character_id"), f"角色#{s.get('character_id')}")
                 status = s.get("status", "unknown")
-                status_icon = "🟢" if status == "active" else "⚪"
+                is_current = sid == current_id
+                status_icon = "🟢" if is_current else "⚪"
                 msg_count = len(s.get("messages", []))
-                is_current = status == "active"
                 current_tag = " ← 当前" if is_current else ""
-                lines.append(f"{status_icon} #{sid} {char_name} ({msg_count}条消息) [{status}]{current_tag}")
 
-            lines.append("\n使用 /resume <编号> 恢复归档会话，如 /resume 3")
+                # Last message summary
+                msgs = s.get("messages", [])
+                summary = ""
+                if msgs:
+                    last_msg = msgs[-1]
+                    last_content = last_msg.get("content", "")
+                    # Truncate to ~30 chars
+                    summary = last_content.replace("\n", " ")[:30]
+                    if len(last_content) > 30:
+                        summary += "…"
+                    summary = f"\n   💬 {summary}"
+
+                lines.append(f"{status_icon} #{sid} {char_name} ({msg_count}条消息){current_tag}{summary}")
+
+            lines.append("\n使用 /resume <编号> 恢复会话，如 /resume 3")
             send_text(chat_id, "\n".join(lines))
         except Exception as exc:
             logger.exception("list command failed")
