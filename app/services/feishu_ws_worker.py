@@ -602,7 +602,7 @@ def _handle_message(chat_id: str, sender_id: str, text: str) -> None:
 
 
 # Memory size threshold for compact hint (chars)
-_MEMORY_COMPACT_HINT_THRESHOLD = 5000
+_MEMORY_COMPACT_HINT_THRESHOLD = 10000
 _memory_hint_sent: set[int] = set()  # Track which sessions got the hint this run
 
 
