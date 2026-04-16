@@ -259,6 +259,15 @@ async def extract_memory_full(
         for m in all_messages
     )
 
+    # Truncate to avoid exceeding API request size limits
+    max_chars = 80000
+    if len(conversation_text) > max_chars:
+        conversation_text = conversation_text[-max_chars:]
+        # Find first complete line
+        nl = conversation_text.find("\n")
+        if nl > 0:
+            conversation_text = conversation_text[nl + 1:]
+
     system_prompt = EXTRACTION_FULL_SYSTEM_PROMPT
     if custom_instruction:
         system_prompt += f"\n\nAdditional instruction from user: {custom_instruction}"
