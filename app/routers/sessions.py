@@ -86,10 +86,10 @@ async def _row_to_out(s: Session) -> SessionOut:
     )
 
 
-async def _run_memory_rebuild(session_id, msg_dicts, backend, session, db):
+async def _run_memory_rebuild(session_id, msg_dicts, backend, session, db, custom_instruction=None):
     """Background task for memory rebuild — notifies feishu chat when done."""
     try:
-        result = await extract_memory_rebuild(session_id, msg_dicts, backend)
+        result = await extract_memory_rebuild(session_id, msg_dicts, backend, custom_instruction=custom_instruction)
         chat_id = session.feishu_chat_id
         if chat_id:
             from app.services.feishu_ws_worker import send_text
@@ -455,9 +455,11 @@ async def _handle_command(
             msg_count = len(msg_dicts)
             chunk_count = max(1, sum(len(f"{m['role']}: {m['content']}") for m in msg_dicts) // 60000 + 1)
             response = f"⏳ 开始重建记忆（{msg_count}条消息，预计{chunk_count}个分块），这可能需要几分钟..."
+            if sub_arg:
+                response += f"\n📝 自定义指令：{sub_arg}"
             # Run in background so we can reply immediately
             asyncio.create_task(
-                _run_memory_rebuild(session_id, msg_dicts, backend, session, db)
+                _run_memory_rebuild(session_id, msg_dicts, backend, session, db, custom_instruction=sub_arg or None)
             )
         elif sub_cmd == "apply":
             from pathlib import Path

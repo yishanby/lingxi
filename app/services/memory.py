@@ -303,6 +303,7 @@ async def extract_memory_rebuild(
     session_id: int,
     all_messages: list[dict[str, str]],
     backend_config: dict[str, Any],
+    custom_instruction: str | None = None,
 ) -> str:
     """Process entire conversation in chunks and rebuild memory from scratch.
     
@@ -336,6 +337,10 @@ async def extract_memory_rebuild(
 
     accumulated_memory = ""
 
+    system_prompt = EXTRACTION_FULL_SYSTEM_PROMPT
+    if custom_instruction:
+        system_prompt += f"\n\nAdditional instruction from user: {custom_instruction}"
+
     for i, chunk in enumerate(chunks):
         user_prompt = (
             f"## Current Memory\n{accumulated_memory}\n\n"
@@ -345,7 +350,7 @@ async def extract_memory_rebuild(
         )
 
         llm_messages = [
-            {"role": "system", "content": EXTRACTION_FULL_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
