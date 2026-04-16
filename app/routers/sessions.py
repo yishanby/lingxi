@@ -457,9 +457,7 @@ async def _handle_command(
                 if preview_path.exists():
                     async with aiofiles.open(preview_path, mode="r", encoding="utf-8") as f:
                         preview_content = await f.read()
-                    response = f"📋 Rebuild进度预览（{len(preview_content)}字）：\n\n{preview_content[:2000]}"
-                    if len(preview_content) > 2000:
-                        response += f"\n\n…（共{len(preview_content)}字，已截断）"
+                    response = f"📋 Rebuild进度预览（{len(preview_content)}字）：\n\n{preview_content}"
                 else:
                     response = "❌ 没有正在进行的rebuild，也没有待应用的预览。"
             else:
