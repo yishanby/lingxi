@@ -38,6 +38,7 @@ def assemble_prompt(
     user_name: str = "用户",
     user_persona: str = "",
     persona_position: str = "in_prompt",  # in_prompt / after_scenario / none
+    memory_context: str = "",
 ) -> list[dict[str, str]]:
     """Build the full messages payload for an LLM chat-completion call.
 
@@ -84,6 +85,9 @@ def assemble_prompt(
 
     if wb_after:
         system_parts.append("[Additional World Info]\n" + "\n".join(wb_after))
+
+    if memory_context:
+        system_parts.append(f"[Long-term Memory]\n{memory_context}")
 
     if system_parts:
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})

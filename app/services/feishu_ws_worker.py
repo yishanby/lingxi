@@ -402,6 +402,13 @@ def api_delete(path: str):
         resp.raise_for_status()
 
 
+def api_patch(path: str, data: dict):
+    with httpx.Client(timeout=30) as client:
+        resp = client.patch(f"{API_BASE}{path}", json=data)
+        resp.raise_for_status()
+        return resp.json()
+
+
 # ── Event Handlers (ALL SYNCHRONOUS) ─────────────────────────────────────────
 
 def _on_bot_added(data) -> None:
@@ -595,6 +602,64 @@ def _handle_message(chat_id: str, sender_id: str, text: str) -> None:
 def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
     cmd = text.split()[0].lower()
 
+    if cmd == "/help":
+        help_text = (
+            "📖 可用命令：\n\n"
+            "💬 会话管理\n"
+            "/list — 列出本群所有会话（含已归档）\n"
+            "/switch — 选择/切换角色（归档当前会话）\n"
+            "/resume — 恢复已归档的会话\n"
+            "/reset — 重置当前会话（重新开始对话）\n"
+            "/info — 查看当前会话信息\n\n"
+            "✏️ 对话操作\n"
+            "/retry — 重新生成上一条AI回复\n"
+            "/undo — 撤销上一轮对话\n\n"
+            "🧠 记忆管理\n"
+            "/memory — 查看当前记忆\n"
+            "/memory edit <内容> — 替换全部记忆\n"
+            "/memory delete <关键词> — 删除含关键词的记忆\n"
+            "/memory extract — 从对话中提取记忆\n"
+            "/memory clear — 清空记忆\n"
+            "/remember <内容> — 手动添加一条记忆\n\n"
+            "/help — 显示此帮助信息"
+        )
+        send_text(chat_id, help_text)
+        return
+
+    if cmd == "/list":
+        try:
+            sessions = api_get("/api/sessions")
+            # Filter to this chat only
+            chat_sessions = [s for s in sessions if s.get("feishu_chat_id") == chat_id]
+            if not chat_sessions:
+                send_text(chat_id, "本群还没有任何会话。")
+                return
+
+            # Look up character names
+            try:
+                characters = api_get("/api/characters")
+                char_map = {c["id"]: c["name"] for c in characters}
+            except Exception:
+                char_map = {}
+
+            lines = ["📋 本群会话列表：\n"]
+            for s in chat_sessions:
+                sid = s["id"]
+                char_name = char_map.get(s.get("character_id"), f"角色#{s.get('character_id')}")
+                status = s.get("status", "unknown")
+                status_icon = "🟢" if status == "active" else "⚪"
+                msg_count = len(s.get("messages", []))
+                is_current = status == "active"
+                current_tag = " ← 当前" if is_current else ""
+                lines.append(f"{status_icon} #{sid} {char_name} ({msg_count}条消息) [{status}]{current_tag}")
+
+            lines.append("\n使用 /resume <编号> 恢复归档会话，如 /resume 3")
+            send_text(chat_id, "\n".join(lines))
+        except Exception as exc:
+            logger.exception("list command failed")
+            send_text(chat_id, f"获取会话列表失败: {exc}")
+        return
+
     if cmd == "/reset":
         sessions = api_get("/api/sessions")
         for s in sessions:
@@ -634,6 +699,19 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
         send_text(chat_id, "没有活跃会话。")
 
     elif cmd == "/switch":
+        # Archive the current active session first
+        try:
+            sessions = api_get("/api/sessions")
+            for s in sessions:
+                if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
+                    try:
+                        api_patch(f"/api/sessions/{s['id']}/status", {"status": "archived"})
+                        logger.info(f"Archived session {s['id']} before switch")
+                    except Exception:
+                        logger.exception(f"Failed to archive session {s['id']}")
+        except Exception:
+            pass
+
         characters = api_get("/api/characters")
         if characters:
             char_list = [{"id": c["id"], "name": c["name"]} for c in characters]
@@ -655,8 +733,110 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                 return
         send_text(chat_id, "没有活跃会话。")
 
+    elif cmd == "/resume":
+        try:
+            parts = text.split()
+            sessions = api_get("/api/sessions")
+            chat_sessions = [s for s in sessions if s.get("feishu_chat_id") == chat_id]
+
+            if len(parts) < 2:
+                # Show list of sessions to pick from
+                if not chat_sessions:
+                    send_text(chat_id, "本群没有任何会话。")
+                    return
+                try:
+                    characters = api_get("/api/characters")
+                    char_map = {c["id"]: c["name"] for c in characters}
+                except Exception:
+                    char_map = {}
+
+                lines = ["📋 选择要恢复的会话：\n"]
+                for s in chat_sessions:
+                    sid = s["id"]
+                    char_name = char_map.get(s.get("character_id"), f"角色#{s.get('character_id')}")
+                    status = s.get("status", "unknown")
+                    status_icon = "🟢" if status == "active" else "⚪"
+                    msg_count = len(s.get("messages", []))
+                    lines.append(f"{status_icon} #{sid} {char_name} ({msg_count}条消息) [{status}]")
+                lines.append("\n输入 /resume <编号> 恢复，如 /resume 3")
+                send_text(chat_id, "\n".join(lines))
+                return
+
+            # /resume <number> — activate that session
+            try:
+                target_id = int(parts[1])
+            except ValueError:
+                send_text(chat_id, "用法: /resume <会话编号>，如 /resume 3")
+                return
+
+            # Check target exists and belongs to this chat
+            target_session = None
+            for s in chat_sessions:
+                if s["id"] == target_id:
+                    target_session = s
+                    break
+
+            if not target_session:
+                send_text(chat_id, f"未找到本群的会话 #{target_id}。使用 /list 查看可用会话。")
+                return
+
+            if target_session.get("status") == "active":
+                send_text(chat_id, f"会话 #{target_id} 已经是活跃状态。")
+                return
+
+            # Archive current active session
+            for s in chat_sessions:
+                if s.get("status") == "active":
+                    try:
+                        api_patch(f"/api/sessions/{s['id']}/status", {"status": "archived"})
+                        logger.info(f"Archived session {s['id']} for resume")
+                    except Exception:
+                        logger.exception(f"Failed to archive session {s['id']}")
+
+            # Activate target session
+            api_patch(f"/api/sessions/{target_id}/status", {"status": "active"})
+
+            # Look up character name
+            char_name = f"会话#{target_id}"
+            try:
+                characters = api_get("/api/characters")
+                for c in characters:
+                    if c["id"] == target_session.get("character_id"):
+                        char_name = c["name"]
+                        break
+            except Exception:
+                pass
+
+            send_text(chat_id, f"✅ 已恢复会话 #{target_id}（{char_name}）。继续发消息即可。")
+
+        except Exception as exc:
+            logger.exception("resume command failed")
+            send_text(chat_id, f"恢复会话失败: {exc}")
+        return
+
     else:
-        send_text(chat_id, "可用命令: /reset /switch /info")
+        # Forward to backend API (handles /memory, /remember, /undo, /retry, etc.)
+        try:
+            sessions = api_get("/api/sessions")
+            session = None
+            for s in sessions:
+                if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
+                    session = s
+                    break
+            if not session:
+                send_text(chat_id, "没有活跃会话。请先用 /switch 选择角色。")
+                return
+
+            result = api_post(f"/api/sessions/{session['id']}/message", {"content": text})
+            messages = result.get("messages", [])
+            if messages and messages[-1].get("role") == "assistant":
+                reply = messages[-1]["content"]
+                send_text(chat_id, reply)
+            else:
+                send_text(chat_id, "命令已执行。")
+        except Exception as exc:
+            logger.exception(f"Forward command {cmd} failed")
+            send_text(chat_id, f"未知命令。输入 /help 查看所有可用命令。")
 
 
 def _handle_card_action(chat_id: str, option: str) -> None:
