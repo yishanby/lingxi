@@ -367,6 +367,58 @@ async def extract_memory_rebuild(
     return accumulated_memory
 
 
+# ── 7d. compact_memory ─────────────────────────────────────────────────────
+
+COMPACT_SYSTEM_PROMPT = (
+    "你是一个记忆压缩系统。给定一份角色扮演对话的记忆文档，请将其压缩精炼，保留最重要的信息。\n\n"
+    "规则：\n"
+    "1. 保留核心人物关系、性格特点、重要情节转折点\n"
+    "2. 合并重复或相似的条目\n"
+    "3. 删除已过时/不再相关的细节\n"
+    "4. 保持原有的markdown标题结构（Characters, Relationships, Key Events等）\n"
+    "5. 压缩后的内容应该是原来的 1/3 到 1/2 左右\n"
+    "6. 用简洁的语言，每个要点一行\n"
+    "7. 直接输出压缩后的完整记忆文档"
+)
+
+
+async def compact_memory(
+    session_id: int,
+    backend_config: dict[str, Any],
+) -> str:
+    """压缩memory.md，备份旧文件后用LLM精练。"""
+    import shutil
+
+    memory = await load_memory(session_id)
+    if not memory or not memory.strip():
+        raise ValueError("记忆为空，无需压缩")
+
+    # Backup with timestamp
+    d = _ensure_dir(session_id)
+    now = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup_path = d / f"memory_backup_{now}.md"
+    shutil.copy2(d / "memory.md", backup_path)
+    logger.info(f"Memory backed up to {backup_path}")
+
+    llm_messages = [
+        {"role": "system", "content": COMPACT_SYSTEM_PROMPT},
+        {"role": "user", "content": f"以下是需要压缩的记忆文档（{len(memory)}字）：\n\n{memory}"},
+    ]
+
+    compacted = await chat_completion(
+        provider=backend_config["provider"],
+        api_key=backend_config["api_key"],
+        model=backend_config["model"],
+        base_url=backend_config["base_url"],
+        messages=llm_messages,
+        params=backend_config.get("params", {}),
+    )
+
+    await save_memory(session_id, compacted)
+    logger.info(f"Memory compacted for session {session_id}: {len(memory)} -> {len(compacted)} chars")
+    return compacted, len(memory), len(compacted), backup_path.name
+
+
 # ── 8. should_extract_memory ───────────────────────────────────────────────
 
 async def should_extract_memory(session_id: int, message_count: int) -> bool:

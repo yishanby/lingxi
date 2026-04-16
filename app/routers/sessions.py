@@ -29,6 +29,7 @@ from app.services.memory import (
     extract_memory,
     extract_memory_full,
     extract_memory_rebuild,
+    compact_memory,
     inject_memory_into_prompt,
     load_chat_md,
     load_memory,
@@ -470,6 +471,19 @@ async def _handle_command(
                 response = f"✅ 记忆已更新！（{len(new_memory)}字）"
             else:
                 response = "❌ 没有待应用的重建结果。请先运行 /memory rebuild"
+        elif sub_cmd == "compact":
+            backend = await _resolve_backend(backend_id, db)
+            try:
+                compacted, old_len, new_len, backup_name = await compact_memory(session_id, backend)
+                preview = compacted[:800] + ("…" if len(compacted) > 800 else "")
+                response = (
+                    f"✅ 记忆已压缩！{old_len}字 → {new_len}字 ({new_len*100//old_len}%)\n"
+                    f"备份: {backup_name}\n\n{preview}"
+                )
+            except ValueError as exc:
+                response = f"⚠️ {exc}"
+            except Exception as exc:
+                response = f"❌ 压缩失败: {exc}"
         elif sub_cmd == "clear":
             await save_memory(session_id, "")
             response = "🗑️ Memory cleared."

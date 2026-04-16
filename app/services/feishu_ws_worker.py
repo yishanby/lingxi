@@ -621,6 +621,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             "/memory extract — 从最近对话提取记忆\n"
             "/memory rebuild — 从整个对话重建记忆（耗时较长）\n"
             "/memory apply — 应用重建结果到记忆\n"
+            "/memory compact — 压缩记忆（备份后精练）\n"
             "/memory clear — 清空记忆\n"
             "/remember <内容> — 手动添加一条记忆\n"
             "/summary — 查看前情提要\n"
