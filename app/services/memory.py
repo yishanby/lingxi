@@ -297,6 +297,74 @@ async def extract_memory_full(
     return result
 
 
+# ── 7c. extract_memory_rebuild (chunked, processes entire chat.md) ─────────
+
+async def extract_memory_rebuild(
+    session_id: int,
+    all_messages: list[dict[str, str]],
+    backend_config: dict[str, Any],
+) -> str:
+    """Process entire conversation in chunks and rebuild memory from scratch.
+    
+    Splits the conversation into ~60K char chunks, processes each sequentially,
+    accumulating memory as it goes. Finally produces a clean consolidated memory.
+    """
+    CHUNK_CHARS = 60000
+
+    # Build all conversation lines
+    lines = [
+        f"{m.get('role', 'user')}: {m.get('content', '')}"
+        for m in all_messages
+    ]
+
+    # Split into chunks by character count
+    chunks: list[str] = []
+    current_chunk: list[str] = []
+    current_size = 0
+    for line in lines:
+        line_len = len(line) + 1  # +1 for newline
+        if current_size + line_len > CHUNK_CHARS and current_chunk:
+            chunks.append("\n".join(current_chunk))
+            current_chunk = []
+            current_size = 0
+        current_chunk.append(line)
+        current_size += line_len
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+
+    logger.info(f"Memory rebuild for session {session_id}: {len(all_messages)} messages, {len(chunks)} chunks")
+
+    accumulated_memory = ""
+
+    for i, chunk in enumerate(chunks):
+        user_prompt = (
+            f"## Current Memory\n{accumulated_memory}\n\n"
+            f"## Conversation (part {i+1}/{len(chunks)})\n{chunk}\n\n"
+            "Update the memory document with any new important information from this conversation segment. "
+            "Keep existing important items. Remove outdated info. Output the complete updated memory."
+        )
+
+        llm_messages = [
+            {"role": "system", "content": EXTRACTION_FULL_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        accumulated_memory = await chat_completion(
+            provider=backend_config["provider"],
+            api_key=backend_config["api_key"],
+            model=backend_config["model"],
+            base_url=backend_config["base_url"],
+            messages=llm_messages,
+            params=backend_config.get("params", {}),
+        )
+        logger.info(f"Memory rebuild chunk {i+1}/{len(chunks)} done, memory size: {len(accumulated_memory)}")
+
+    # Save the final result
+    await save_memory(session_id, accumulated_memory)
+    logger.info(f"Memory rebuild complete for session {session_id}")
+    return accumulated_memory
+
+
 # ── 8. should_extract_memory ───────────────────────────────────────────────
 
 async def should_extract_memory(session_id: int, message_count: int) -> bool:

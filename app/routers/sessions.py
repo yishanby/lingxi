@@ -28,6 +28,7 @@ from app.services.memory import (
     append_manual_memory,
     extract_memory,
     extract_memory_full,
+    extract_memory_rebuild,
     inject_memory_into_prompt,
     load_chat_md,
     load_memory,
@@ -82,6 +83,24 @@ async def _row_to_out(s: Session) -> SessionOut:
         status=s.status,
         created_at=s.created_at,
     )
+
+
+async def _run_memory_rebuild(session_id, msg_dicts, backend, session, db):
+    """Background task for memory rebuild — notifies feishu chat when done."""
+    try:
+        result = await extract_memory_rebuild(session_id, msg_dicts, backend)
+        # Notify via feishu if possible
+        chat_id = session.feishu_chat_id
+        if chat_id:
+            from app.services.feishu_ws_worker import send_text
+            preview = result[:500] + ("…" if len(result) > 500 else "")
+            send_text(chat_id, f"✅ 记忆重建完成！\n\n{preview}")
+    except Exception as exc:
+        logger.exception(f"Memory rebuild failed for session {session_id}")
+        chat_id = session.feishu_chat_id
+        if chat_id:
+            from app.services.feishu_ws_worker import send_text
+            send_text(chat_id, f"❌ 记忆重建失败: {exc}")
 
 
 @router.post("", response_model=SessionOut, status_code=201)
@@ -429,6 +448,17 @@ async def _handle_command(
                 response = f"📋 Extracted memory (preview, not saved yet):\n\n{result}\n\nUse `/memory edit <content>` to save."
             except Exception as exc:
                 response = f"❌ Extraction failed: {exc}"
+        elif sub_cmd == "rebuild":
+            # Chunked rebuild from entire chat.md
+            backend = await _resolve_backend(backend_id, db)
+            msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
+            msg_count = len(msg_dicts)
+            chunk_count = max(1, sum(len(f"{m['role']}: {m['content']}") for m in msg_dicts) // 60000 + 1)
+            response = f"⏳ 开始重建记忆（{msg_count}条消息，预计{chunk_count}个分块），这可能需要几分钟..."
+            # Run in background so we can reply immediately
+            asyncio.create_task(
+                _run_memory_rebuild(session_id, msg_dicts, backend, session, db)
+            )
         elif sub_cmd == "clear":
             await save_memory(session_id, "")
             response = "🗑️ Memory cleared."
