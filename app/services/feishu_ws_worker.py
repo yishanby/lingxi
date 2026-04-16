@@ -577,6 +577,7 @@ def _handle_message(chat_id: str, sender_id: str, text: str) -> None:
             reply_text = _stream_llm_to_card(session["id"], text, card_id)
             if reply_text:
                 logger.info(f"Streamed reply from {char_name} in {chat_id} ({len(reply_text)} chars)")
+                _check_memory_size_hint(chat_id, session["id"])
             else:
                 logger.warning(f"Empty streaming reply in {chat_id}")
         else:
@@ -593,10 +594,33 @@ def _handle_message(chat_id: str, sender_id: str, text: str) -> None:
                     card = build_reply_card(char_name, last_msg["content"])
                     send_card(chat_id, card)
                     logger.info(f"Sent reply from {char_name} in {chat_id}")
+                    _check_memory_size_hint(chat_id, session["id"])
 
     except Exception as exc:
         logger.exception("handle_message failed")
         send_text(chat_id, f"处理消息出错: {exc}")
+
+
+# Memory size threshold for compact hint (chars)
+_MEMORY_COMPACT_HINT_THRESHOLD = 5000
+_memory_hint_sent: set[int] = set()  # Track which sessions got the hint this run
+
+
+def _check_memory_size_hint(chat_id: str, session_id: int) -> None:
+    """Send a one-time hint if memory.md is getting large."""
+    if session_id in _memory_hint_sent:
+        return
+    try:
+        from pathlib import Path
+        memory_path = Path(f"data/memory/{session_id}/memory.md")
+        if not memory_path.exists():
+            return
+        size = memory_path.stat().st_size
+        if size > _MEMORY_COMPACT_HINT_THRESHOLD:
+            _memory_hint_sent.add(session_id)
+            send_text(chat_id, f"💡 记忆已较长（{size}字），可能占用较多context。建议使用 /memory compact 精练。")
+    except Exception:
+        pass
 
 
 def _handle_command(text: str, chat_id: str, sender_id: str) -> None:

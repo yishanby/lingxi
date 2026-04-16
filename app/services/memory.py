@@ -414,8 +414,11 @@ async def compact_memory(
         params=backend_config.get("params", {}),
     )
 
-    await save_memory(session_id, compacted)
-    logger.info(f"Memory compacted for session {session_id}: {len(memory)} -> {len(compacted)} chars")
+    # Save to preview file, not overwriting memory.md
+    preview_path = d / "memory_compact_preview.md"
+    async with aiofiles.open(preview_path, mode="w", encoding="utf-8") as f:
+        await f.write(compacted)
+    logger.info(f"Memory compacted for session {session_id}: {len(memory)} -> {len(compacted)} chars (preview)")
     return compacted, len(memory), len(compacted), backup_path.name
 
 

@@ -461,24 +461,36 @@ async def _handle_command(
             )
         elif sub_cmd == "apply":
             from pathlib import Path
-            preview_path = Path(f"data/memory/{session_id}/memory_rebuild_preview.md")
-            if preview_path.exists():
-                import aiofiles
+            import aiofiles
+            # Check for rebuild or compact preview
+            rebuild_path = Path(f"data/memory/{session_id}/memory_rebuild_preview.md")
+            compact_path = Path(f"data/memory/{session_id}/memory_compact_preview.md")
+            preview_path = None
+            source = ""
+            if rebuild_path.exists():
+                preview_path = rebuild_path
+                source = "重建"
+            elif compact_path.exists():
+                preview_path = compact_path
+                source = "压缩"
+            
+            if preview_path:
                 async with aiofiles.open(preview_path, mode="r", encoding="utf-8") as f:
                     new_memory = await f.read()
                 await save_memory(session_id, new_memory)
                 preview_path.unlink()
-                response = f"✅ 记忆已更新！（{len(new_memory)}字）"
+                response = f"✅ {source}记忆已应用！（{len(new_memory)}字）"
             else:
-                response = "❌ 没有待应用的重建结果。请先运行 /memory rebuild"
+                response = "❌ 没有待应用的预览。请先运行 /memory rebuild 或 /memory compact"
         elif sub_cmd == "compact":
             backend = await _resolve_backend(backend_id, db)
             try:
                 compacted, old_len, new_len, backup_name = await compact_memory(session_id, backend)
                 preview = compacted[:800] + ("…" if len(compacted) > 800 else "")
                 response = (
-                    f"✅ 记忆已压缩！{old_len}字 → {new_len}字 ({new_len*100//old_len}%)\n"
-                    f"备份: {backup_name}\n\n{preview}"
+                    f"📦 记忆压缩预览：{old_len}字 → {new_len}字 ({new_len*100//old_len}%)\n"
+                    f"备份: {backup_name}\n\n{preview}\n\n"
+                    f"使用 /memory apply 确认替换，或忽略保留原记忆。"
                 )
             except ValueError as exc:
                 response = f"⚠️ {exc}"
