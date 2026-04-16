@@ -89,12 +89,11 @@ async def _run_memory_rebuild(session_id, msg_dicts, backend, session, db):
     """Background task for memory rebuild — notifies feishu chat when done."""
     try:
         result = await extract_memory_rebuild(session_id, msg_dicts, backend)
-        # Notify via feishu if possible
         chat_id = session.feishu_chat_id
         if chat_id:
             from app.services.feishu_ws_worker import send_text
-            preview = result[:500] + ("…" if len(result) > 500 else "")
-            send_text(chat_id, f"✅ 记忆重建完成！\n\n{preview}")
+            preview = result[:1500] + ("…" if len(result) > 1500 else "")
+            send_text(chat_id, f"✅ 记忆重建完成！内容已保存到预览文件。\n\n{preview}\n\n使用 /memory apply 确认替换当前记忆，或忽略保留原记忆。")
     except Exception as exc:
         logger.exception(f"Memory rebuild failed for session {session_id}")
         chat_id = session.feishu_chat_id
@@ -459,6 +458,18 @@ async def _handle_command(
             asyncio.create_task(
                 _run_memory_rebuild(session_id, msg_dicts, backend, session, db)
             )
+        elif sub_cmd == "apply":
+            from pathlib import Path
+            preview_path = Path(f"data/memory/{session_id}/memory_rebuild_preview.md")
+            if preview_path.exists():
+                import aiofiles
+                async with aiofiles.open(preview_path, mode="r", encoding="utf-8") as f:
+                    new_memory = await f.read()
+                await save_memory(session_id, new_memory)
+                preview_path.unlink()
+                response = f"✅ 记忆已更新！（{len(new_memory)}字）"
+            else:
+                response = "❌ 没有待应用的重建结果。请先运行 /memory rebuild"
         elif sub_cmd == "clear":
             await save_memory(session_id, "")
             response = "🗑️ Memory cleared."

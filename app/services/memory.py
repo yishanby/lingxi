@@ -359,9 +359,11 @@ async def extract_memory_rebuild(
         )
         logger.info(f"Memory rebuild chunk {i+1}/{len(chunks)} done, memory size: {len(accumulated_memory)}")
 
-    # Save the final result
-    await save_memory(session_id, accumulated_memory)
-    logger.info(f"Memory rebuild complete for session {session_id}")
+    # Save to a preview file, not overwriting existing memory.md
+    preview_path = _session_dir(session_id) / "memory_rebuild_preview.md"
+    async with aiofiles.open(preview_path, mode="w", encoding="utf-8") as f:
+        await f.write(accumulated_memory)
+    logger.info(f"Memory rebuild complete for session {session_id}, saved to preview")
     return accumulated_memory
 
 
