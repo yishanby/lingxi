@@ -534,6 +534,14 @@ async def update_rolling_summary(
             for m in truncated_messages
         )
 
+        # Truncate to avoid exceeding API request size limits
+        max_text_chars = 80000
+        if len(truncated_text) > max_text_chars:
+            truncated_text = truncated_text[-max_text_chars:]
+            nl = truncated_text.find("\n")
+            if nl > 0:
+                truncated_text = truncated_text[nl + 1:]
+
         user_prompt_parts = []
         if existing_summary:
             user_prompt_parts.append(f"## 已有故事摘要\n{existing_summary}")
