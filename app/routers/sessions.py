@@ -449,18 +449,32 @@ async def _handle_command(
             except Exception as exc:
                 response = f"❌ Extraction failed: {exc}"
         elif sub_cmd == "rebuild":
-            # Chunked rebuild from entire chat.md
-            backend = await _resolve_backend(backend_id, db)
-            msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
-            msg_count = len(msg_dicts)
-            chunk_count = max(1, sum(len(f"{m['role']}: {m['content']}") for m in msg_dicts) // 60000 + 1)
-            response = f"⏳ 开始重建记忆（{msg_count}条消息，预计{chunk_count}个分块），这可能需要几分钟..."
-            if sub_arg:
-                response += f"\n📝 自定义指令：{sub_arg}"
-            # Run in background so we can reply immediately
-            asyncio.create_task(
-                _run_memory_rebuild(session_id, msg_dicts, backend, session, db, custom_instruction=sub_arg or None)
-            )
+            if sub_arg.lower() == "preview":
+                # Show current rebuild progress
+                from pathlib import Path
+                import aiofiles
+                preview_path = Path(f"data/memory/{session_id}/memory_rebuild_preview.md")
+                if preview_path.exists():
+                    async with aiofiles.open(preview_path, mode="r", encoding="utf-8") as f:
+                        preview_content = await f.read()
+                    response = f"📋 Rebuild进度预览（{len(preview_content)}字）：\n\n{preview_content[:2000]}"
+                    if len(preview_content) > 2000:
+                        response += f"\n\n…（共{len(preview_content)}字，已截断）"
+                else:
+                    response = "❌ 没有正在进行的rebuild，也没有待应用的预览。"
+            else:
+                # Chunked rebuild from entire chat.md
+                backend = await _resolve_backend(backend_id, db)
+                msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
+                msg_count = len(msg_dicts)
+                chunk_count = max(1, sum(len(f"{m['role']}: {m['content']}") for m in msg_dicts) // 60000 + 1)
+                response = f"⏳ 开始重建记忆（{msg_count}条消息，预计{chunk_count}个分块），这可能需要几分钟..."
+                if sub_arg:
+                    response += f"\n📝 自定义指令：{sub_arg}"
+                # Run in background so we can reply immediately
+                asyncio.create_task(
+                    _run_memory_rebuild(session_id, msg_dicts, backend, session, db, custom_instruction=sub_arg or None)
+                )
         elif sub_cmd == "apply":
             from pathlib import Path
             import aiofiles
