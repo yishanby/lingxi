@@ -159,8 +159,32 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
 
 
 @router.get("", response_model=list[SessionOut])
-async def list_sessions(db: AsyncSession = Depends(get_db)):
+async def list_sessions(
+    lite: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(select(Session).order_by(Session.created_at.desc()))
+    if lite:
+        # Lightweight: only metadata + message count + last message summary
+        sessions = []
+        for s in result.scalars().all():
+            raw = await load_chat_md(s.id)
+            msg_count = len(raw)
+            last_summary = ""
+            if raw:
+                last_content = raw[-1].get("content", "")
+                last_summary = last_content.replace("\n", " ")[:50]
+            sessions.append({
+                "id": s.id,
+                "character_id": s.character_id,
+                "feishu_chat_id": s.feishu_chat_id,
+                "status": s.status,
+                "created_at": s.created_at,
+                "user_name": s.user_name or "用户",
+                "msg_count": msg_count,
+                "last_summary": last_summary,
+            })
+        return sessions
     return [await _row_to_out(s) for s in result.scalars().all()]
 
 

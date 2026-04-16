@@ -548,7 +548,7 @@ def _handle_message(chat_id: str, sender_id: str, text: str) -> None:
 
     try:
         # Find active session for this chat
-        sessions = api_get("/api/sessions")
+        sessions = api_get("/api/sessions?lite=true")
         session = None
         for s in sessions:
             if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
@@ -631,7 +631,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
 
     if cmd == "/list":
         try:
-            sessions = api_get("/api/sessions")
+            sessions = api_get("/api/sessions?lite=true")
             # Filter to this chat only
             chat_sessions = [s for s in sessions if s.get("feishu_chat_id") == chat_id]
             if not chat_sessions:
@@ -653,25 +653,19 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             for s in chat_sessions:
                 sid = s["id"]
                 char_name = char_map.get(s.get("character_id"), f"角色#{s.get('character_id')}")
-                status = s.get("status", "unknown")
                 is_current = sid == current_id
                 status_icon = "🟢" if is_current else "⚪"
-                msg_count = len(s.get("messages", []))
+                msg_count = s.get("msg_count", 0)
                 current_tag = " ← 当前" if is_current else ""
 
                 # Last message summary
-                msgs = s.get("messages", [])
-                summary = ""
-                if msgs:
-                    last_msg = msgs[-1]
-                    last_content = last_msg.get("content", "")
-                    # Truncate to ~30 chars
-                    summary = last_content.replace("\n", " ")[:30]
-                    if len(last_content) > 30:
-                        summary += "…"
-                    summary = f"\n   💬 {summary}"
+                summary = s.get("last_summary", "")
+                summary_line = ""
+                if summary:
+                    display = summary[:30] + ("…" if len(summary) > 30 else "")
+                    summary_line = f"\n   💬 {display}"
 
-                lines.append(f"{status_icon} #{sid} {char_name} ({msg_count}条消息){current_tag}{summary}")
+                lines.append(f"{status_icon} #{sid} {char_name} ({msg_count}条消息){current_tag}{summary_line}")
 
             lines.append("\n使用 /resume <编号> 恢复会话，如 /resume 3")
             send_text(chat_id, "\n".join(lines))
@@ -681,7 +675,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
         return
 
     if cmd == "/reset":
-        sessions = api_get("/api/sessions")
+        sessions = api_get("/api/sessions?lite=true")
         for s in sessions:
             if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
                 # Delete the old session
@@ -721,7 +715,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
     elif cmd == "/switch":
         # Archive the current active session first
         try:
-            sessions = api_get("/api/sessions")
+            sessions = api_get("/api/sessions?lite=true")
             for s in sessions:
                 if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
                     try:
@@ -741,7 +735,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             send_text(chat_id, "没有可用角色。")
 
     elif cmd == "/info":
-        sessions = api_get("/api/sessions")
+        sessions = api_get("/api/sessions?lite=true")
         for s in sessions:
             if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
                 msg_count = len(s.get("messages", []))
@@ -756,7 +750,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
     elif cmd == "/resume":
         try:
             parts = text.split()
-            sessions = api_get("/api/sessions")
+            sessions = api_get("/api/sessions?lite=true")
             chat_sessions = [s for s in sessions if s.get("feishu_chat_id") == chat_id]
 
             if len(parts) < 2:
@@ -837,7 +831,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
     else:
         # Forward to backend API (handles /memory, /remember, /undo, /retry, etc.)
         try:
-            sessions = api_get("/api/sessions")
+            sessions = api_get("/api/sessions?lite=true")
             session = None
             for s in sessions:
                 if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
