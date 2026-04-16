@@ -8,6 +8,14 @@ import json
 import logging
 import re
 
+# Delay for background LLM tasks to let main conversation go first
+_BG_DELAY_SECONDS = 30
+
+async def _delayed(coro, delay: float = _BG_DELAY_SECONDS):
+    """Wait *delay* seconds then run *coro*, giving the main LLM priority."""
+    await asyncio.sleep(delay)
+    return await coro
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
@@ -320,10 +328,10 @@ async def send_message(
     msg_dicts_for_summary = [{"role": m.role, "content": m.content} for m in messages]
     if should_update_summary(msg_dicts_for_summary, settings.prompt_history_max_chars):
         asyncio.create_task(
-            update_rolling_summary(
+            _delayed(update_rolling_summary(
                 session_id, msg_dicts_for_summary, backend,
                 settings.prompt_history_max_chars,
-            )
+            ))
         )
 
     # Add OOC instruction if needed
@@ -382,11 +390,11 @@ async def send_message(
     msg_count = len(messages)
     if await should_extract_memory(session_id, msg_count):
         asyncio.create_task(
-            extract_memory(
+            _delayed(extract_memory(
                 session_id,
                 [m.model_dump(mode="json") for m in messages],
                 backend,
-            )
+            ))
         )
 
     return await _row_to_out(session)
@@ -780,10 +788,10 @@ async def send_message_stream(
     _msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
     if should_update_summary(_msg_dicts, _settings.prompt_history_max_chars):
         asyncio.create_task(
-            update_rolling_summary(
+            _delayed(update_rolling_summary(
                 session_id, _msg_dicts, backend,
                 _settings.prompt_history_max_chars,
-            )
+            ))
         )
 
     # Add OOC instruction if needed
