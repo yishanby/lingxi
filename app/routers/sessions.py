@@ -31,9 +31,12 @@ from app.services.memory import (
     inject_memory_into_prompt,
     load_chat_md,
     load_memory,
+    load_summary,
     remove_last_chat_md_entries,
     save_memory,
     should_extract_memory,
+    should_update_summary,
+    update_rolling_summary,
 )
 from app.services.prompt import assemble_prompt
 
@@ -266,6 +269,20 @@ async def send_message(
     # Load memory context
     memory_context = await load_memory(session_id)
 
+    # Load rolling summary
+    summary_context = await load_summary(session_id)
+
+    # Update rolling summary if history exceeds context budget
+    from app.config import settings
+    msg_dicts_for_summary = [{"role": m.role, "content": m.content} for m in messages]
+    if should_update_summary(msg_dicts_for_summary, settings.prompt_history_max_chars):
+        asyncio.create_task(
+            update_rolling_summary(
+                session_id, msg_dicts_for_summary, backend,
+                settings.prompt_history_max_chars,
+            )
+        )
+
     # Add OOC instruction if needed
     ooc_extra = ""
     if msg_type == "ooc":
@@ -285,6 +302,7 @@ async def send_message(
         user_persona=session.user_persona or "",
         persona_position=persona_position,
         memory_context=full_memory,
+        summary_context=summary_context,
     )
 
     # Call LLM
@@ -417,6 +435,35 @@ async def _handle_command(
             logger.error(f"Failed to append chat.md for /remember: {exc}")
         return await _row_to_out(session)
 
+    elif cmd == "/summary":
+        sub_parts = arg.split(maxsplit=1)
+        sub_cmd = sub_parts[0].lower() if sub_parts else ""
+
+        if sub_cmd == "update":
+            backend = await _resolve_backend(backend_id, db)
+            msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
+            try:
+                await update_rolling_summary(
+                    session_id, msg_dicts, backend, settings.prompt_history_max_chars
+                )
+                summary = await load_summary(session_id)
+                response = f"✅ 摘要已更新：\n\n{summary[:500]}" + ("…" if len(summary) > 500 else "")
+            except Exception as exc:
+                response = f"❌ 更新失败: {exc}"
+        elif sub_cmd == "clear":
+            await save_summary(session_id, "")
+            response = "🗑️ 摘要已清空。"
+        else:
+            summary = await load_summary(session_id)
+            response = summary if summary else "(还没有摘要)"
+
+        try:
+            await append_chat_md(session_id, "user", content, char_name=char.name, user_name=user_name)
+            await append_chat_md(session_id, "assistant", response, char_name=char.name, user_name=user_name)
+        except Exception as exc:
+            logger.error(f"Failed to append chat.md for /summary: {exc}")
+        return await _row_to_out(session)
+
     elif cmd == "/undo":
         if len(messages) < 2:
             raise HTTPException(400, "No messages to undo")
@@ -473,6 +520,8 @@ async def _handle_command(
 
         memory_context = await load_memory(session_id)
 
+        summary_context = await load_summary(session_id)
+
         llm_messages = assemble_prompt(
             character=char_dict,
             worldbook_entries=all_entries,
@@ -482,6 +531,7 @@ async def _handle_command(
             user_persona=session.user_persona or "",
             persona_position=persona_position,
             memory_context=memory_context,
+            summary_context=summary_context,
         )
 
         try:
@@ -607,6 +657,20 @@ async def send_message_stream(
     # Load memory context
     memory_context = await load_memory(session_id)
 
+    # Load rolling summary
+    summary_context = await load_summary(session_id)
+
+    # Update rolling summary if needed
+    from app.config import settings as _settings
+    _msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
+    if should_update_summary(_msg_dicts, _settings.prompt_history_max_chars):
+        asyncio.create_task(
+            update_rolling_summary(
+                session_id, _msg_dicts, backend,
+                _settings.prompt_history_max_chars,
+            )
+        )
+
     # Add OOC instruction if needed
     if msg_type == "ooc":
         memory_context = (memory_context + "\n\n" + _OOC_INSTRUCTION) if memory_context else _OOC_INSTRUCTION
@@ -620,6 +684,7 @@ async def send_message_stream(
         user_persona=session.user_persona or "",
         persona_position=persona_position,
         memory_context=memory_context,
+        summary_context=summary_context,
     )
 
     # Capture values needed for DB save after streaming

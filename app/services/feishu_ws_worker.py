@@ -620,7 +620,10 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             "/memory delete <关键词> — 删除含关键词的记忆\n"
             "/memory extract — 从对话中提取记忆\n"
             "/memory clear — 清空记忆\n"
-            "/remember <内容> — 手动添加一条记忆\n\n"
+            "/remember <内容> — 手动添加一条记忆\n"
+            "/summary — 查看前情提要\n"
+            "/summary update — 强制更新摘要\n"
+            "/summary clear — 清空摘要\n\n"
             "/help — 显示此帮助信息"
         )
         send_text(chat_id, help_text)
