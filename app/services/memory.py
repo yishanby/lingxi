@@ -431,8 +431,8 @@ async def compact_memory(
 # ── 8. should_extract_memory ───────────────────────────────────────────────
 
 async def should_extract_memory(session_id: int, message_count: int) -> bool:
-    """Return True every 20 messages."""
-    return message_count > 0 and message_count % 20 == 0
+    """Return True every 2 messages."""
+    return message_count > 0 and message_count % 2 == 0
 
 
 # ── 9. inject_memory_into_prompt ───────────────────────────────────────────

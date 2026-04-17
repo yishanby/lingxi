@@ -836,33 +836,37 @@ async def send_message_stream(
             logger.error(f"Streaming LLM error: {exc}")
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
-        # Write to chat.md
-        try:
-            await append_chat_md(
-                _session_id, "user", _user_content,
-                char_name=_char_name, user_name=_user_name, msg_type=_msg_type,
-            )
-            await append_chat_md(
-                _session_id, "assistant", full_reply,
-                char_name=_char_name, user_name=_user_name,
-            )
-        except Exception as exc:
-            logger.error(f"Failed to append chat.md in stream: {exc}")
+        # Schedule post-stream work as a separate task so it survives client disconnect
+        async def _post_stream_work():
+            # Write to chat.md
+            try:
+                await append_chat_md(
+                    _session_id, "user", _user_content,
+                    char_name=_char_name, user_name=_user_name, msg_type=_msg_type,
+                )
+                await append_chat_md(
+                    _session_id, "assistant", full_reply,
+                    char_name=_char_name, user_name=_user_name,
+                )
+            except Exception as exc:
+                logger.error(f"Failed to append chat.md in stream: {exc}")
 
-        # Reload messages for memory extraction count
-        _current_messages = await _load_session_messages(_session_id)
+            # Reload messages for memory extraction count
+            current_msgs = await _load_session_messages(_session_id)
 
-        # Check memory extraction
-        msg_count = len(_current_messages)
-        logger.info(f"Stream done: session {_session_id}, msg_count={msg_count}, trigger={msg_count % 20 == 0}")
-        if await should_extract_memory(_session_id, msg_count):
-            asyncio.create_task(
-                _delayed(extract_memory(
-                    _session_id,
-                    [m.model_dump(mode="json") for m in _current_messages],
-                    _backend,
-                ))
-            )
+            # Check memory extraction
+            msg_count = len(current_msgs)
+            logger.info(f"Stream post-work: session {_session_id}, msg_count={msg_count}, extract_trigger={msg_count % 2 == 0}")
+            if await should_extract_memory(_session_id, msg_count):
+                asyncio.create_task(
+                    _delayed(extract_memory(
+                        _session_id,
+                        [m.model_dump(mode="json") for m in current_msgs],
+                        _backend,
+                    ))
+                )
+
+        asyncio.create_task(_post_stream_work())
 
         yield "data: [DONE]\n\n"
 
