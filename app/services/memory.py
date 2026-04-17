@@ -430,7 +430,7 @@ async def compact_memory(
 
 # ── 8. should_extract_memory ───────────────────────────────────────────────
 
-_EXTRACT_INTERVAL = 20  # trigger every N new messages
+_EXTRACT_INTERVAL = 10  # trigger every N new messages
 
 
 def _last_extract_path(session_id: int) -> Path:
