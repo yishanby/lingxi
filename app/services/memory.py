@@ -243,6 +243,142 @@ def _merge_memory(existing: str, new_extraction: str) -> str:
     return f"{existing.rstrip()}\n\n---\n### Update [{now}]\n{new_extraction}\n"
 
 
+# ── 7a. Asset Tracking ─────────────────────────────────────────────────────
+
+ASSET_EXTRACTION_PROMPT = (
+    "You are an asset tracking system for a roleplay conversation. "
+    "Given the recent conversation and existing asset records, detect any changes to "
+    "the character's assets (money, property, investments, items of value, debts, income, expenses). "
+    "Output a COMPLETE updated asset record in this exact markdown format:\n"
+    "```\n"
+    "# 资产总览\n"
+    "- 现金：¥XXX\n"
+    "- [资产名称]：[描述/估值]\n"
+    "...\n\n"
+    "# 近期变动\n"
+    "- [日期] [描述] [+/-金额]\n"
+    "...（最近10条）\n"
+    "```\n"
+    "If NO asset changes occurred, output exactly: NO_CHANGE\n"
+    "Keep the 近期变动 section to the last 10 entries max. "
+    "Use Chinese. Be precise with numbers."
+)
+
+ASSET_SUMMARY_PROMPT = (
+    "Summarize the following asset record into ONE concise line (under 80 chars) in Chinese. "
+    "Format: 总资产约¥XX | 现金¥XX | 主要资产：A、B\n"
+    "Output ONLY the summary line, nothing else."
+)
+
+# Asset-related keywords for Layer 1 disclosure
+_ASSET_KEYWORDS = re.compile(
+    r"钱|买|卖|投资|资产|花费|收入|预算|贷款|租金|花了|赚|亏|账|支出|成本|"
+    r"价格|估值|财务|经费|薪|工资|报酬|利润|分红|股|债|房产|地产|物业|酒店|"
+    r"公司|企业|生意|商业|交易|合同|签约|付款|转账|存款|取款"
+)
+
+
+def is_asset_relevant(text: str) -> bool:
+    """Check if user message is asset-related (triggers Layer 1 disclosure)."""
+    return bool(_ASSET_KEYWORDS.search(text))
+
+
+async def load_assets(session_id: int) -> str:
+    """Load full asset record from assets.md."""
+    p = _session_dir(session_id) / "assets.md"
+    if not p.exists():
+        return ""
+    async with aiofiles.open(p, mode="r", encoding="utf-8") as f:
+        return await f.read()
+
+
+async def save_assets(session_id: int, content: str) -> None:
+    """Save full asset record to assets.md."""
+    d = _ensure_dir(session_id)
+    async with aiofiles.open(d / "assets.md", mode="w", encoding="utf-8") as f:
+        await f.write(content)
+
+
+async def load_assets_summary(session_id: int) -> str:
+    """Load one-line asset summary from assets_summary.txt."""
+    p = _session_dir(session_id) / "assets_summary.txt"
+    if not p.exists():
+        return ""
+    async with aiofiles.open(p, mode="r", encoding="utf-8") as f:
+        return (await f.read()).strip()
+
+
+async def save_assets_summary(session_id: int, summary: str) -> None:
+    """Save one-line asset summary."""
+    d = _ensure_dir(session_id)
+    async with aiofiles.open(d / "assets_summary.txt", mode="w", encoding="utf-8") as f:
+        await f.write(summary.strip())
+
+
+async def update_assets(
+    session_id: int,
+    recent_messages: list[dict[str, str]],
+    backend_config: dict[str, Any],
+) -> bool:
+    """Detect asset changes from recent messages and update assets.md + summary.
+    Returns True if assets were updated."""
+    try:
+        existing_assets = await load_assets(session_id)
+
+        conversation_text = "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')}"
+            for m in recent_messages[-20:]
+        )
+
+        user_prompt = (
+            f"## Existing Assets\n{existing_assets or '(无记录)'}\n\n"
+            f"## Recent Conversation\n{conversation_text}\n\n"
+            "Detect any asset changes and output the updated record."
+        )
+
+        llm_messages = [
+            {"role": "system", "content": ASSET_EXTRACTION_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        result = await chat_completion(
+            provider=backend_config["provider"],
+            api_key=backend_config["api_key"],
+            model=backend_config["model"],
+            base_url=backend_config["base_url"],
+            messages=llm_messages,
+            params=backend_config.get("params", {}),
+        )
+
+        if "NO_CHANGE" in result.strip():
+            logger.info(f"No asset changes for session {session_id}")
+            return False
+
+        # Save updated assets
+        await save_assets(session_id, result.strip())
+
+        # Regenerate summary
+        summary_messages = [
+            {"role": "system", "content": ASSET_SUMMARY_PROMPT},
+            {"role": "user", "content": result.strip()},
+        ]
+        summary = await chat_completion(
+            provider=backend_config["provider"],
+            api_key=backend_config["api_key"],
+            model=backend_config["model"],
+            base_url=backend_config["base_url"],
+            messages=summary_messages,
+            params=backend_config.get("params", {}),
+        )
+        await save_assets_summary(session_id, summary.strip())
+        logger.info(f"Assets updated for session {session_id}")
+        return True
+
+    except Exception as exc:
+        logger.error(f"Asset update failed for session {session_id}: {exc}")
+        return False
+
+
 # ── 7b. extract_memory_full (synchronous, replaces memory) ─────────────────
 
 async def extract_memory_full(

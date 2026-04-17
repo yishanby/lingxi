@@ -39,6 +39,9 @@ from app.services.memory import (
     extract_memory_rebuild,
     compact_memory,
     inject_memory_into_prompt,
+    is_asset_relevant,
+    load_assets,
+    load_assets_summary,
     load_chat_md,
     load_memory,
     load_summary,
@@ -46,6 +49,7 @@ from app.services.memory import (
     save_memory,
     should_extract_memory,
     should_update_summary,
+    update_assets,
     update_rolling_summary,
 )
 from app.services.prompt import assemble_prompt
@@ -320,6 +324,10 @@ async def send_message(
     # Load memory context
     memory_context = await load_memory(session_id)
 
+    # Load asset context (Layer 0: summary always, Layer 1: full when relevant)
+    assets_summary = await load_assets_summary(session_id)
+    assets_full = await load_assets(session_id) if is_asset_relevant(content) else ""
+
     # Load rolling summary
     summary_context = await load_summary(session_id)
 
@@ -354,6 +362,8 @@ async def send_message(
         persona_position=persona_position,
         memory_context=full_memory,
         summary_context=summary_context,
+        assets_summary=assets_summary,
+        assets_full=assets_full,
     )
 
     # Call LLM
@@ -395,6 +405,14 @@ async def send_message(
                 [m.model_dump(mode="json") for m in messages],
                 backend,
             ))
+        )
+        # Also update assets alongside memory
+        asyncio.create_task(
+            _delayed(update_assets(
+                session_id,
+                [m.model_dump(mode="json") for m in messages],
+                backend,
+            ), delay=_BG_DELAY_SECONDS + 5)  # stagger after memory extract
         )
 
     return await _row_to_out(session)
@@ -556,6 +574,20 @@ async def _handle_command(
             await append_chat_md(session_id, "assistant", response, char_name=char.name, user_name=user_name)
         except Exception as exc:
             logger.error(f"Failed to append chat.md for /remember: {exc}")
+        return await _row_to_out(session)
+
+    elif cmd == "/assets":
+        assets = await load_assets(session_id)
+        summary = await load_assets_summary(session_id)
+        if assets:
+            response = f"📊 资产概览：{summary}\n\n{assets}"
+        else:
+            response = "还没有资产记录。资产会在对话中自动跟踪更新。"
+        try:
+            await append_chat_md(session_id, "user", content, char_name=char.name, user_name=user_name)
+            await append_chat_md(session_id, "assistant", response, char_name=char.name, user_name=user_name)
+        except Exception as exc:
+            logger.error(f"Failed to append chat.md for /assets: {exc}")
         return await _row_to_out(session)
 
     elif cmd == "/summary":
@@ -780,6 +812,10 @@ async def send_message_stream(
     # Load memory context
     memory_context = await load_memory(session_id)
 
+    # Load asset context (Layer 0: summary always, Layer 1: full when relevant)
+    _assets_summary = await load_assets_summary(session_id)
+    _assets_full = await load_assets(session_id) if is_asset_relevant(content) else ""
+
     # Load rolling summary
     summary_context = await load_summary(session_id)
 
@@ -808,6 +844,8 @@ async def send_message_stream(
         persona_position=persona_position,
         memory_context=memory_context,
         summary_context=summary_context,
+        assets_summary=_assets_summary,
+        assets_full=_assets_full,
     )
 
     # Capture values needed for DB save after streaming
@@ -865,6 +903,14 @@ async def send_message_stream(
                         [m.model_dump(mode="json") for m in current_msgs],
                         _backend,
                     ))
+                )
+                # Also update assets alongside memory
+                asyncio.create_task(
+                    _delayed(update_assets(
+                        _session_id,
+                        [m.model_dump(mode="json") for m in current_msgs],
+                        _backend,
+                    ), delay=_BG_DELAY_SECONDS + 5)
                 )
 
         asyncio.create_task(_post_stream_work())

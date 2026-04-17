@@ -653,6 +653,8 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             "/summary — 查看前情提要\n"
             "/summary update — 强制更新摘要\n"
             "/summary clear — 清空摘要\n\n"
+            "💰 资产追踪\n"
+            "/assets — 查看当前资产记录\n\n"
             "/help — 显示此帮助信息"
         )
         send_text(chat_id, help_text)
