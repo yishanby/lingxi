@@ -856,11 +856,11 @@ async def send_message_stream(
         msg_count = len(_current_messages)
         if await should_extract_memory(_session_id, msg_count):
             asyncio.create_task(
-                extract_memory(
+                _delayed(extract_memory(
                     _session_id,
                     [m.model_dump(mode="json") for m in _current_messages],
                     _backend,
-                )
+                ))
             )
 
         yield "data: [DONE]\n\n"
