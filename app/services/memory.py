@@ -430,9 +430,40 @@ async def compact_memory(
 
 # ── 8. should_extract_memory ───────────────────────────────────────────────
 
+_EXTRACT_INTERVAL = 20  # trigger every N new messages
+
+
+def _last_extract_path(session_id: int) -> Path:
+    return _memory_dir(session_id) / ".last_extract_count"
+
+
+async def _read_last_extract_count(session_id: int) -> int:
+    p = _last_extract_path(session_id)
+    if p.exists():
+        try:
+            async with aiofiles.open(p, mode="r", encoding="utf-8") as f:
+                return int((await f.read()).strip())
+        except (ValueError, OSError):
+            pass
+    return 0
+
+
+async def _save_last_extract_count(session_id: int, count: int) -> None:
+    p = _last_extract_path(session_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    async with aiofiles.open(p, mode="w", encoding="utf-8") as f:
+        await f.write(str(count))
+
+
 async def should_extract_memory(session_id: int, message_count: int) -> bool:
-    """Return True every ~10 messages (whenever count crosses a multiple of 10)."""
-    return message_count > 0 and message_count % 10 < 2
+    """Return True when message_count has grown by >= _EXTRACT_INTERVAL since last extract."""
+    if message_count <= 0:
+        return False
+    last = await _read_last_extract_count(session_id)
+    if message_count - last >= _EXTRACT_INTERVAL:
+        await _save_last_extract_count(session_id, message_count)
+        return True
+    return False
 
 
 # ── 9. inject_memory_into_prompt ───────────────────────────────────────────

@@ -856,8 +856,9 @@ async def send_message_stream(
 
             # Check memory extraction
             msg_count = len(current_msgs)
-            logger.info(f"Stream post-work: session {_session_id}, msg_count={msg_count}, extract_trigger={msg_count % 2 == 0}")
-            if await should_extract_memory(_session_id, msg_count):
+            should_extract = await should_extract_memory(_session_id, msg_count)
+            logger.info(f"Stream post-work: session {_session_id}, msg_count={msg_count}, extract={should_extract}")
+            if should_extract:
                 asyncio.create_task(
                     _delayed(extract_memory(
                         _session_id,
