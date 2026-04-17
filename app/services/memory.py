@@ -379,6 +379,165 @@ async def update_assets(
         return False
 
 
+# ── 7a2. Character Profiles ─────────────────────────────────────────────────
+
+CHARACTER_EXTRACTION_PROMPT = (
+    "You are a character profile extraction system for a roleplay conversation. "
+    "Given the recent conversation and existing character profiles, detect any NEW characters "
+    "or UPDATES to existing characters. For each character with changes, output their COMPLETE "
+    "updated profile in this markdown format:\n"
+    "```\n"
+    "# [角色名]\n"
+    "## 基本信息\n"
+    "- 身份：[职业/身份]\n"
+    "- 外貌：[外貌描述]\n"
+    "- 性格：[性格特点]\n"
+    "- 与主角关系：[关系描述]\n\n"
+    "## 关键事件\n"
+    "- [事件1]\n"
+    "- [事件2]\n\n"
+    "## 近期动态\n"
+    "- [最近的行为/情绪/状态变化]\n"
+    "```\n"
+    "Separate multiple characters with `---` on its own line.\n"
+    "If NO character changes occurred, output exactly: NO_CHANGE\n"
+    "Use Chinese. Be thorough but concise."
+)
+
+
+def _characters_dir(session_id: int) -> Path:
+    d = _session_dir(session_id) / "characters"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+async def list_character_names(session_id: int) -> list[str]:
+    """Return list of known character names from .md files."""
+    d = _session_dir(session_id) / "characters"
+    if not d.exists():
+        return []
+    return [p.stem for p in d.glob("*.md")]
+
+
+async def load_character_profile(session_id: int, name: str) -> str:
+    """Load a single character's profile."""
+    p = _session_dir(session_id) / "characters" / f"{name}.md"
+    if not p.exists():
+        return ""
+    async with aiofiles.open(p, mode="r", encoding="utf-8") as f:
+        return await f.read()
+
+
+async def save_character_profile(session_id: int, name: str, content: str) -> None:
+    """Save a single character's profile."""
+    d = _characters_dir(session_id)
+    async with aiofiles.open(d / f"{name}.md", mode="w", encoding="utf-8") as f:
+        await f.write(content)
+
+
+def find_mentioned_characters(
+    character_names: list[str],
+    user_message: str,
+    recent_messages: list[dict[str, str]] | None = None,
+) -> list[str]:
+    """Find which characters are mentioned in user message + recent 2 rounds."""
+    text = user_message
+    if recent_messages:
+        for m in recent_messages[-4:]:  # last 2 rounds (user+assistant each)
+            text += " " + (m.get("content", "") if isinstance(m, dict) else str(m))
+    return [name for name in character_names if name in text]
+
+
+async def load_mentioned_character_profiles(
+    session_id: int,
+    user_message: str,
+    recent_messages: list[dict[str, str]] | None = None,
+) -> str:
+    """Load profiles of characters mentioned in current context."""
+    names = await list_character_names(session_id)
+    if not names:
+        return ""
+    mentioned = find_mentioned_characters(names, user_message, recent_messages)
+    if not mentioned:
+        return ""
+    profiles = []
+    for name in mentioned:
+        profile = await load_character_profile(session_id, name)
+        if profile:
+            profiles.append(profile)
+    return "\n\n---\n\n".join(profiles)
+
+
+async def update_character_profiles(
+    session_id: int,
+    recent_messages: list[dict[str, str]],
+    backend_config: dict[str, Any],
+) -> bool:
+    """Detect character changes from recent messages and update profiles.
+    Returns True if any profiles were updated."""
+    try:
+        # Load existing profiles for context
+        names = await list_character_names(session_id)
+        existing = ""
+        for name in names:
+            p = await load_character_profile(session_id, name)
+            if p:
+                existing += f"\n\n---\n{p}"
+
+        conversation_text = "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')}"
+            for m in recent_messages[-20:]
+        )
+
+        user_prompt = (
+            f"## Existing Character Profiles\n{existing or '(无记录)'}\n\n"
+            f"## Recent Conversation\n{conversation_text}\n\n"
+            "Detect any character changes and output updated profiles."
+        )
+
+        llm_messages = [
+            {"role": "system", "content": CHARACTER_EXTRACTION_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        result = await chat_completion(
+            provider=backend_config["provider"],
+            api_key=backend_config["api_key"],
+            model=backend_config["model"],
+            base_url=backend_config["base_url"],
+            messages=llm_messages,
+            params=backend_config.get("params", {}),
+        )
+
+        if "NO_CHANGE" in result.strip():
+            logger.info(f"No character changes for session {session_id}")
+            return False
+
+        # Parse output: split by --- and extract character name from # header
+        blocks = re.split(r"\n---\n", result.strip())
+        updated = 0
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+            # Extract name from first # header
+            match = re.match(r"^#\s+(.+)", block)
+            if match:
+                char_name = match.group(1).strip()
+                await save_character_profile(session_id, char_name, block)
+                updated += 1
+                logger.info(f"Character profile updated: {char_name} (session {session_id})")
+
+        if updated:
+            logger.info(f"{updated} character profiles updated for session {session_id}")
+            return True
+        return False
+
+    except Exception as exc:
+        logger.error(f"Character profile update failed for session {session_id}: {exc}")
+        return False
+
+
 # ── 7b. extract_memory_full (synchronous, replaces memory) ─────────────────
 
 async def extract_memory_full(

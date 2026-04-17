@@ -43,6 +43,7 @@ from app.services.memory import (
     load_assets,
     load_assets_summary,
     load_chat_md,
+    load_mentioned_character_profiles,
     load_memory,
     load_summary,
     remove_last_chat_md_entries,
@@ -50,6 +51,7 @@ from app.services.memory import (
     should_extract_memory,
     should_update_summary,
     update_assets,
+    update_character_profiles,
     update_rolling_summary,
 )
 from app.services.prompt import assemble_prompt
@@ -328,6 +330,10 @@ async def send_message(
     assets_summary = await load_assets_summary(session_id)
     assets_full = await load_assets(session_id) if is_asset_relevant(content) else ""
 
+    # Load character profiles for mentioned characters
+    recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-4:]]
+    character_profiles = await load_mentioned_character_profiles(session_id, content, recent_dicts)
+
     # Load rolling summary
     summary_context = await load_summary(session_id)
 
@@ -364,6 +370,7 @@ async def send_message(
         summary_context=summary_context,
         assets_summary=assets_summary,
         assets_full=assets_full,
+        character_profiles=character_profiles,
     )
 
     # Call LLM
@@ -413,6 +420,14 @@ async def send_message(
                 [m.model_dump(mode="json") for m in messages],
                 backend,
             ), delay=_BG_DELAY_SECONDS + 5)  # stagger after memory extract
+        )
+        # Also update character profiles
+        asyncio.create_task(
+            _delayed(update_character_profiles(
+                session_id,
+                [m.model_dump(mode="json") for m in messages],
+                backend,
+            ), delay=_BG_DELAY_SECONDS + 10)  # stagger after assets
         )
 
     return await _row_to_out(session)
@@ -816,6 +831,10 @@ async def send_message_stream(
     _assets_summary = await load_assets_summary(session_id)
     _assets_full = await load_assets(session_id) if is_asset_relevant(content) else ""
 
+    # Load character profiles for mentioned characters
+    _recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-4:]]
+    _char_profiles = await load_mentioned_character_profiles(session_id, content, _recent_dicts)
+
     # Load rolling summary
     summary_context = await load_summary(session_id)
 
@@ -846,6 +865,7 @@ async def send_message_stream(
         summary_context=summary_context,
         assets_summary=_assets_summary,
         assets_full=_assets_full,
+        character_profiles=_char_profiles,
     )
 
     # Capture values needed for DB save after streaming
@@ -911,6 +931,14 @@ async def send_message_stream(
                         [m.model_dump(mode="json") for m in current_msgs],
                         _backend,
                     ), delay=_BG_DELAY_SECONDS + 5)
+                )
+                # Also update character profiles
+                asyncio.create_task(
+                    _delayed(update_character_profiles(
+                        _session_id,
+                        [m.model_dump(mode="json") for m in current_msgs],
+                        _backend,
+                    ), delay=_BG_DELAY_SECONDS + 10)
                 )
 
         asyncio.create_task(_post_stream_work())

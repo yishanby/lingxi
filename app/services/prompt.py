@@ -42,6 +42,7 @@ def assemble_prompt(
     summary_context: str = "",
     assets_summary: str = "",
     assets_full: str = "",
+    character_profiles: str = "",
 ) -> list[dict[str, str]]:
     """Build the full messages payload for an LLM chat-completion call.
 
@@ -97,6 +98,9 @@ def assemble_prompt(
         system_parts.append(f"[资产概览] {assets_summary}")
     if assets_full:
         system_parts.append(f"[资产详情]\n{assets_full}")
+
+    if character_profiles:
+        system_parts.append(f"[角色详情档案]\n{character_profiles}")
 
     if summary_context:
         system_parts.append(f"[Story So Far]\n{summary_context}")
