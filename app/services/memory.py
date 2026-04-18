@@ -729,7 +729,7 @@ _EXTRACT_INTERVAL = 10  # trigger every N new messages
 
 
 def _last_extract_path(session_id: int) -> Path:
-    return _memory_dir(session_id) / ".last_extract_count"
+    return _session_dir(session_id) / ".last_extract_count"
 
 
 async def _read_last_extract_count(session_id: int) -> int:
