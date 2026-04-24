@@ -76,6 +76,7 @@ class Session(Base):
     messages: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of message dicts
     summary: Mapped[str] = mapped_column(Text, default="")  # rolling summary of older messages
     summary_up_to: Mapped[int] = mapped_column(Integer, default=0)  # messages[0:N] already summarised
+    backend_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("backends.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="active")  # active / archived
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now()
@@ -83,6 +84,7 @@ class Session(Base):
 
     character: Mapped[Character] = relationship(back_populates="sessions")
     persona: Mapped[Optional["Persona"]] = relationship()
+    backend: Mapped[Optional["Backend"]] = relationship()
 
 
 class Backend(Base):
@@ -95,6 +97,7 @@ class Backend(Base):
     model: Mapped[str] = mapped_column(String(256), default="")
     base_url: Mapped[str] = mapped_column(Text, default="")
     params: Mapped[str] = mapped_column(Text, default="{}")  # JSON dict
+    is_default: Mapped[bool] = mapped_column(Integer, default=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now()
     )

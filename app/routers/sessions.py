@@ -304,8 +304,9 @@ async def send_message(
             for e in json.loads(wb.entries) if wb.entries else []:
                 all_entries.append(WorldBookEntry(**e))
 
-    # Choose backend
-    backend = await _resolve_backend(body.backend_id, db)
+    # Choose backend: explicit request > session binding > default
+    effective_backend_id = body.backend_id or session.backend_id
+    backend = await _resolve_backend(effective_backend_id, db)
 
     # Build character dict
     char_dict = {
@@ -763,7 +764,18 @@ async def _resolve_backend(
             "base_url": b.base_url,
             "params": json.loads(b.params) if b.params else {},
         }
-    # Fallback: first available backend
+    # Fallback: default backend (is_default=1), then first available
+    result = await db.execute(select(Backend).where(Backend.is_default == True).limit(1))
+    b = result.scalar_one_or_none()
+    if b:
+        return {
+            "provider": b.provider,
+            "api_key": b.api_key,
+            "model": b.model,
+            "base_url": b.base_url,
+            "params": json.loads(b.params) if b.params else {},
+        }
+    # No default marked, fall back to first available
     result = await db.execute(select(Backend).limit(1))
     b = result.scalar_one_or_none()
     if b:
@@ -817,7 +829,8 @@ async def send_message_stream(
             for e in json.loads(wb.entries) if wb.entries else []:
                 all_entries.append(WorldBookEntry(**e))
 
-    backend = await _resolve_backend(body.backend_id, db)
+    effective_backend_id_stream = body.backend_id or session.backend_id
+    backend = await _resolve_backend(effective_backend_id_stream, db)
 
     messages = await _load_session_messages(session_id)
 
