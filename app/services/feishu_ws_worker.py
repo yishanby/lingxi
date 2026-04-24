@@ -655,6 +655,8 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             "/summary clear — 清空摘要\n\n"
             "💰 资产追踪\n"
             "/assets — 查看当前资产记录\n\n"
+            "📊 统计\n"
+            "/stats — 查看Token用量统计\n\n"
             "/help — 显示此帮助信息"
         )
         send_text(chat_id, help_text)
@@ -857,6 +859,34 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
         except Exception as exc:
             logger.exception("resume command failed")
             send_text(chat_id, f"恢复会话失败: {exc}")
+        return
+
+    elif cmd == "/stats":
+        try:
+            parts = text.split()
+            days = 30
+            if len(parts) > 1:
+                try:
+                    days = int(parts[1])
+                except ValueError:
+                    pass
+            stats = api_get(f"/api/stats/tokens?days={days}")
+            lines = [f"📊 Token用量统计（最近{days}天）\n"]
+            lines.append(f"总计: {stats['total_tokens']:,} tokens ({stats['request_count']} 次请求)")
+            lines.append(f"  Prompt: {stats['prompt_tokens']:,}")
+            lines.append(f"  Completion: {stats['completion_tokens']:,}")
+            if stats.get("by_character"):
+                lines.append("\n按角色:")
+                for c in stats["by_character"][:10]:
+                    lines.append(f"  {c['character_name']}: {c['total_tokens']:,} ({c['request_count']}次)")
+            if stats.get("by_model"):
+                lines.append("\n按模型:")
+                for m in stats["by_model"][:5]:
+                    lines.append(f"  {m['model']}: {m['total_tokens']:,} ({m['request_count']}次)")
+            send_text(chat_id, "\n".join(lines))
+        except Exception as exc:
+            logger.exception("stats command failed")
+            send_text(chat_id, f"获取统计失败: {exc}")
         return
 
     else:

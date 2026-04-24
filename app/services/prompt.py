@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-import json
+import logging
 import re
 from typing import Any
 
 from app.schemas.api import MessageItem, WorldBookEntry
+from app.services.token_utils import estimate_tokens, truncate_to_tokens
+
+logger = logging.getLogger(__name__)
 
 
 def _match_worldbook_entries(
@@ -46,18 +49,16 @@ def assemble_prompt(
 ) -> list[dict[str, str]]:
     """Build the full messages payload for an LLM chat-completion call.
 
-    Order:
-      1. System prompt (character system_prompt + personality + scenario + user persona)
-      2. Worldbook entries (position=before_char)
-      3. Character description block
-      4. Worldbook entries (position=after_char)
-      5. Example dialogues (as few-shot user/assistant pairs)
-      6. Chat history
-      7. Current user message
+    Uses a token budget system to keep total input under control:
+      - Layer 0 (fixed): system prompt, character card, worldbook
+      - Layer 1 (recall): memory, assets, character profiles
+      - Layer 2 (conversation): summary + recent messages
     """
+    from app.config import settings
+
     messages: list[dict[str, str]] = []
 
-    # ── 1. System prompt ─────────────────────────────────────────────────
+    # ── Layer 0: System prompt (fixed) ───────────────────────────────────
     system_parts: list[str] = []
     if character.get("system_prompt"):
         system_parts.append(character["system_prompt"].replace("{{user}}", user_name).replace("{{char}}", character["name"]))
@@ -66,14 +67,11 @@ def assemble_prompt(
     if character.get("scenario"):
         system_parts.append(f"Scenario: {character['scenario'].replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
 
-    # User persona (position: after_scenario)
-    if user_persona and persona_position == "after_scenario":
-        system_parts.append(f"[User Character: {user_name}]\n{user_persona.replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
-    # User persona / protagonist definition (position: in_prompt)
-    if user_persona and persona_position == "in_prompt":
+    # User persona
+    if user_persona and persona_position in ("after_scenario", "in_prompt"):
         system_parts.append(f"[User Character: {user_name}]\n{user_persona.replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
 
-    # ── 2 & 4. Worldbook entries ─────────────────────────────────────────
+    # Worldbook entries
     recent_text = " ".join(
         m.content for m in chat_history[-10:]
     ) + " " + user_message
@@ -82,7 +80,6 @@ def assemble_prompt(
     if wb_before:
         system_parts.append("[World Info]\n" + "\n".join(wb_before))
 
-    # ── 3. Description ───────────────────────────────────────────────────
     if character.get("description"):
         desc = character["description"].replace("{{user}}", user_name).replace("{{char}}", character["name"])
         system_parts.append(f"[Character: {character['name']}]\n{desc}")
@@ -90,65 +87,105 @@ def assemble_prompt(
     if wb_after:
         system_parts.append("[Additional World Info]\n" + "\n".join(wb_after))
 
+    # ── Layer 1: Recall (memory, assets, profiles) ───────────────────────
+    layer1_parts: list[str] = []
     if memory_context:
-        system_parts.append(f"[Long-term Memory]\n{memory_context}")
-
-    # Asset disclosure: Layer 0 (summary always) + Layer 1 (full when relevant)
+        layer1_parts.append(f"[Long-term Memory]\n{memory_context}")
     if assets_summary:
-        system_parts.append(f"[资产概览] {assets_summary}")
+        layer1_parts.append(f"[资产概览] {assets_summary}")
     if assets_full:
-        system_parts.append(f"[资产详情]\n{assets_full}")
-
+        layer1_parts.append(f"[资产详情]\n{assets_full}")
     if character_profiles:
-        system_parts.append(f"[角色详情档案]\n{character_profiles}")
+        layer1_parts.append(f"[角色详情档案]\n{character_profiles}")
 
+    # Truncate layer 1 to budget
+    layer1_text = "\n\n".join(layer1_parts)
+    layer1_text = truncate_to_tokens(layer1_text, settings.layer1_budget)
+    if layer1_text:
+        system_parts.append(layer1_text)
+
+    # ── Layer 2: Summary (truncated) ─────────────────────────────────────
     if summary_context:
-        system_parts.append(f"[Story So Far]\n{summary_context}")
+        truncated_summary = truncate_to_tokens(summary_context, settings.summary_max_tokens)
+        system_parts.append(f"[Story So Far]\n{truncated_summary}")
 
+    # Assemble system message
     if system_parts:
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 
-    # ── 5. Example dialogues (simple {{user}}/{{char}} parsing) ──────────
+    # ── Example dialogues ────────────────────��───────────────────────────
     if character.get("example_dialogues"):
         examples = _parse_example_dialogues(
             character["example_dialogues"], character["name"], user_name
         )
         messages.extend(examples)
 
-    # ── 6. Chat history (truncated to fit context budget) ─────────────
-    from app.config import settings
-    max_history_chars = settings.prompt_history_max_chars
-    truncated_history: list[MessageItem] = []
-    char_count = 0
-    for m in reversed(chat_history):
-        msg_len = len(m.content)
-        if char_count + msg_len > max_history_chars:
-            break
-        truncated_history.append(m)
-        char_count += msg_len
-    truncated_history.reverse()
+    # ── Layer 2: Chat history (token-budget-aware) ───────────────────────
+    # Calculate remaining budget for conversation messages
+    current_tokens = sum(estimate_tokens(m["content"]) for m in messages)
+    user_msg_tokens = estimate_tokens(user_message)
+    remaining_budget = settings.total_token_budget - current_tokens - user_msg_tokens
 
-    for m in truncated_history:
+    # Take messages from newest to oldest until budget exhausted
+    selected: list[MessageItem] = []
+    used_tokens = 0
+    for m in reversed(chat_history):
+        msg_tokens = estimate_tokens(m.content)
+        if used_tokens + msg_tokens > remaining_budget and len(selected) >= settings.min_recent_messages:
+            break
+        selected.append(m)
+        used_tokens += msg_tokens
+        # Always include at least min_recent_messages
+        if used_tokens > remaining_budget and len(selected) >= settings.min_recent_messages:
+            break
+
+    selected.reverse()
+
+    for m in selected:
         messages.append({"role": m.role, "content": m.content})
 
-    # ── 7. Current user message ──────────────────────────────────────────
+    # ── Current user message ─────────────────────────────────────────────
     messages.append({"role": "user", "content": user_message})
 
+    # ── Final budget check: trim from oldest history if still over ───────
+    total_tokens = sum(estimate_tokens(m["content"]) for m in messages)
+    if total_tokens > settings.total_token_budget:
+        _trim_to_budget(messages, settings.total_token_budget, settings.min_recent_messages)
+
+    logger.debug(
+        "Prompt assembled: %d messages, ~%d tokens",
+        len(messages),
+        sum(estimate_tokens(m["content"]) for m in messages),
+    )
+
     return messages
+
+
+def _trim_to_budget(
+    messages: list[dict[str, str]],
+    budget: int,
+    min_recent: int,
+) -> None:
+    """Remove oldest non-system, non-final messages until under budget."""
+    while sum(estimate_tokens(m["content"]) for m in messages) > budget:
+        # Find the first removable message (not system, not the last `min_recent + 1` messages)
+        # +1 for the current user message at the end
+        protected_tail = min_recent + 1
+        removable_start = None
+        for i, m in enumerate(messages):
+            if m["role"] != "system":
+                removable_start = i
+                break
+        if removable_start is None or len(messages) - removable_start <= protected_tail:
+            break  # can't remove any more
+        messages.pop(removable_start)
 
 
 def _parse_example_dialogues(
     text: str, char_name: str, user_name: str = "用户"
 ) -> list[dict[str, str]]:
-    """Parse SillyTavern example dialogue format into user/assistant message pairs.
-
-    Format:
-      <START>
-      {{user}}: Hello
-      {{char}}: Hi there!
-    """
+    """Parse SillyTavern example dialogue format into user/assistant message pairs."""
     messages: list[dict[str, str]] = []
-    # Split on <START> blocks
     blocks = re.split(r"<START>", text, flags=re.IGNORECASE)
     for block in blocks:
         block = block.strip()

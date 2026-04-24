@@ -46,11 +46,11 @@ EXTRACTION_FULL_SYSTEM_PROMPT = (
 
 EXTRACTION_SYSTEM_PROMPT = (
     "You are a memory extraction system for a roleplay conversation. "
-    "Given the recent conversation, extract and update the following categories. "
-    "Output ONLY the new/changed items in markdown format with these exact headers: "
-    "Characters, Relationships, Key Events, Decisions, User Preferences. "
-    "Be concise. Use bullet points. If a category has no new items, omit it entirely. "
-    "Do NOT repeat items that are already in the existing memory."
+    "Given the recent conversation and existing memory, produce a COMPLETE updated memory document "
+    "that replaces the old one. Merge new information into existing sections. "
+    "Use these exact markdown headers: Characters, Relationships, Key Events, Decisions, User Preferences. "
+    "Be concise. Use bullet points. Remove outdated or redundant items. "
+    "This output will REPLACE the entire memory file."
 )
 
 
@@ -167,6 +167,103 @@ async def load_memory(session_id: int) -> str:
         return await f.read()
 
 
+# Keywords that mark "always include" blocks
+_ALWAYS_INCLUDE_KEYWORDS = re.compile(
+    r"仪表盘|规则|偏好|关系|Relationships|Preferences|User Preferences|Decisions|Dashboard"
+)
+
+
+def _split_memory_blocks(memory_text: str) -> list[tuple[str, str]]:
+    """Split memory.md by ## or # headings into (heading, content) tuples."""
+    blocks: list[tuple[str, str]] = []
+    current_heading = ""
+    current_lines: list[str] = []
+
+    for line in memory_text.split("\n"):
+        if re.match(r'^#{1,2}\s+', line):
+            if current_heading or current_lines:
+                blocks.append((current_heading, "\n".join(current_lines)))
+            current_heading = line
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    if current_heading or current_lines:
+        blocks.append((current_heading, "\n".join(current_lines)))
+
+    return blocks
+
+
+def _extract_block_keywords(heading: str, content: str) -> set[str]:
+    """Extract potential keywords (names, places) from a memory block for matching."""
+    text = heading + " " + content
+    # Extract CJK names (2-4 chars that look like names), and capitalized English words
+    cjk_names = set(re.findall(r'[\u4e00-\u9fff]{2,4}', text))
+    en_names = set(re.findall(r'[A-Z][a-z]+(?:\s[A-Z][a-z]+)*', text))
+    return cjk_names | en_names
+
+
+async def load_memory_relevant(
+    session_id: int,
+    user_message: str,
+    recent_messages: list[dict[str, str]] | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    """Load only relevant chunks of memory.md based on keyword matching.
+
+    - Splits memory by markdown headings
+    - Always includes blocks matching _ALWAYS_INCLUDE_KEYWORDS
+    - Includes blocks whose keywords appear in user_message or recent messages
+    - Falls back to a minimal set if nothing matches
+    """
+    from app.services.token_utils import estimate_tokens, truncate_to_tokens
+
+    if max_tokens is None:
+        from app.config import settings
+        max_tokens = settings.layer1_budget
+
+    memory_text = await load_memory(session_id)
+    if not memory_text or not memory_text.strip():
+        return ""
+
+    blocks = _split_memory_blocks(memory_text)
+    if not blocks:
+        return ""
+
+    # Build context text for matching
+    context_text = user_message
+    if recent_messages:
+        for m in recent_messages[-4:]:
+            context_text += " " + (m.get("content", "") if isinstance(m, dict) else str(m))
+
+    selected: list[str] = []
+    fallback_blocks: list[str] = []  # always-include blocks
+
+    for heading, content in blocks:
+        block_text = (heading + "\n" + content).strip()
+        if not block_text:
+            continue
+
+        # Always include blocks with dashboard/rules/preferences/relationships
+        if _ALWAYS_INCLUDE_KEYWORDS.search(heading):
+            fallback_blocks.append(block_text)
+            selected.append(block_text)
+            continue
+
+        # Check if any keywords from this block appear in context
+        keywords = _extract_block_keywords(heading, content)
+        if any(kw in context_text for kw in keywords if len(kw) >= 2):
+            selected.append(block_text)
+
+    # If nothing matched beyond always-include, use fallback
+    if len(selected) <= len(fallback_blocks) and fallback_blocks:
+        result = "\n\n".join(fallback_blocks)
+    else:
+        result = "\n\n".join(selected)
+
+    return truncate_to_tokens(result, max_tokens)
+
+
 # ── 5. save_context_snapshot ────────────────────────────────────────────────
 
 async def save_context_snapshot(session_id: int, snapshot: str) -> None:
@@ -215,14 +312,14 @@ async def extract_memory(
             {"role": "user", "content": user_prompt},
         ]
 
-        extraction = await chat_completion(
+        extraction = (await chat_completion(
             provider=backend_config["provider"],
             api_key=backend_config["api_key"],
             model=backend_config["model"],
             base_url=backend_config["base_url"],
             messages=llm_messages,
             params=backend_config.get("params", {}),
-        )
+        ))["content"]
 
         # Merge: append new extractions to existing memory
         if existing_memory:
@@ -238,7 +335,12 @@ async def extract_memory(
 
 
 def _merge_memory(existing: str, new_extraction: str) -> str:
-    """Append new extraction results under an update separator."""
+    """LLM outputs a complete replacement; use it directly instead of appending."""
+    # The new extraction IS the full updated memory (see EXTRACTION_SYSTEM_PROMPT change).
+    # If it looks like a complete document (has markdown headers), use as-is.
+    if re.search(r'^#{1,2}\s+', new_extraction, re.MULTILINE):
+        return new_extraction.strip() + "\n"
+    # Fallback: if extraction is just fragments, append (legacy compat)
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     return f"{existing.rstrip()}\n\n---\n### Update [{now}]\n{new_extraction}\n"
 
@@ -341,14 +443,14 @@ async def update_assets(
             {"role": "user", "content": user_prompt},
         ]
 
-        result = await chat_completion(
+        result = (await chat_completion(
             provider=backend_config["provider"],
             api_key=backend_config["api_key"],
             model=backend_config["model"],
             base_url=backend_config["base_url"],
             messages=llm_messages,
             params=backend_config.get("params", {}),
-        )
+        ))["content"]
 
         if "NO_CHANGE" in result.strip():
             logger.info(f"No asset changes for session {session_id}")
@@ -362,14 +464,14 @@ async def update_assets(
             {"role": "system", "content": ASSET_SUMMARY_PROMPT},
             {"role": "user", "content": result.strip()},
         ]
-        summary = await chat_completion(
+        summary = (await chat_completion(
             provider=backend_config["provider"],
             api_key=backend_config["api_key"],
             model=backend_config["model"],
             base_url=backend_config["base_url"],
             messages=summary_messages,
             params=backend_config.get("params", {}),
-        )
+        ))["content"]
         await save_assets_summary(session_id, summary.strip())
         logger.info(f"Assets updated for session {session_id}")
         return True
@@ -500,14 +602,14 @@ async def update_character_profiles(
             {"role": "user", "content": user_prompt},
         ]
 
-        result = await chat_completion(
+        result = (await chat_completion(
             provider=backend_config["provider"],
             api_key=backend_config["api_key"],
             model=backend_config["model"],
             base_url=backend_config["base_url"],
             messages=llm_messages,
             params=backend_config.get("params", {}),
-        )
+        ))["content"]
 
         if "NO_CHANGE" in result.strip():
             logger.info(f"No character changes for session {session_id}")
@@ -578,14 +680,14 @@ async def extract_memory_full(
         {"role": "user", "content": user_prompt},
     ]
 
-    result = await chat_completion(
+    result = (await chat_completion(
         provider=backend_config["provider"],
         api_key=backend_config["api_key"],
         model=backend_config["model"],
         base_url=backend_config["base_url"],
         messages=llm_messages,
         params=backend_config.get("params", {}),
-    )
+    ))["content"]
 
     # Don't save — return only. User decides via /memory edit.
     logger.info(f"Full memory extraction for session {session_id} (preview only)")
@@ -649,14 +751,14 @@ async def extract_memory_rebuild(
             {"role": "user", "content": user_prompt},
         ]
 
-        accumulated_memory = await chat_completion(
+        accumulated_memory = (await chat_completion(
             provider=backend_config["provider"],
             api_key=backend_config["api_key"],
             model=backend_config["model"],
             base_url=backend_config["base_url"],
             messages=llm_messages,
             params=backend_config.get("params", {}),
-        )
+        ))["content"]
         logger.info(f"Memory rebuild chunk {i+1}/{len(chunks)} done, memory size: {len(accumulated_memory)}")
 
         # Persist after each chunk so progress is not lost
@@ -706,14 +808,14 @@ async def compact_memory(
         {"role": "user", "content": f"以下是需要压缩的记忆文档（{len(memory)}字）：\n\n{memory}"},
     ]
 
-    compacted = await chat_completion(
+    compacted = (await chat_completion(
         provider=backend_config["provider"],
         api_key=backend_config["api_key"],
         model=backend_config["model"],
         base_url=backend_config["base_url"],
         messages=llm_messages,
         params=backend_config.get("params", {}),
-    )
+    ))["content"]
 
     # Save to preview file, not overwriting memory.md
     preview_path = d / "memory_compact_preview.md"
@@ -885,14 +987,14 @@ async def update_rolling_summary(
             {"role": "user", "content": "\n\n".join(user_prompt_parts)},
         ]
 
-        new_summary = await chat_completion(
+        new_summary = (await chat_completion(
             provider=backend_config["provider"],
             api_key=backend_config["api_key"],
             model=backend_config["model"],
             base_url=backend_config["base_url"],
             messages=llm_messages,
             params=backend_config.get("params", {}),
-        )
+        ))["content"]
 
         await save_summary(session_id, new_summary)
         logger.info(f"Rolling summary updated for session {session_id}")

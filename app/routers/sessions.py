@@ -31,6 +31,7 @@ from app.schemas.api import (
     WorldBookEntry,
 )
 from app.services.llm import LLMError, chat_completion, chat_completion_stream
+from app.services.token_tracker import record_usage
 from app.services.memory import (
     append_chat_md,
     append_manual_memory,
@@ -45,6 +46,7 @@ from app.services.memory import (
     load_chat_md,
     load_mentioned_character_profiles,
     load_memory,
+    load_memory_relevant,
     load_summary,
     remove_last_chat_md_entries,
     save_memory,
@@ -323,15 +325,15 @@ async def send_message(
         if persona:
             persona_position = persona.description_position or "in_prompt"
 
-    # Load memory context
-    memory_context = await load_memory(session_id)
+    # Load memory context (relevant chunks only, within token budget)
+    recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-4:]]
+    memory_context = await load_memory_relevant(session_id, content, recent_dicts)
 
     # Load asset context (Layer 0: summary always, Layer 1: full when relevant)
     assets_summary = await load_assets_summary(session_id)
     assets_full = await load_assets(session_id) if is_asset_relevant(content) else ""
 
     # Load character profiles for mentioned characters
-    recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-4:]]
     character_profiles = await load_mentioned_character_profiles(session_id, content, recent_dicts)
 
     # Load rolling summary
@@ -375,7 +377,7 @@ async def send_message(
 
     # Call LLM
     try:
-        reply = await chat_completion(
+        result = await chat_completion(
             provider=backend["provider"],
             api_key=backend["api_key"],
             model=backend["model"],
@@ -383,6 +385,11 @@ async def send_message(
             messages=llm_messages,
             params=backend["params"],
         )
+        reply = result["content"]
+        asyncio.create_task(record_usage(
+            session_id=session_id, user_id=session.user_id,
+            character_name=char.name, model=backend["model"], usage=result["usage"],
+        ))
     except LLMError as exc:
         raise HTTPException(502, f"LLM error: {exc}")
 
@@ -688,7 +695,8 @@ async def _handle_command(
             if persona:
                 persona_position = persona.description_position or "in_prompt"
 
-        memory_context = await load_memory(session_id)
+        recent_dicts_retry = [{"role": m.role, "content": m.content} for m in messages[-4:]]
+        memory_context = await load_memory_relevant(session_id, retry_content, recent_dicts_retry)
 
         summary_context = await load_summary(session_id)
 
@@ -705,7 +713,7 @@ async def _handle_command(
         )
 
         try:
-            reply = await chat_completion(
+            result = await chat_completion(
                 provider=backend["provider"],
                 api_key=backend["api_key"],
                 model=backend["model"],
@@ -713,6 +721,11 @@ async def _handle_command(
                 messages=llm_messages,
                 params=backend["params"],
             )
+            reply = result["content"]
+            asyncio.create_task(record_usage(
+                session_id=session_id, user_id=session.user_id,
+                character_name=char.name, model=backend["model"], usage=result["usage"],
+            ))
         except LLMError as exc:
             raise HTTPException(502, f"LLM error: {exc}")
 
@@ -824,15 +837,15 @@ async def send_message_stream(
         if persona:
             persona_position = persona.description_position or "in_prompt"
 
-    # Load memory context
-    memory_context = await load_memory(session_id)
+    # Load memory context (relevant chunks only)
+    _recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-4:]]
+    memory_context = await load_memory_relevant(session_id, content, _recent_dicts)
 
     # Load asset context (Layer 0: summary always, Layer 1: full when relevant)
     _assets_summary = await load_assets_summary(session_id)
     _assets_full = await load_assets(session_id) if is_asset_relevant(content) else ""
 
     # Load character profiles for mentioned characters
-    _recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-4:]]
     _char_profiles = await load_mentioned_character_profiles(session_id, content, _recent_dicts)
 
     # Load rolling summary
@@ -879,6 +892,7 @@ async def send_message_stream(
 
     async def generate():
         full_reply = ""
+        stream_usage = {}
         try:
             async for chunk in chat_completion_stream(
                 provider=backend["provider"],
@@ -888,11 +902,21 @@ async def send_message_stream(
                 messages=llm_messages,
                 params=backend["params"],
             ):
+                if isinstance(chunk, dict):
+                    stream_usage = chunk.get("usage", {})
+                    continue
                 full_reply += chunk
                 yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
         except Exception as exc:
             logger.error(f"Streaming LLM error: {exc}")
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+
+        # Record token usage
+        if stream_usage:
+            asyncio.create_task(record_usage(
+                session_id=_session_id, user_id=session.user_id,
+                character_name=_char_name, model=_backend["model"], usage=stream_usage,
+            ))
 
         # Schedule post-stream work as a separate task so it survives client disconnect
         async def _post_stream_work():

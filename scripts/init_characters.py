@@ -44,7 +44,7 @@ async def main():
         "so include everyone mentioned."
     )
 
-    result = await chat_completion(
+    result = (await chat_completion(
         provider=backend["provider"],
         api_key=backend["api_key"],
         model=backend["model"],
@@ -54,7 +54,7 @@ async def main():
             {"role": "user", "content": user_prompt},
         ],
         params=params,
-    )
+    ))["content"]
 
     print(f"LLM output length: {len(result)}")
 

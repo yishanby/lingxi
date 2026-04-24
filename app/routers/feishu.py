@@ -16,6 +16,7 @@ from app.models.tables import Character, Session
 from app.schemas.api import MessageItem, SessionCreate, WorldBookEntry
 from app.services import feishu_client
 from app.services.llm import LLMError, chat_completion
+from app.services.token_tracker import record_usage
 from app.services.prompt import assemble_prompt
 
 logger = logging.getLogger(__name__)
@@ -158,6 +159,7 @@ async def _handle_message(event: dict[str, Any], db: AsyncSession) -> None:
         worldbook_entries=all_entries,
         chat_history=messages,
         user_message=text,
+        summary_context=session.summary or "",
     )
 
     # Resolve backend
@@ -165,7 +167,7 @@ async def _handle_message(event: dict[str, Any], db: AsyncSession) -> None:
 
     try:
         backend = await _resolve_backend(None, db)
-        reply = await chat_completion(
+        result = await chat_completion(
             provider=backend["provider"],
             api_key=backend["api_key"],
             model=backend["model"],
@@ -173,6 +175,13 @@ async def _handle_message(event: dict[str, Any], db: AsyncSession) -> None:
             messages=llm_messages,
             params=backend["params"],
         )
+        reply = result["content"]
+        usage_info = result["usage"]
+        import asyncio
+        asyncio.create_task(record_usage(
+            session_id=session.id, user_id=sender,
+            character_name=char.name, model=backend["model"], usage=usage_info,
+        ))
     except (LLMError, Exception) as exc:
         logger.exception("LLM call failed in Feishu handler")
         await feishu_client.send_text_message(chat_id, f"LLM error: {exc}")
@@ -189,8 +198,19 @@ async def _handle_message(event: dict[str, Any], db: AsyncSession) -> None:
     )
     await db.commit()
 
+    # Trigger background summary if enough unsummarised messages accumulated
+    from app.services.summarizer import maybe_summarize
+    asyncio.create_task(maybe_summarize(session.id, backend))
+
+    # Append token usage footer
+    p_tok = usage_info.get("prompt_tokens", 0)
+    c_tok = usage_info.get("completion_tokens", 0)
+    t_tok = usage_info.get("total_tokens", 0)
+    usage_footer = f"\n\n---\n💡 Token: {t_tok:,} (输入 {p_tok:,} / 输出 {c_tok:,})"
+    display_reply = reply + usage_footer
+
     # Reply with a card showing character name
-    card = feishu_client.build_character_reply_card(char.name, reply)
+    card = feishu_client.build_character_reply_card(char.name, display_reply)
     await feishu_client.send_interactive_card(chat_id, card)
 
 
@@ -253,9 +273,43 @@ async def _handle_command(
         else:
             await feishu_client.send_text_message(chat_id, "No active session.")
 
+    elif cmd == "/stats":
+        from app.services.token_tracker import get_usage_stats
+
+        # Parse optional days argument: /stats 7
+        parts = text.split()
+        days = 30
+        if len(parts) > 1:
+            try:
+                days = int(parts[1])
+            except ValueError:
+                pass
+
+        stats = await get_usage_stats(user_id=sender, days=days)
+        total = stats["total_tokens"]
+        prompt = stats["prompt_tokens"]
+        completion = stats["completion_tokens"]
+        count = stats["request_count"]
+
+        lines = [
+            f"📊 Token Usage (last {days} days)",
+            f"Total: {total:,} tokens ({count} requests)",
+            f"  Prompt: {prompt:,} | Completion: {completion:,}",
+        ]
+        if stats["by_character"]:
+            lines.append("\nBy character:")
+            for c in stats["by_character"][:5]:
+                lines.append(f"  {c['character_name']}: {c['total_tokens']:,} ({c['request_count']} req)")
+        if stats["by_model"]:
+            lines.append("\nBy model:")
+            for m in stats["by_model"][:5]:
+                lines.append(f"  {m['model']}: {m['total_tokens']:,} ({m['request_count']} req)")
+
+        await feishu_client.send_text_message(chat_id, "\n".join(lines))
+
     else:
         await feishu_client.send_text_message(
-            chat_id, "Available commands: /reset, /switch, /info"
+            chat_id, "Available commands: /reset, /switch, /info, /stats"
         )
 
 

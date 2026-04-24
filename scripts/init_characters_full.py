@@ -71,7 +71,7 @@ async def main():
         print(f"  Chunk {i+1}/{chunk_count} (msgs {start+1}-{end})...", end=" ", flush=True)
 
         try:
-            result = await chat_completion(
+            result = (await chat_completion(
                 provider=backend["provider"],
                 api_key=backend["api_key"],
                 model=backend["model"],
@@ -81,7 +81,7 @@ async def main():
                     {"role": "user", "content": user_prompt},
                 ],
                 params=params,
-            )
+            ))["content"]
 
             if "NO_CHANGE" in result.strip():
                 print("no changes")

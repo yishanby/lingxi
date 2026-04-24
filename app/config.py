@@ -24,6 +24,20 @@ class Settings(BaseSettings):
     # Prompt context limit (max chars of chat history to include in prompt)
     prompt_history_max_chars: int = 100000
 
+    # Summary / context compression
+    summary_recent_window: int = 10       # keep last N messages verbatim (legacy, unused by budget system)
+    summary_max_chars: int = 3000         # max chars for the rolling summary
+    summary_trigger_threshold: int = 20   # unsummarised msgs before triggering
+
+    # Token budget system
+    total_token_budget: int = 40000
+    layer0_budget: int = 5000             # fixed layer (system prompt, character, worldbook)
+    layer1_budget: int = 5000             # recall layer (memory, assets, character profiles)
+    layer2_budget: int = 30000            # conversation layer (summary + recent messages)
+    min_recent_messages: int = 4          # at least 2 rounds (4 messages)
+    summary_max_tokens: int = 3000
+    compressed_history_max_tokens: int = 5000
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

@@ -74,6 +74,8 @@ class Session(Base):
     user_name: Mapped[str] = mapped_column(String(256), default="用户")  # protagonist name
     user_persona: Mapped[str] = mapped_column(Text, default="")  # protagonist description
     messages: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of message dicts
+    summary: Mapped[str] = mapped_column(Text, default="")  # rolling summary of older messages
+    summary_up_to: Mapped[int] = mapped_column(Integer, default=0)  # messages[0:N] already summarised
     status: Mapped[str] = mapped_column(String(32), default="active")  # active / archived
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now()
@@ -98,6 +100,22 @@ class Backend(Base):
     )
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class TokenUsage(Base):
+    __tablename__ = "token_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("sessions.id"), nullable=True)
+    user_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True, index=True)
+    character_name: Mapped[str] = mapped_column(String(256), default="")
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    model: Mapped[str] = mapped_column(String(256), default="")
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, server_default=func.now()
     )
 
 

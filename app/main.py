@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import engine
 from app.models.tables import Base
-from app.routers import backends, characters, feishu, personas, sessions, worldbooks
+from app.routers import backends, characters, feishu, personas, sessions, stats, worldbooks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,11 +24,34 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 
 
+async def _column_missing(conn, table: str, column: str) -> bool:
+    """Check if a column is missing from a SQLite table."""
+    import sqlalchemy
+    result = await conn.execute(sqlalchemy.text(f"PRAGMA table_info({table})"))
+    columns = [row[1] for row in result.fetchall()]
+    return column not in columns
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Create tables on startup
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+        # Migrate: add summary columns if missing (SQLite)
+        if await _column_missing(conn, "sessions", "summary"):
+            await conn.execute(
+                __import__("sqlalchemy").text(
+                    "ALTER TABLE sessions ADD COLUMN summary TEXT DEFAULT ''"
+                )
+            )
+        if await _column_missing(conn, "sessions", "summary_up_to"):
+            await conn.execute(
+                __import__("sqlalchemy").text(
+                    "ALTER TABLE sessions ADD COLUMN summary_up_to INTEGER DEFAULT 0"
+                )
+            )
+
     logger.info("Database tables ready")
 
     # Start Feishu WebSocket client
@@ -57,6 +80,7 @@ app.include_router(worldbooks.router)
 app.include_router(personas.router)
 app.include_router(sessions.router)
 app.include_router(backends.router)
+app.include_router(stats.router)
 app.include_router(feishu.router)
 
 # ── Static files / SPA ──────────────────────────────────────────────────────
