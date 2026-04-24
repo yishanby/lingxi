@@ -36,6 +36,7 @@ from app.services.memory import (
     append_chat_md,
     append_manual_memory,
     extract_memory,
+    extract_memory_and_characters,
     extract_memory_full,
     extract_memory_rebuild,
     compact_memory,
@@ -414,28 +415,21 @@ async def send_message(
     # Check if memory extraction is needed (background task)
     msg_count = len(messages)
     if await should_extract_memory(session_id, msg_count):
+        # Unified memory + character extraction (single LLM call)
         asyncio.create_task(
-            _delayed(extract_memory(
+            _delayed(extract_memory_and_characters(
                 session_id,
                 [m.model_dump(mode="json") for m in messages],
                 backend,
             ))
         )
-        # Also update assets alongside memory
+        # Update assets separately
         asyncio.create_task(
             _delayed(update_assets(
                 session_id,
                 [m.model_dump(mode="json") for m in messages],
                 backend,
-            ), delay=_BG_DELAY_SECONDS + 5)  # stagger after memory extract
-        )
-        # Also update character profiles
-        asyncio.create_task(
-            _delayed(update_character_profiles(
-                session_id,
-                [m.model_dump(mode="json") for m in messages],
-                backend,
-            ), delay=_BG_DELAY_SECONDS + 10)  # stagger after assets
+            ), delay=_BG_DELAY_SECONDS + 5)
         )
 
     return await _row_to_out(session)
@@ -954,28 +948,21 @@ async def send_message_stream(
             should_extract = await should_extract_memory(_session_id, msg_count)
             logger.info(f"Stream post-work: session {_session_id}, msg_count={msg_count}, extract={should_extract}")
             if should_extract:
+                # Unified memory + character extraction (single LLM call)
                 asyncio.create_task(
-                    _delayed(extract_memory(
+                    _delayed(extract_memory_and_characters(
                         _session_id,
                         [m.model_dump(mode="json") for m in current_msgs],
                         _backend,
                     ))
                 )
-                # Also update assets alongside memory
+                # Update assets separately
                 asyncio.create_task(
                     _delayed(update_assets(
                         _session_id,
                         [m.model_dump(mode="json") for m in current_msgs],
                         _backend,
                     ), delay=_BG_DELAY_SECONDS + 5)
-                )
-                # Also update character profiles
-                asyncio.create_task(
-                    _delayed(update_character_profiles(
-                        _session_id,
-                        [m.model_dump(mode="json") for m in current_msgs],
-                        _backend,
-                    ), delay=_BG_DELAY_SECONDS + 10)
                 )
 
         asyncio.create_task(_post_stream_work())

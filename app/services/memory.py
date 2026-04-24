@@ -21,9 +21,6 @@ MEMORY_BASE = Path("data/memory")
 
 MEMORY_TEMPLATE = """# Session Memory
 
-## Characters
-- (none yet)
-
 ## Relationships
 - (none yet)
 
@@ -46,11 +43,28 @@ EXTRACTION_FULL_SYSTEM_PROMPT = (
 
 EXTRACTION_SYSTEM_PROMPT = (
     "You are a memory extraction system for a roleplay conversation. "
-    "Given the recent conversation and existing memory, produce a COMPLETE updated memory document "
-    "that replaces the old one. Merge new information into existing sections. "
-    "Use these exact markdown headers: Characters, Relationships, Key Events, Decisions, User Preferences. "
-    "Be concise. Use bullet points. Remove outdated or redundant items. "
-    "This output will REPLACE the entire memory file."
+    "Given the recent conversation, existing memory, and existing character profiles, "
+    "produce TWO sections separated by the exact marker ===CHARACTERS=== on its own line.\n\n"
+    "FIRST SECTION (global memory): A COMPLETE updated memory document that replaces the old one. "
+    "Merge new information into existing sections. "
+    "Use these exact markdown headers: Relationships, Key Events, Decisions, User Preferences. "
+    "Do NOT include character descriptions here (those go in the second section). "
+    "Be concise. Use bullet points. Remove outdated or redundant items.\n\n"
+    "SECOND SECTION (character profiles): For each character with NEW or CHANGED information, "
+    "output their COMPLETE updated profile in this markdown format:\n"
+    "# [角色名]\n"
+    "## 基本信息\n"
+    "- 身份：[职业/身份]\n"
+    "- 外貌：[外貌描述]\n"
+    "- 性格：[性格特点]\n"
+    "- 与主角关系：[关系描述]\n\n"
+    "## 关键事件\n"
+    "- [事件1]\n\n"
+    "## 近期动态\n"
+    "- [最近的行为/情绪/状态变化]\n\n"
+    "Separate multiple characters with --- on its own line.\n"
+    "If NO character changes occurred, output exactly: NO_CHANGE\n"
+    "Use Chinese for character profiles. Be thorough but concise."
 )
 
 
@@ -291,7 +305,8 @@ async def extract_memory(
     recent_messages: list[dict[str, str]],
     backend_config: dict[str, Any],
 ) -> None:
-    """Call LLM to extract key facts from recent messages and UPDATE memory.md."""
+    """Deprecated: use extract_memory_and_characters() instead.
+    Call LLM to extract key facts from recent messages and UPDATE memory.md."""
     try:
         existing_memory = await load_memory(session_id)
 
@@ -343,6 +358,101 @@ def _merge_memory(existing: str, new_extraction: str) -> str:
     # Fallback: if extraction is just fragments, append (legacy compat)
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     return f"{existing.rstrip()}\n\n---\n### Update [{now}]\n{new_extraction}\n"
+
+
+# ── 7a0. Unified memory + character extraction ────────────────────────────
+
+async def extract_memory_and_characters(
+    session_id: int,
+    recent_messages: list[dict[str, str]],
+    backend_config: dict[str, Any],
+) -> None:
+    """Single LLM call that extracts both global memory and character profiles.
+
+    Output format from LLM:
+        <global memory markdown>
+        ===CHARACTERS===
+        <character profiles or NO_CHANGE>
+    """
+    try:
+        existing_memory = await load_memory(session_id)
+
+        # Load existing character profiles for context
+        names = await list_character_names(session_id)
+        existing_characters = ""
+        for name in names:
+            p = await load_character_profile(session_id, name)
+            if p:
+                existing_characters += f"\n\n---\n{p}"
+
+        conversation_text = "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')}"
+            for m in recent_messages[-20:]
+        )
+
+        user_prompt = (
+            f"## Existing Memory\n{existing_memory}\n\n"
+            f"## Existing Character Profiles\n{existing_characters or '(无记录)'}\n\n"
+            f"## Recent Conversation\n{conversation_text}\n\n"
+            "Produce the updated memory and character profiles as described."
+        )
+
+        llm_messages = [
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        extraction = (await chat_completion(
+            provider=backend_config["provider"],
+            api_key=backend_config["api_key"],
+            model=backend_config["model"],
+            base_url=backend_config["base_url"],
+            messages=llm_messages,
+            params=backend_config.get("params", {}),
+        ))["content"]
+
+        # Split by ===CHARACTERS=== marker
+        marker = "===CHARACTERS==="
+        if marker in extraction:
+            memory_part, characters_part = extraction.split(marker, 1)
+        else:
+            # No marker found — treat entire output as memory, no character changes
+            memory_part = extraction
+            characters_part = "NO_CHANGE"
+
+        memory_part = memory_part.strip()
+        characters_part = characters_part.strip()
+
+        # Save memory
+        if memory_part:
+            if existing_memory:
+                updated = _merge_memory(existing_memory, memory_part)
+            else:
+                updated = MEMORY_TEMPLATE.rstrip() + "\n\n" + memory_part
+            await save_memory(session_id, updated)
+            logger.info(f"Memory extracted for session {session_id}")
+
+        # Save character profiles
+        if "NO_CHANGE" not in characters_part and characters_part:
+            blocks = re.split(r"\n---\n", characters_part)
+            updated_count = 0
+            for block in blocks:
+                block = block.strip()
+                if not block:
+                    continue
+                match = re.match(r"^#\s+(.+)", block)
+                if match:
+                    char_name = match.group(1).strip()
+                    await save_character_profile(session_id, char_name, block)
+                    updated_count += 1
+                    logger.info(f"Character profile updated: {char_name} (session {session_id})")
+            if updated_count:
+                logger.info(f"{updated_count} character profiles updated for session {session_id}")
+        else:
+            logger.info(f"No character changes for session {session_id}")
+
+    except Exception as exc:
+        logger.error(f"Unified memory+character extraction failed for session {session_id}: {exc}")
 
 
 # ── 7a. Asset Tracking ─────────────────────────────────────────────────────
@@ -575,7 +685,8 @@ async def update_character_profiles(
     recent_messages: list[dict[str, str]],
     backend_config: dict[str, Any],
 ) -> bool:
-    """Detect character changes from recent messages and update profiles.
+    """Deprecated: use extract_memory_and_characters() instead.
+    Detect character changes from recent messages and update profiles.
     Returns True if any profiles were updated."""
     try:
         # Load existing profiles for context
