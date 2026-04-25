@@ -670,48 +670,20 @@ async def load_mentioned_character_profiles(
 ) -> str:
     """Load profiles of characters mentioned in current context.
 
-    Sources for character detection:
-    1. Current user message + recent 10 messages
-    2. Active characters from memory.md Relationships section
+    Searches user message + recent 10 messages for character names.
+    Only loads profiles for characters actually mentioned (progressive disclosure).
     """
     names = await list_character_names(session_id)
     if not names:
         return ""
-
-    # Source 1: mentioned in recent conversation
-    mentioned = set(find_mentioned_characters(names, user_message, recent_messages))
-
-    # Source 2: active characters from memory.md (Relationships section)
-    memory_text = await load_memory(session_id)
-    if memory_text:
-        # Extract Relationships section
-        rel_match = re.search(r'## Relationships\n(.*?)(?=\n## |$)', memory_text, re.DOTALL)
-        if rel_match:
-            rel_text = rel_match.group(1)
-            for name in names:
-                if name in rel_text:
-                    mentioned.add(name)
-
+    mentioned = find_mentioned_characters(names, user_message, recent_messages)
     if not mentioned:
         return ""
-
-    # Apply token budget: truncate if too many profiles
-    from app.services.token_utils import estimate_tokens, truncate_to_tokens
-    from app.config import settings
-    # Reserve half of layer1 budget for character profiles
-    max_profile_tokens = settings.layer1_budget // 2
-
     profiles = []
-    total_tokens = 0
-    for name in sorted(mentioned):  # deterministic order
+    for name in mentioned:
         profile = await load_character_profile(session_id, name)
         if profile:
-            ptokens = estimate_tokens(profile)
-            if total_tokens + ptokens > max_profile_tokens and profiles:
-                break
             profiles.append(profile)
-            total_tokens += ptokens
-
     return "\n\n---\n".join(profiles)
 
 
