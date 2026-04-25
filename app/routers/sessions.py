@@ -344,10 +344,11 @@ async def send_message(
     # Update rolling summary if history exceeds context budget
     from app.config import settings
     msg_dicts_for_summary = [{"role": m.role, "content": m.content} for m in messages]
+    bg_backend = await _resolve_bg_backend(backend, db)
     if should_update_summary(msg_dicts_for_summary, settings.prompt_history_max_chars):
         asyncio.create_task(
             _delayed(update_rolling_summary(
-                session_id, msg_dicts_for_summary, backend,
+                session_id, msg_dicts_for_summary, bg_backend,
                 settings.prompt_history_max_chars,
             ))
         )
@@ -420,7 +421,7 @@ async def send_message(
             _delayed(extract_memory_and_characters(
                 session_id,
                 [m.model_dump(mode="json") for m in messages],
-                backend,
+                bg_backend,
             ))
         )
         # Update assets separately
@@ -428,7 +429,7 @@ async def send_message(
             _delayed(update_assets(
                 session_id,
                 [m.model_dump(mode="json") for m in messages],
-                backend,
+                bg_backend,
             ), delay=_BG_DELAY_SECONDS + 5)
         )
 
@@ -792,6 +793,20 @@ async def _resolve_backend(
     }
 
 
+async def _resolve_bg_backend(session_backend: dict, db: AsyncSession) -> dict:
+    """Resolve backend for background tasks (summary, memory, assets).
+
+    Uses settings.background_backend_id if configured, otherwise falls back
+    to the session's own backend."""
+    from app.config import settings
+    if settings.background_backend_id:
+        try:
+            return await _resolve_backend(settings.background_backend_id, db)
+        except Exception:
+            pass  # fall back to session backend
+    return session_backend
+
+
 @router.post("/{session_id}/message/stream")
 async def send_message_stream(
     session_id: int,
@@ -860,11 +875,12 @@ async def send_message_stream(
 
     # Update rolling summary if needed
     from app.config import settings as _settings
+    _bg_backend = await _resolve_bg_backend(backend, db)
     _msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
     if should_update_summary(_msg_dicts, _settings.prompt_history_max_chars):
         asyncio.create_task(
             _delayed(update_rolling_summary(
-                session_id, _msg_dicts, backend,
+                session_id, _msg_dicts, _bg_backend,
                 _settings.prompt_history_max_chars,
             ))
         )
@@ -953,7 +969,7 @@ async def send_message_stream(
                     _delayed(extract_memory_and_characters(
                         _session_id,
                         [m.model_dump(mode="json") for m in current_msgs],
-                        _backend,
+                        _bg_backend,
                     ))
                 )
                 # Update assets separately
@@ -961,7 +977,7 @@ async def send_message_stream(
                     _delayed(update_assets(
                         _session_id,
                         [m.model_dump(mode="json") for m in current_msgs],
-                        _backend,
+                        _bg_backend,
                     ), delay=_BG_DELAY_SECONDS + 5)
                 )
 

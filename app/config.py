@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     summary_max_tokens: int = 3000
     compressed_history_max_tokens: int = 5000
 
+    # Background tasks backend (summary, memory extraction, assets)
+    # If set, background LLM tasks use this backend instead of the session's backend
+    background_backend_id: int | None = None
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
