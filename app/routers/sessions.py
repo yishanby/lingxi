@@ -42,9 +42,11 @@ from app.services.memory import (
     compact_memory,
     inject_memory_into_prompt,
     is_asset_relevant,
+    list_character_names,
     load_assets,
     load_assets_summary,
     load_chat_md,
+    load_character_profile,
     load_mentioned_character_profiles,
     load_memory,
     load_memory_relevant,
@@ -738,6 +740,34 @@ async def _handle_command(
         except Exception as exc:
             logger.error(f"Failed to append chat.md on retry: {exc}")
 
+        return await _row_to_out(session)
+
+    elif cmd == "/chars":
+        names = await list_character_names(session_id)
+        if not names:
+            response = "No character profiles found."
+        elif arg.strip():
+            query = arg.strip()
+            matched = [n for n in names if query in n]
+            if not matched:
+                response = f"No character matching '{query}'.\nAvailable: " + ", ".join(sorted(names))
+            else:
+                parts_out = []
+                for name in matched:
+                    profile = await load_character_profile(session_id, name)
+                    parts_out.append(profile + f"\n({len(profile)} chars)")
+                response = "\n\n---\n".join(parts_out)
+        else:
+            parts_out = []
+            for name in sorted(names):
+                profile = await load_character_profile(session_id, name)
+                parts_out.append(profile + f"\n({len(profile)} chars)")
+            response = "\n\n---\n".join(parts_out)
+        try:
+            await append_chat_md(session_id, "user", content, char_name=char.name, user_name=user_name)
+            await append_chat_md(session_id, "assistant", response, char_name=char.name, user_name=user_name)
+        except Exception as exc:
+            logger.error(f"Failed to append chat.md for /chars: {exc}")
         return await _row_to_out(session)
 
     else:
