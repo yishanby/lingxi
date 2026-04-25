@@ -328,7 +328,7 @@ async def send_message(
             persona_position = persona.description_position or "in_prompt"
 
     # Load memory context (relevant chunks only, within token budget)
-    recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-4:]]
+    recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-10:]]
     memory_context = await load_memory_relevant(session_id, content, recent_dicts)
 
     # Load asset context (Layer 0: summary always, Layer 1: full when relevant)
@@ -691,7 +691,7 @@ async def _handle_command(
             if persona:
                 persona_position = persona.description_position or "in_prompt"
 
-        recent_dicts_retry = [{"role": m.role, "content": m.content} for m in messages[-4:]]
+        recent_dicts_retry = [{"role": m.role, "content": m.content} for m in messages[-10:]]
         memory_context = await load_memory_relevant(session_id, retry_content, recent_dicts_retry)
 
         summary_context = await load_summary(session_id)
@@ -860,7 +860,7 @@ async def send_message_stream(
             persona_position = persona.description_position or "in_prompt"
 
     # Load memory context (relevant chunks only)
-    _recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-4:]]
+    _recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-10:]]
     memory_context = await load_memory_relevant(session_id, content, _recent_dicts)
 
     # Load asset context (Layer 0: summary always, Layer 1: full when relevant)

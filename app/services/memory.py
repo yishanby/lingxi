@@ -652,10 +652,13 @@ def find_mentioned_characters(
     user_message: str,
     recent_messages: list[dict[str, str]] | None = None,
 ) -> list[str]:
-    """Find which characters are mentioned in user message + recent 2 rounds."""
+    """Find which characters are mentioned in user message + recent messages.
+
+    Searches a wider window (last 10 messages) to catch actively involved characters,
+    not just those explicitly named in the current turn."""
     text = user_message
     if recent_messages:
-        for m in recent_messages[-4:]:  # last 2 rounds (user+assistant each)
+        for m in recent_messages[-10:]:  # wider window for active character detection
             text += " " + (m.get("content", "") if isinstance(m, dict) else str(m))
     return [name for name in character_names if name in text]
 
