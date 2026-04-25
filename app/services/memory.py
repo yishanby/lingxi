@@ -668,19 +668,51 @@ async def load_mentioned_character_profiles(
     user_message: str,
     recent_messages: list[dict[str, str]] | None = None,
 ) -> str:
-    """Load profiles of characters mentioned in current context."""
+    """Load profiles of characters mentioned in current context.
+
+    Sources for character detection:
+    1. Current user message + recent 10 messages
+    2. Active characters from memory.md Relationships section
+    """
     names = await list_character_names(session_id)
     if not names:
         return ""
-    mentioned = find_mentioned_characters(names, user_message, recent_messages)
+
+    # Source 1: mentioned in recent conversation
+    mentioned = set(find_mentioned_characters(names, user_message, recent_messages))
+
+    # Source 2: active characters from memory.md (Relationships section)
+    memory_text = await load_memory(session_id)
+    if memory_text:
+        # Extract Relationships section
+        rel_match = re.search(r'## Relationships\n(.*?)(?=\n## |$)', memory_text, re.DOTALL)
+        if rel_match:
+            rel_text = rel_match.group(1)
+            for name in names:
+                if name in rel_text:
+                    mentioned.add(name)
+
     if not mentioned:
         return ""
+
+    # Apply token budget: truncate if too many profiles
+    from app.services.token_utils import estimate_tokens, truncate_to_tokens
+    from app.config import settings
+    # Reserve half of layer1 budget for character profiles
+    max_profile_tokens = settings.layer1_budget // 2
+
     profiles = []
-    for name in mentioned:
+    total_tokens = 0
+    for name in sorted(mentioned):  # deterministic order
         profile = await load_character_profile(session_id, name)
         if profile:
+            ptokens = estimate_tokens(profile)
+            if total_tokens + ptokens > max_profile_tokens and profiles:
+                break
             profiles.append(profile)
-    return "\n\n---\n\n".join(profiles)
+            total_tokens += ptokens
+
+    return "\n\n---\n".join(profiles)
 
 
 async def update_character_profiles(
