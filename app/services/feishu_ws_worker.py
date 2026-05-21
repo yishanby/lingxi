@@ -983,10 +983,10 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                 if not results:
                     send_text(chat_id, f"未找到与{char_name}相关的记录。需要先 /chars index 建立索引。")
                 else:
-                    lines = [f"🔍 与{char_name}相关的历史片段 (top {len(results)}):\n"]
-                    for i, r in enumerate(results[:5], 1):
-                        snippet = r['text'][:150].replace('\n', ' ')
-                        lines.append(f"{i}. [相关度{r['score']:.2f}] {snippet}...")
+                    lines = [f"🔍 与{char_name}相关的历史片段 (top {min(len(results), 10)}):\n"]
+                    for i, r in enumerate(results[:10], 1):
+                        snippet = r['text'][:400].replace('\n', ' ')
+                        lines.append(f"{i}. [相关度{r['score']:.2f}]\n{snippet}\n")
                     send_text(chat_id, "\n".join(lines))
 
             elif sub == "rebuildall":
