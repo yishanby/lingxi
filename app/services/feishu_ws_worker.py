@@ -901,6 +901,20 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                 else:
                     send_text(chat_id, "暂无角色档案。")
 
+            elif sub == "show":
+                char_name = parts[2].strip() if len(parts) > 2 else None
+                if not char_name:
+                    send_text(chat_id, "用法: /chars show <角色名>")
+                    return
+                profile = asyncio.run(load_character_profile(sid, char_name))
+                if profile:
+                    # Truncate for chat display
+                    if len(profile) > 2000:
+                        profile = profile[:2000] + "\n\n...（档案过长，已截断）"
+                    send_text(chat_id, f"📋 {char_name} 的角色档案:\n\n{profile}")
+                else:
+                    send_text(chat_id, f"未找到{char_name}的档案。")
+
             elif sub == "index":
                 send_text(chat_id, "🔨 正在建立RAG索引...")
                 index = asyncio.run(
