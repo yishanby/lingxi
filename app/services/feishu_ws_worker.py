@@ -657,6 +657,12 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             "/assets — 查看当前资产记录\n\n"
             "📊 统计\n"
             "/stats — 查看Token用量统计\n\n"
+            "🔍 RAG角色检索\n"
+            "/chars list — 查看角色档案列表\n"
+            "/chars index — 建立历史对话索引\n"
+            "/chars search <名字> — 搜索角色相关历史\n"
+            "/chars rebuild <名字> — 从历史重建角色档案\n"
+            "/chars rebuildall — 重建所有角色档案\n\n"
             "/help — 显示此帮助信息"
         )
         send_text(chat_id, help_text)
@@ -859,6 +865,117 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
         except Exception as exc:
             logger.exception("resume command failed")
             send_text(chat_id, f"恢复会话失败: {exc}")
+        return
+
+    elif cmd == "/chars":
+        # RAG-based character profile management
+        try:
+            parts = text.split(maxsplit=2)
+            sub = parts[1] if len(parts) > 1 else "list"
+
+            # Find active session
+            sessions = api_get("/api/sessions?lite=true")
+            session = None
+            for s in sessions:
+                if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
+                    session = s
+                    break
+            if not session:
+                send_text(chat_id, "没有活跃会话。请先用 /switch 选择角色。")
+                return
+
+            import asyncio
+            from app.services.rag import build_index, search_character, rebuild_character_from_history
+            from app.services.memory import list_character_names, load_character_profile, save_character_profile
+            from app.config import settings as app_settings
+
+            sid = session["id"]
+            emb_url = app_settings.rag_embedding_base_url or app_settings.default_llm_base_url
+            emb_key = app_settings.rag_embedding_api_key or app_settings.default_llm_api_key
+            emb_model = app_settings.rag_embedding_model
+
+            if sub == "list":
+                names = asyncio.get_event_loop().run_until_complete(list_character_names(sid))
+                if names:
+                    send_text(chat_id, f"📋 角色档案列表:\n" + "\n".join(f"  • {n}" for n in names))
+                else:
+                    send_text(chat_id, "暂无角色档案。")
+
+            elif sub == "index":
+                send_text(chat_id, "🔨 正在建立RAG索引...")
+                index = asyncio.get_event_loop().run_until_complete(
+                    build_index(sid, embedding_base_url=emb_url, embedding_api_key=emb_key, embedding_model=emb_model)
+                )
+                send_text(chat_id, f"✅ 索引完成: {index['indexed_messages']} 条消息, {len(index['chunks'])} 个chunk")
+
+            elif sub == "rebuild":
+                char_name = parts[2].strip() if len(parts) > 2 else None
+                if not char_name:
+                    send_text(chat_id, "用法: /chars rebuild <角色名>")
+                    return
+                send_text(chat_id, f"🔍 正在从历史中检索{char_name}的信息...")
+                profile = asyncio.get_event_loop().run_until_complete(
+                    rebuild_character_from_history(
+                        sid, char_name,
+                        embedding_base_url=emb_url,
+                        embedding_api_key=emb_key,
+                        embedding_model=emb_model,
+                    )
+                )
+                asyncio.get_event_loop().run_until_complete(
+                    save_character_profile(sid, char_name, profile)
+                )
+                # Show truncated preview
+                preview = profile[:500] + ("..." if len(profile) > 500 else "")
+                send_text(chat_id, f"✅ {char_name}的档案已更新:\n\n{preview}")
+
+            elif sub == "search":
+                char_name = parts[2].strip() if len(parts) > 2 else None
+                if not char_name:
+                    send_text(chat_id, "用法: /chars search <角色名>")
+                    return
+                results = asyncio.get_event_loop().run_until_complete(
+                    search_character(sid, char_name, embedding_base_url=emb_url, embedding_api_key=emb_key, embedding_model=emb_model)
+                )
+                if not results:
+                    send_text(chat_id, f"未找到与{char_name}相关的记录。需要先 /chars index 建立索引。")
+                else:
+                    lines = [f"🔍 与{char_name}相关的历史片段 (top {len(results)}):\n"]
+                    for i, r in enumerate(results[:5], 1):
+                        snippet = r['text'][:150].replace('\n', ' ')
+                        lines.append(f"{i}. [相关度{r['score']:.2f}] {snippet}...")
+                    send_text(chat_id, "\n".join(lines))
+
+            elif sub == "rebuildall":
+                names = asyncio.get_event_loop().run_until_complete(list_character_names(sid))
+                if not names:
+                    send_text(chat_id, "暂无角色档案可重建。")
+                    return
+                send_text(chat_id, f"🔨 开始重建所有角色档案 ({len(names)}个)...")
+                for name in names:
+                    try:
+                        profile = asyncio.get_event_loop().run_until_complete(
+                            rebuild_character_from_history(
+                                sid, name,
+                                embedding_base_url=emb_url,
+                                embedding_api_key=emb_key,
+                                embedding_model=emb_model,
+                            )
+                        )
+                        asyncio.get_event_loop().run_until_complete(
+                            save_character_profile(sid, name, profile)
+                        )
+                        send_text(chat_id, f"  ✅ {name}")
+                    except Exception as e:
+                        send_text(chat_id, f"  ❌ {name}: {e}")
+                send_text(chat_id, "🎉 全部角色档案重建完成!")
+
+            else:
+                send_text(chat_id, "用法:\n/chars list - 查看角色列表\n/chars index - 建立RAG索引\n/chars search <名字> - 搜索角色相关历史\n/chars rebuild <名字> - 重建单个角色档案\n/chars rebuildall - 重建所有角色档案")
+
+        except Exception as exc:
+            logger.exception("chars command failed")
+            send_text(chat_id, f"角色命令失败: {exc}")
         return
 
     elif cmd == "/stats":

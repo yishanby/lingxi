@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     summary_max_tokens: int = 3000
     compressed_history_max_tokens: int = 5000
 
+    # RAG settings
+    rag_embedding_model: str = "text-embedding-3-small"
+    rag_embedding_base_url: str = ""  # empty = use default_llm_base_url
+    rag_embedding_api_key: str = ""   # empty = use default_llm_api_key
+    rag_chunk_size: int = 5            # messages per chunk
+    rag_auto_index: bool = True        # auto-build index on memory extract
+
     # Background tasks backend (summary, memory extraction, assets)
     # If set, background LLM tasks use this backend instead of the session's backend
     background_backend_id: int | None = None
