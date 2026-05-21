@@ -284,29 +284,47 @@ async def search_character(
 ) -> list[dict[str, Any]]:
     """Search for chunks related to a specific character.
     
-    Uses character name + common queries as search terms.
+    Primary: keyword filter (chunks containing the name).
+    Secondary: semantic search as supplement.
     """
-    queries = [
-        f"{character_name}的性格和行为",
-        f"{character_name}的关系和身份",
-        f"{character_name}的状态和变化",
-    ]
+    # 1. Load index and keyword-filter chunks containing the character name
+    index = await load_index(session_id)
+    if not index.get("chunks"):
+        return []
     
-    all_results: dict[int, dict] = {}
+    keyword_chunks = []
+    for i, chunk in enumerate(index["chunks"]):
+        if character_name in chunk["text"]:
+            keyword_chunks.append({"text": chunk["text"], "index": i, "score": 1.0, "method": "keyword"})
+    
+    # 2. Also do semantic search for supplementary results
+    queries = [
+        character_name,
+        f"{character_name}的关系",
+        f"{character_name}的事件",
+    ]
+    semantic_indices = set()
+    semantic_results = []
     for q in queries:
         results = await search(session_id, q, top_k=top_k, **kwargs)
         for r in results:
-            idx = r["index"]
-            if idx not in all_results or r["score"] > all_results[idx]["score"]:
-                all_results[idx] = r
-
-    # Also do keyword filtering: boost chunks that mention the name
-    for idx, r in all_results.items():
-        if character_name in r["text"]:
-            r["score"] = min(r["score"] * 1.3, 1.0)  # boost
-
-    sorted_results = sorted(all_results.values(), key=lambda x: x["score"], reverse=True)
-    return sorted_results[:top_k]
+            if r["index"] not in semantic_indices:
+                semantic_indices.add(r["index"])
+                # Only include if character name actually appears in text
+                if character_name in r["text"]:
+                    r["score"] = min(r["score"] * 1.2, 1.0)
+                    semantic_results.append(r)
+    
+    # 3. Merge: keyword results first, then semantic supplements
+    seen = set(c["index"] for c in keyword_chunks)
+    for r in semantic_results:
+        if r["index"] not in seen:
+            keyword_chunks.append(r)
+            seen.add(r["index"])
+    
+    # Sort by score descending
+    keyword_chunks.sort(key=lambda x: x["score"], reverse=True)
+    return keyword_chunks[:top_k]
 
 
 # ── High-level: rebuild character profile from RAG ────────────────────────
