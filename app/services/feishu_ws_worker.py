@@ -901,6 +901,35 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                 else:
                     send_text(chat_id, "暂无角色档案。")
 
+            elif sub == "summary":
+                import re as _re
+                names = asyncio.run(list_character_names(sid))
+                if not names:
+                    send_text(chat_id, "暂无角色档案。")
+                    return
+                lines = [f"📊 角色亲密度汇总 ({len(names)}人):\n"]
+                entries = []
+                for n in names:
+                    profile = asyncio.run(load_character_profile(sid, n)) or ""
+                    # Extract intimacy value
+                    m = _re.search(r'亲密[值度][：:]\s*(\d+)', profile)
+                    intimacy = int(m.group(1)) if m else None
+                    # Extract identity
+                    id_m = _re.search(r'身份[：:](.+?)(?:\n|$)', profile)
+                    identity = id_m.group(1).strip()[:30] if id_m else ""
+                    entries.append((n, intimacy, identity))
+                # Sort by intimacy descending, None last
+                entries.sort(key=lambda x: (x[1] is not None, x[1] or 0), reverse=True)
+                for n, intim, ident in entries:
+                    bar = ""
+                    if intim is not None:
+                        filled = intim // 10
+                        bar = "█" * filled + "░" * (10 - filled)
+                        lines.append(f"  {bar} {intim:>3} | {n} — {ident}")
+                    else:
+                        lines.append(f"  {'░' * 10}   ? | {n} — {ident}")
+                send_text(chat_id, "\n".join(lines))
+
             elif sub == "show":
                 char_name = parts[2].strip() if len(parts) > 2 else None
                 if not char_name:
