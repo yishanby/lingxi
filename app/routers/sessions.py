@@ -340,6 +340,18 @@ async def send_message(
     # Load character profiles for mentioned characters
     character_profiles = await load_mentioned_character_profiles(session_id, content, recent_dicts)
 
+    # RAG: search history for relevant context
+    rag_context = ""
+    try:
+        from app.services.rag import search as rag_search, load_index
+        index = await load_index(session_id)
+        if index.get("chunks"):
+            results = await rag_search(session_id, content, top_k=5)
+            if results:
+                rag_context = "\n\n---\n\n".join(r["text"] for r in results if r["score"] > 0.2)
+    except Exception as rag_exc:
+        logger.warning(f"RAG search failed for session {session_id}: {rag_exc}")
+
     # Load rolling summary
     summary_context = await load_summary(session_id)
 
@@ -378,6 +390,7 @@ async def send_message(
         assets_summary=assets_summary,
         assets_full=assets_full,
         character_profiles=character_profiles,
+        rag_context=rag_context,
     )
 
     # Call LLM
@@ -900,6 +913,18 @@ async def send_message_stream(
     # Load character profiles for mentioned characters
     _char_profiles = await load_mentioned_character_profiles(session_id, content, _recent_dicts)
 
+    # RAG: search history for relevant context
+    _rag_context = ""
+    try:
+        from app.services.rag import search as rag_search, load_index
+        _idx = await load_index(session_id)
+        if _idx.get("chunks"):
+            _rag_results = await rag_search(session_id, content, top_k=5)
+            if _rag_results:
+                _rag_context = "\n\n---\n\n".join(r["text"] for r in _rag_results if r["score"] > 0.2)
+    except Exception as _rag_exc:
+        logger.warning(f"RAG search failed for session {session_id}: {_rag_exc}")
+
     # Load rolling summary
     summary_context = await load_summary(session_id)
 
@@ -932,6 +957,7 @@ async def send_message_stream(
         assets_summary=_assets_summary,
         assets_full=_assets_full,
         character_profiles=_char_profiles,
+        rag_context=_rag_context,
     )
 
     # Capture values needed for DB save after streaming

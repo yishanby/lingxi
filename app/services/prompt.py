@@ -46,6 +46,7 @@ def assemble_prompt(
     assets_summary: str = "",
     assets_full: str = "",
     character_profiles: str = "",
+    rag_context: str = "",
 ) -> list[dict[str, str]]:
     """Build the full messages payload for an LLM chat-completion call.
 
@@ -97,6 +98,8 @@ def assemble_prompt(
         layer1_parts.append(f"[资产详情]\n{assets_full}")
     if character_profiles:
         layer1_parts.append(f"[角色详情档案]\n{character_profiles}")
+    if rag_context:
+        layer1_parts.append(f"[相关历史片段]\n{rag_context}")
 
     # Truncate layer 1 to budget
     layer1_text = "\n\n".join(layer1_parts)
