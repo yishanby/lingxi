@@ -895,7 +895,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             emb_model = app_settings.rag_embedding_model
 
             if sub == "list":
-                names = asyncio.get_event_loop().run_until_complete(list_character_names(sid))
+                names = asyncio.run(list_character_names(sid))
                 if names:
                     send_text(chat_id, f"📋 角色档案列表:\n" + "\n".join(f"  • {n}" for n in names))
                 else:
@@ -903,7 +903,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
 
             elif sub == "index":
                 send_text(chat_id, "🔨 正在建立RAG索引...")
-                index = asyncio.get_event_loop().run_until_complete(
+                index = asyncio.run(
                     build_index(sid, embedding_base_url=emb_url, embedding_api_key=emb_key, embedding_model=emb_model)
                 )
                 send_text(chat_id, f"✅ 索引完成: {index['indexed_messages']} 条消息, {len(index['chunks'])} 个chunk")
@@ -914,7 +914,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                     send_text(chat_id, "用法: /chars rebuild <角色名>")
                     return
                 send_text(chat_id, f"🔍 正在从历史中检索{char_name}的信息...")
-                profile = asyncio.get_event_loop().run_until_complete(
+                profile = asyncio.run(
                     rebuild_character_from_history(
                         sid, char_name,
                         embedding_base_url=emb_url,
@@ -922,7 +922,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                         embedding_model=emb_model,
                     )
                 )
-                asyncio.get_event_loop().run_until_complete(
+                asyncio.run(
                     save_character_profile(sid, char_name, profile)
                 )
                 # Show truncated preview
@@ -934,7 +934,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                 if not char_name:
                     send_text(chat_id, "用法: /chars search <角色名>")
                     return
-                results = asyncio.get_event_loop().run_until_complete(
+                results = asyncio.run(
                     search_character(sid, char_name, embedding_base_url=emb_url, embedding_api_key=emb_key, embedding_model=emb_model)
                 )
                 if not results:
@@ -947,14 +947,14 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                     send_text(chat_id, "\n".join(lines))
 
             elif sub == "rebuildall":
-                names = asyncio.get_event_loop().run_until_complete(list_character_names(sid))
+                names = asyncio.run(list_character_names(sid))
                 if not names:
                     send_text(chat_id, "暂无角色档案可重建。")
                     return
                 send_text(chat_id, f"🔨 开始重建所有角色档案 ({len(names)}个)...")
                 for name in names:
                     try:
-                        profile = asyncio.get_event_loop().run_until_complete(
+                        profile = asyncio.run(
                             rebuild_character_from_history(
                                 sid, name,
                                 embedding_base_url=emb_url,
@@ -962,7 +962,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                                 embedding_model=emb_model,
                             )
                         )
-                        asyncio.get_event_loop().run_until_complete(
+                        asyncio.run(
                             save_character_profile(sid, name, profile)
                         )
                         send_text(chat_id, f"  ✅ {name}")
@@ -1109,3 +1109,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
