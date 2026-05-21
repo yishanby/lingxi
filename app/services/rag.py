@@ -37,30 +37,57 @@ def _index_dir(session_id: int) -> Path:
 # ── Embedding ─────────────────────────────────────────────────────────────
 
 
+# ── Local model singleton ─────────────────────────────────────────────────
+
+_local_model = None
+
+
+def _get_local_model():
+    """Lazy-load sentence-transformers model."""
+    global _local_model
+    if _local_model is None:
+        from sentence_transformers import SentenceTransformer
+        model_name = settings.rag_embedding_model or "all-MiniLM-L6-v2"
+        logger.info(f"Loading local embedding model: {model_name}")
+        _local_model = SentenceTransformer(model_name)
+        dim = getattr(_local_model, 'get_embedding_dimension', _local_model.get_sentence_embedding_dimension)()
+        logger.info(f"Embedding model loaded, dim={dim}")
+    return _local_model
+
+
 async def get_embeddings(
     texts: list[str],
     *,
     base_url: str | None = None,
     api_key: str | None = None,
-    model: str = "text-embedding-3-small",
+    model: str = "",
 ) -> list[list[float]]:
-    """Call OpenAI-compatible embedding API.
+    """Get embeddings using local sentence-transformers or OpenAI-compatible API.
     
-    Falls back to settings.default_llm_base_url if base_url not provided.
+    If base_url is provided and not empty, uses the API.
+    Otherwise uses local sentence-transformers model.
     """
-    url = (base_url or settings.default_llm_base_url).rstrip("/") + "/embeddings"
-    key = api_key or settings.default_llm_api_key or "no-key"
+    # Try API if configured
+    if base_url and base_url.strip():
+        url = base_url.rstrip("/") + "/embeddings"
+        key = api_key or settings.default_llm_api_key or "no-key"
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        payload = {"model": model or "text-embedding-3-small", "input": texts}
 
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {"model": model, "input": texts}
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        return [item["embedding"] for item in data["data"]]
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-
-    # OpenAI format: data.data[i].embedding
-    return [item["embedding"] for item in data["data"]]
+    # Local model
+    import asyncio
+    loop = asyncio.get_event_loop()
+    model_instance = _get_local_model()
+    embeddings = await loop.run_in_executor(
+        None, lambda: model_instance.encode(texts, normalize_embeddings=True).tolist()
+    )
+    return embeddings
 
 
 async def get_embedding(text: str, **kwargs) -> list[float]:

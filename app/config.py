@@ -39,9 +39,9 @@ class Settings(BaseSettings):
     compressed_history_max_tokens: int = 5000
 
     # RAG settings
-    rag_embedding_model: str = "text-embedding-3-small"
-    rag_embedding_base_url: str = ""  # empty = use default_llm_base_url
-    rag_embedding_api_key: str = ""   # empty = use default_llm_api_key
+    rag_embedding_model: str = "all-MiniLM-L6-v2"  # local sentence-transformers model
+    rag_embedding_base_url: str = ""  # empty = use local model; set for API
+    rag_embedding_api_key: str = ""   # only needed if using API
     rag_chunk_size: int = 5            # messages per chunk
     rag_auto_index: bool = True        # auto-build index on memory extract
 
