@@ -989,6 +989,40 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                         lines.append(f"{i}. [相关度{r['score']:.2f}]\n{snippet}\n")
                     send_text(chat_id, "\n".join(lines))
 
+            elif sub == "find":
+                # Pure keyword search: /chars find <keyword> [max_chars_per_chunk]
+                keyword = parts[2].strip() if len(parts) > 2 else None
+                if not keyword:
+                    send_text(chat_id, "用法: /chars find <关键词> [每条长度]\n例: /chars find 杨紫 800")
+                    return
+                max_len = 400
+                if len(parts) > 3:
+                    try:
+                        max_len = int(parts[3].strip())
+                    except ValueError:
+                        pass
+                from app.services.rag import load_index
+                index = asyncio.run(load_index(sid))
+                if not index.get("chunks"):
+                    send_text(chat_id, "索引为空，请先 /chars index")
+                    return
+                hits = []
+                for i, chunk in enumerate(index["chunks"]):
+                    text = chunk if isinstance(chunk, str) else chunk.get("text", "")
+                    if keyword in text:
+                        hits.append((i, text))
+                if not hits:
+                    send_text(chat_id, f"未找到包含'{keyword}'的记录。")
+                    return
+                # Most recent first
+                hits.sort(key=lambda x: x[0], reverse=True)
+                total = len(hits)
+                lines = [f"🔎 包含'{keyword}'的片段 (共{total}条，显示最近10条):\n"]
+                for idx, (i, text) in enumerate(hits[:10], 1):
+                    snippet = text[:max_len].replace('\n', '\n')
+                    lines.append(f"--- [{idx}] chunk#{i} ---\n{snippet}\n")
+                send_text(chat_id, "\n".join(lines))
+
             elif sub == "rebuildall":
                 names = asyncio.run(list_character_names(sid))
                 if not names:
