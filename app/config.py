@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     compressed_history_max_tokens: int = 5000
 
     # RAG settings
-    rag_embedding_model: str = "all-MiniLM-L6-v2"  # local sentence-transformers model
+    rag_embedding_model: str = "BAAI/bge-small-zh-v1.5"  # Chinese embedding model
     rag_embedding_base_url: str = ""  # empty = use local model; set for API
     rag_embedding_api_key: str = ""   # only needed if using API
     rag_chunk_size: int = 5            # messages per chunk
