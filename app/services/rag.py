@@ -294,8 +294,9 @@ async def search_character(
     
     keyword_chunks = []
     for i, chunk in enumerate(index["chunks"]):
-        if character_name in chunk["text"]:
-            keyword_chunks.append({"text": chunk["text"], "index": i, "score": 1.0, "method": "keyword"})
+        chunk_text = chunk if isinstance(chunk, str) else chunk.get("text", "")
+        if character_name in chunk_text:
+            keyword_chunks.append({"text": chunk_text, "index": i, "score": 1.0, "method": "keyword"})
     
     # 2. Also do semantic search for supplementary results
     queries = [
