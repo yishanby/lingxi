@@ -323,8 +323,8 @@ async def search_character(
             keyword_chunks.append(r)
             seen.add(r["index"])
     
-    # Sort by score descending
-    keyword_chunks.sort(key=lambda x: x["score"], reverse=True)
+    # Sort by score descending, then by index descending (most recent first) for same score
+    keyword_chunks.sort(key=lambda x: (x["score"], x["index"]), reverse=True)
     return keyword_chunks[:top_k]
 
 
