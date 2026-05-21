@@ -456,8 +456,8 @@ async def extract_memory_and_characters(
             from app.config import settings as app_settings
             if app_settings.rag_auto_index:
                 from app.services.rag import build_index
-                emb_url = app_settings.rag_embedding_base_url or app_settings.default_llm_base_url
-                emb_key = app_settings.rag_embedding_api_key or app_settings.default_llm_api_key
+                emb_url = app_settings.rag_embedding_base_url  # empty = local model
+                emb_key = app_settings.rag_embedding_api_key
                 await build_index(
                     session_id,
                     embedding_base_url=emb_url,

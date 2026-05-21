@@ -890,8 +890,8 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             from app.config import settings as app_settings
 
             sid = session["id"]
-            emb_url = app_settings.rag_embedding_base_url or app_settings.default_llm_base_url
-            emb_key = app_settings.rag_embedding_api_key or app_settings.default_llm_api_key
+            emb_url = app_settings.rag_embedding_base_url  # empty = local model
+            emb_key = app_settings.rag_embedding_api_key
             emb_model = app_settings.rag_embedding_model
 
             if sub == "list":
