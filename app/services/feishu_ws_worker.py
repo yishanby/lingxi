@@ -991,16 +991,21 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
 
             elif sub == "find":
                 # Pure keyword search: /chars find <keyword> [max_chars_per_chunk]
-                keyword = parts[2].strip() if len(parts) > 2 else None
-                if not keyword:
+                rest = parts[2].strip() if len(parts) > 2 else ""
+                if not rest:
                     send_text(chat_id, "用法: /chars find <关键词> [每条长度]\n例: /chars find 杨紫 800")
                     return
+                # Try to extract trailing number as max_len
                 max_len = 400
-                if len(parts) > 3:
+                rest_parts = rest.rsplit(maxsplit=1)
+                if len(rest_parts) == 2:
                     try:
-                        max_len = int(parts[3].strip())
+                        max_len = int(rest_parts[1])
+                        keyword = rest_parts[0]
                     except ValueError:
-                        pass
+                        keyword = rest
+                else:
+                    keyword = rest
                 from app.services.rag import load_index
                 index = asyncio.run(load_index(sid))
                 if not index.get("chunks"):
