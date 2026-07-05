@@ -7,7 +7,7 @@ from pathlib import Path
 async def main():
     from app.services.memory import (
         load_chat_md, load_memory, save_character_profile,
-        CHARACTER_EXTRACTION_PROMPT, _characters_dir,
+        CHARACTER_EXTRACTION_PROMPT, _characters_dir, normalize_character_name,
     )
     from app.services.llm import chat_completion
     from app.database import async_session
@@ -72,6 +72,7 @@ async def main():
         match = re.match(r"^#\s+(.+)", block)
         if match:
             char_name = match.group(1).strip()
+            char_name = normalize_character_name(char_name)
             await save_character_profile(session_id, char_name, block)
             print(f"  Saved: {char_name}", flush=True)
             saved += 1

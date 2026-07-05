@@ -91,10 +91,12 @@ def _escape(text: str) -> str:
 
 def send_text(chat_id: str, text: str):
     url = f"{_FEISHU_BASE}/im/v1/messages?receive_id_type=chat_id"
+    import json as _json
+    content_str = _json.dumps({"text": text}, ensure_ascii=False)
     body = {
         "receive_id": chat_id,
         "msg_type": "text",
-        "content": f'{{"text":"{_escape(text)}"}}',
+        "content": content_str,
     }
     with httpx.Client(timeout=30) as client:
         resp = client.post(url, headers=_feishu_headers(), json=body)
@@ -272,6 +274,25 @@ def close_streaming_card(card_id: str, final_text: str, sequence: int) -> None:
         logger.exception("close_streaming_card failed")
 
 
+import re as _re
+
+def _strip_code_blocks(text: str) -> str:
+    """Convert code-fenced status blocks to plain text with dividers for Feishu rendering.
+    
+    Feishu renders code blocks with horizontal scrollbars which is hard to read.
+    Convert ```...``` blocks to plain text with ━━━ dividers.
+    Also strips U+FFFD replacement characters (garbled text from streaming).
+    """
+    def _replace_block(m):
+        content = m.group(1).strip()
+        return f"━━━━━━━━━━\n{content}\n━━━━━━━━━━"
+    
+    result = _re.sub(r'```[^\n]*\n(.*?)```', _replace_block, text, flags=_re.DOTALL)
+    # Remove replacement characters
+    result = result.replace('\ufffd', '')
+    return result
+
+
 def _async_card_updater(card_id: str):
     """Background thread that processes card updates.
 
@@ -366,7 +387,7 @@ def _stream_llm_to_card(session_id: int, user_text: str, card_id: str) -> str:
                             full_text += delta
                             now = time.time()
                             if now - last_enqueue_time >= ENQUEUE_INTERVAL:
-                                enqueue_update(full_text)
+                                enqueue_update(_strip_code_blocks(full_text))
                                 last_enqueue_time = now
                     except (json.JSONDecodeError, KeyError):
                         continue
@@ -375,7 +396,7 @@ def _stream_llm_to_card(session_id: int, user_text: str, card_id: str) -> str:
 
     logger.info(f"Stream done: {len(full_text)} chars, closing card")
     # Final close (waits for at most one in-flight update then closes)
-    enqueue_final(full_text)
+    enqueue_final(_strip_code_blocks(full_text))
     worker_thread.join(timeout=10)
     return full_text
 
@@ -631,10 +652,12 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             "📖 可用命令：\n\n"
             "💬 会话管理\n"
             "/list — 列出本群所有会话（含已归档）\n"
+            "/listall — 列出所有群组的会话（可跨群���复）\n"
             "/switch — 选择/切换角色（归档当前会话）\n"
             "/resume — 恢复已归档的会话\n"
             "/reset — 重置当前会话（重新开始对话）\n"
-            "/info — 查看当前会话信息\n\n"
+            "/info — 查看当前会话信息\n"
+            "/bg — 查看当前角色的故事背景\n\n"
             "✏️ 对话操作\n"
             "/retry — 重新生成上一条AI回复\n"
             "/undo — 撤销上一轮对话\n\n"
@@ -713,6 +736,44 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
             send_text(chat_id, f"获取会话列表失败: {exc}")
         return
 
+    if cmd == "/listall":
+        try:
+            sessions = api_get("/api/sessions?lite=true")
+            if not sessions:
+                send_text(chat_id, "系统中还没有任何会话。")
+                return
+
+            # Look up character names
+            try:
+                characters = api_get("/api/characters")
+                char_map = {c["id"]: c["name"] for c in characters}
+            except Exception:
+                char_map = {}
+
+            # Group by chat_id
+            from collections import defaultdict
+            by_chat = defaultdict(list)
+            for s in sessions:
+                by_chat[s.get("feishu_chat_id", "unknown")].append(s)
+
+            lines = ["📋 所有群组会话列表：\n"]
+            for cid, sess_list in by_chat.items():
+                chat_label = cid if cid != chat_id else f"{cid} ← 本群"
+                lines.append(f"\n🏠 {chat_label}")
+                for s in sess_list:
+                    sid = s["id"]
+                    char_name = char_map.get(s.get("character_id"), f"角色#{s.get('character_id')}")
+                    status = "🟢" if s.get("status") == "active" else "⚪"
+                    msg_count = s.get("msg_count", 0)
+                    lines.append(f"  {status} #{sid} {char_name} ({msg_count}条消息)")
+
+            lines.append("\n使用 /resume <编号> 恢复任意会话到本群")
+            send_text(chat_id, "\n".join(lines))
+        except Exception as exc:
+            logger.exception("listall command failed")
+            send_text(chat_id, f"获取全部会话失败: {exc}")
+        return
+
     if cmd == "/reset":
         sessions = api_get("/api/sessions?lite=true")
         for s in sessions:
@@ -786,6 +847,45 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                 return
         send_text(chat_id, "没有活跃会话。")
 
+    elif cmd == "/bg":
+        # Show scenario/background for current character
+        sessions = api_get("/api/sessions?lite=true")
+        active = None
+        for s in sessions:
+            if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
+                active = s
+                break
+        if not active:
+            send_text(chat_id, "没有活跃会话。")
+            return
+        try:
+            characters = api_get("/api/characters")
+            char = None
+            for c in characters:
+                if c["id"] == active.get("character_id"):
+                    char = c
+                    break
+            if not char:
+                send_text(chat_id, "角色未找到。")
+                return
+            parts_out = []
+            char_name = char.get("name", "未知")
+            user_name = active.get("user_name", "用户")
+            if char.get("scenario"):
+                scenario = char["scenario"].replace("{{char}}", char_name).replace("{{user}}", user_name)
+                parts_out.append(f"📖 故事背景\n{scenario}")
+            if char.get("description"):
+                desc = char["description"].replace("{{char}}", char_name).replace("{{user}}", user_name)
+                parts_out.append(f"👤 角色设定\n{desc}")
+            if not parts_out:
+                send_text(chat_id, f"{char_name} 没有设定故事背景。")
+            else:
+                send_text(chat_id, "\n\n".join(parts_out))
+        except Exception as exc:
+            logger.exception("bg command failed")
+            send_text(chat_id, f"获取背景失败: {exc}")
+        return
+
     elif cmd == "/resume":
         try:
             parts = text.split()
@@ -822,15 +922,15 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                 send_text(chat_id, "用法: /resume <会话编号>，如 /resume 3")
                 return
 
-            # Check target exists and belongs to this chat
+            # Check target exists — allow cross-chat resume
             target_session = None
-            for s in chat_sessions:
+            for s in sessions:
                 if s["id"] == target_id:
                     target_session = s
                     break
 
             if not target_session:
-                send_text(chat_id, f"未找到本群的会话 #{target_id}。使用 /list 查看可用会话。")
+                send_text(chat_id, f"未找到会话 #{target_id}。使用 /list 或 /listall 查看可用会话。")
                 return
 
             if target_session.get("status") == "active":
@@ -846,8 +946,8 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                     except Exception:
                         logger.exception(f"Failed to archive session {s['id']}")
 
-            # Activate target session
-            api_patch(f"/api/sessions/{target_id}/status", {"status": "active"})
+            # Activate target session (update chat_id for cross-chat resume)
+            api_patch(f"/api/sessions/{target_id}/status", {"status": "active", "feishu_chat_id": chat_id})
 
             # Look up character name
             char_name = f"会话#{target_id}"

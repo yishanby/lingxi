@@ -18,6 +18,7 @@ from app.services import feishu_client
 from app.services.llm import LLMError, chat_completion
 from app.services.token_tracker import record_usage
 from app.services.prompt import assemble_prompt
+from app.services.history_seed import get_history_seed
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/feishu", tags=["feishu"])
@@ -142,6 +143,12 @@ async def _handle_message(event: dict[str, Any], db: AsyncSession) -> None:
         "example_dialogues": char.example_dialogues,
         "system_prompt": char.system_prompt,
     }
+
+    # Inject history seed for new conversations without example_dialogues
+    if not char.example_dialogues and not messages:
+        seed = await get_history_seed(db, char.id, exclude_session_id=session.id)
+        if seed:
+            char_dict["_history_seed"] = seed
 
     # Worldbook entries
     from app.models.tables import WorldBook

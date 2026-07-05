@@ -10,7 +10,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 sys.path.insert(0, '.')
 
 from app.services.rag import rebuild_character_from_history
-from app.services.memory import save_character_profile, list_character_names
+from app.services.memory import save_character_profile, list_character_names, normalize_character_name
 
 CHARS_DIR = Path('data/memory/9/characters')
 
@@ -21,7 +21,7 @@ async def main():
     # Get unique base names
     base_names = set()
     for n in names:
-        base = re.split(r'[(\uff08]', n)[0].strip()
+        base = normalize_character_name(n)
         if base:
             base_names.add(base)
     base_names = sorted(base_names)

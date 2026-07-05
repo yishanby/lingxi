@@ -68,6 +68,12 @@ EXTRACTION_SYSTEM_PROMPT = (
 )
 
 
+def normalize_character_name(name: str) -> str:
+    """Remove parenthetical suffixes like （升级档案） or (upgraded) from character names."""
+    name = re.sub(r'[（(][^）)]*[）)]', '', name)
+    return name.strip()
+
+
 def _session_dir(session_id: int) -> Path:
     return MEMORY_BASE / str(session_id)
 
@@ -443,6 +449,7 @@ async def extract_memory_and_characters(
                 match = re.match(r"^#\s+(.+)", block)
                 if match:
                     char_name = match.group(1).strip()
+                    char_name = normalize_character_name(char_name)
                     await save_character_profile(session_id, char_name, block)
                     updated_count += 1
                     logger.info(f"Character profile updated: {char_name} (session {session_id})")
@@ -760,6 +767,7 @@ async def update_character_profiles(
             match = re.match(r"^#\s+(.+)", block)
             if match:
                 char_name = match.group(1).strip()
+                char_name = normalize_character_name(char_name)
                 await save_character_profile(session_id, char_name, block)
                 updated += 1
                 logger.info(f"Character profile updated: {char_name} (session {session_id})")
