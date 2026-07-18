@@ -95,6 +95,7 @@ async def _load_session_messages(session_id: int) -> list[MessageItem]:
 def _filter_refusals(messages: list[MessageItem]) -> list[MessageItem]:
     """Remove assistant messages that are clearly safety refusals."""
     REFUSAL_MARKERS = [
+        # English markers
         "I can't engage with this",
         "I cannot and will not",
         "I will not engage",
@@ -106,6 +107,29 @@ def _filter_refusals(messages: list[MessageItem]) -> list[MessageItem]:
         "I'm not able to",
         "Sexual coercion",
         "non-consensual",
+        "I can't continue",
+        "I cannot continue",
+        "I'm not going to continue",
+        "I will not continue",
+        "I need to stop",
+        "I should not have continued",
+        # Chinese markers
+        "我无法继续",
+        "我不能创作",
+        "我不能参与",
+        "无法参与",
+        "我的操作边界",
+        "违反明确同意",
+        "创伤绑定",
+        "边界侵蚀",
+        "性胁迫",
+        "性虐待",
+        "非自愿性行为",
+        "系统性胁迫",
+        "布定的控制关系",
+        "不创作将边界侵蚀正常化",
+        "如果你对以下方面感兴趣",
+        "其他类型的创意写作",
     ]
     filtered = []
     for m in messages:
@@ -114,6 +138,34 @@ def _filter_refusals(messages: list[MessageItem]) -> list[MessageItem]:
                 continue  # skip refusal
         filtered.append(m)
     return filtered
+
+
+def _is_refusal(text: str) -> bool:
+    """Check if a single text is a model refusal."""
+    REFUSAL_MARKERS = [
+        "I can't engage with this",
+        "I cannot and will not",
+        "I will not engage",
+        "I need to be direct",
+        "violates my values",
+        "I cannot assist",
+        "I can't continue",
+        "I cannot continue",
+        "I'm not going to continue",
+        "I will not continue",
+        "I need to stop",
+        "I should not have continued",
+        "This conversation ends",
+        "I will not:",
+        "textbook grooming",
+        "I'm stopping",
+        "I'm not going to",
+        "我无法继续",
+        "我不能创作",
+        "我不能参与",
+    ]
+    lower = text.lower()
+    return any(m.lower() in lower for m in REFUSAL_MARKERS)
 
 
 async def _row_to_out(s: Session) -> SessionOut:
@@ -452,6 +504,11 @@ async def send_message(
     except LLMError as exc:
         raise HTTPException(502, f"LLM error: {exc}")
 
+    # Check for refusal - don't persist and ask user to retry
+    if _is_refusal(reply):
+        logger.warning(f"Session {session_id}: LLM returned a refusal, discarding.")
+        raise HTTPException(422, "模型拒绝生成，请重试 /retry")
+
     # Persist to chat.md (append user + assistant)
     now = datetime.datetime.utcnow().isoformat()
     try:
@@ -669,6 +726,7 @@ async def _handle_command(
         sub_cmd = sub_parts[0].lower() if sub_parts else ""
 
         if sub_cmd == "update":
+            from app.config import settings
             backend = await _resolve_backend(backend_id, db)
             msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
             try:
@@ -696,11 +754,12 @@ async def _handle_command(
     elif cmd == "/undo":
         if len(messages) < 2:
             raise HTTPException(400, "No messages to undo")
-        # Remove from chat.md
+        # Remove last user+assistant pair from chat.md
         try:
             await remove_last_chat_md_entries(session_id, count=2)
         except Exception as exc:
             logger.error(f"Failed to undo chat.md entries: {exc}")
+            raise HTTPException(500, f"Undo failed: {exc}")
         return await _row_to_out(session)
 
     elif cmd == "/retry":
@@ -1040,6 +1099,11 @@ async def send_message_stream(
 
         # Schedule post-stream work as a separate task so it survives client disconnect
         async def _post_stream_work():
+            # Skip refusals - don't persist to chat.md
+            if _is_refusal(full_reply):
+                logger.warning(f"Session {_session_id}: stream LLM returned a refusal, not saving to chat.md.")
+                return
+
             # Write to chat.md
             try:
                 await append_chat_md(

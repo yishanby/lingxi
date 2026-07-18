@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     default_llm_base_url: str = "https://api.openai.com/v1"
 
     # Prompt context limit (max chars of chat history to include in prompt)
-    prompt_history_max_chars: int = 100000
+    prompt_history_max_chars: int = 120000
 
     # Summary / context compression
     summary_recent_window: int = 10       # keep last N messages verbatim (legacy, unused by budget system)

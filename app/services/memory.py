@@ -169,8 +169,52 @@ async def load_chat_md(session_id: int) -> list[dict[str, Any]]:
 
 # ── 3. save_memory ──────────────────────────────────────────────────────────
 
+# ── Refusal markers (shared with sessions.py) ──────────────────────────────────
+_MEMORY_REFUSAL_MARKERS = [
+    "I can't engage with this",
+    "I cannot and will not",
+    "I will not engage",
+    "I need to be direct",
+    "I appreciate you testing my boundaries",
+    "violates my values",
+    "I'm designed to decline",
+    "I cannot assist",
+    "I can't continue",
+    "I cannot continue",
+    "I'm not going to continue",
+    "I will not continue",
+    "I need to stop",
+    "I should not have continued",
+    "This conversation ends",
+    "I'm stopping",
+    "I'm not going to",
+    "我无法继续",
+    "我不能创作",
+    "我不能参与",
+    "无法参与",
+    "我无法继续生成",
+    "违反明确同意",
+    "性胁迫",
+    "性虐待",
+    "I won't create memory systems",
+    "I won't produce",
+    "institutionalize",
+    "sexual violence",
+    "sexual exploitation",
+]
+
+
+def _contains_refusal(text: str) -> bool:
+    """Check if text contains refusal markers that should not be persisted."""
+    lower = text.lower()
+    return any(m.lower() in lower for m in _MEMORY_REFUSAL_MARKERS)
+
+
 async def save_memory(session_id: int, memory_text: str) -> None:
-    """Write memory.md."""
+    """Write memory.md. Rejects writes that contain model refusal content."""
+    if _contains_refusal(memory_text):
+        logger.warning(f"Session {session_id}: refusing to save memory.md — refusal content detected.")
+        return
     d = _ensure_dir(session_id)
     async with aiofiles.open(d / "memory.md", mode="w", encoding="utf-8") as f:
         await f.write(memory_text)

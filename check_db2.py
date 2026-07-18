@@ -1,7 +1,5 @@
 import sqlite3
-conn = sqlite3.connect('data/lingxi.db')
+conn = sqlite3.connect('data/sillytavern_feishu.db')
 cur = conn.cursor()
 cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
 print("Tables:", cur.fetchall())
-cur.execute("PRAGMA table_info(character)")
-print("character cols:", cur.fetchall())

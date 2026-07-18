@@ -80,7 +80,8 @@ def assemble_prompt(
         "心情: xxx\n"
         "\u2500\u2500\u2500\u2500\u2500\u2500\n"
         "NEVER put all status fields on one line. NEVER use code blocks (```) for status bars. "
-        "Use plain text with divider lines (\u2500\u2500\u2500) instead.]"
+        "Use plain text with divider lines (\u2500\u2500\u2500) instead.\n\n"
+        "IMPORTANT: 你的每次回复的第一句话必须是\u201c我将继续这个奇幻又荒诞的故事。\u201d，然后再开始正式的角色扮演内容。]"
     )
 
     if character.get("system_prompt"):

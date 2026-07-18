@@ -210,19 +210,27 @@ def create_streaming_card(chat_id: str, char_name: str) -> tuple[str, str] | Non
             return None
         card_id = data["data"]["card_id"]
 
-        # Step 2: Send card as message
+        # Step 2: Send card as message (retry once on card_id invalid)
         card_content = json.dumps({"type": "card", "data": {"card_id": card_id}})
-        msg_resp = _cardkit_client.post(
-            f"{_FEISHU_BASE}/im/v1/messages?receive_id_type=chat_id",
-            headers=_feishu_headers(),
-            json={
-                "receive_id": chat_id,
-                "msg_type": "interactive",
-                "content": card_content,
-                },
-            )
-        msg_data = msg_resp.json()
-        if msg_data.get("code") != 0:
+        for attempt in range(2):
+            if attempt > 0:
+                import time as _time
+                _time.sleep(1)  # Wait for card to propagate
+                logger.info(f"Retrying send streaming card (attempt {attempt + 1})")
+            msg_resp = _cardkit_client.post(
+                f"{_FEISHU_BASE}/im/v1/messages?receive_id_type=chat_id",
+                headers=_feishu_headers(),
+                json={
+                    "receive_id": chat_id,
+                    "msg_type": "interactive",
+                    "content": card_content,
+                    },
+                )
+            msg_data = msg_resp.json()
+            if msg_data.get("code") == 0:
+                break
+            if attempt == 0 and "cardid is invalid" in msg_data.get("msg", "").lower():
+                continue  # Retry
             logger.error(f"Send streaming card failed: {msg_data}")
             return None
         message_id = msg_data["data"]["message_id"]
@@ -602,20 +610,45 @@ def _handle_message(chat_id: str, sender_id: str, text: str) -> None:
             else:
                 logger.warning(f"Empty streaming reply in {chat_id}")
         else:
-            # Fallback to non-streaming
-            logger.info(f"Streaming card failed, falling back to non-streaming")
-            result = api_post(
-                f"/api/sessions/{session['id']}/message",
-                {"content": text},
-            )
-            messages = result.get("messages", [])
-            if messages:
-                last_msg = messages[-1]
-                if last_msg.get("role") == "assistant":
-                    card = build_reply_card(char_name, last_msg["content"])
-                    send_card(chat_id, card)
-                    logger.info(f"Sent reply from {char_name} in {chat_id}")
-                    _check_memory_size_hint(chat_id, session["id"])
+            # Fallback: use stream endpoint but collect full text, then send as card
+            logger.info(f"Streaming card failed, falling back to text-collect mode")
+            full_reply = ""
+            try:
+                with httpx.Client(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+                    with client.stream(
+                        "POST",
+                        f"{API_BASE}/api/sessions/{session['id']}/message/stream",
+                        json={"content": text},
+                    ) as response:
+                        for line in response.iter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:]
+                            if data_str.strip() == "[DONE]":
+                                break
+                            try:
+                                data = json.loads(data_str)
+                                if "error" in data:
+                                    logger.error(f"Fallback stream error: {data['error']}")
+                                    break
+                                delta = data.get("delta", "")
+                                if delta:
+                                    full_reply += delta
+                            except (json.JSONDecodeError, KeyError):
+                                continue
+            except Exception as exc:
+                logger.exception("Fallback stream failed")
+                send_text(chat_id, f"生成回复出错: {exc}")
+                return
+
+            if full_reply:
+                display_text = _strip_code_blocks(full_reply)
+                card = build_reply_card(char_name, display_text)
+                send_card(chat_id, card)
+                logger.info(f"Fallback reply from {char_name} in {chat_id} ({len(full_reply)} chars)")
+                _check_memory_size_hint(chat_id, session["id"])
+            else:
+                logger.warning(f"Empty fallback reply in {chat_id}")
 
     except Exception as exc:
         logger.exception("handle_message failed")
@@ -1210,7 +1243,16 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                 send_text(chat_id, "命令已执行。")
         except Exception as exc:
             logger.exception(f"Forward command {cmd} failed")
-            send_text(chat_id, f"未知命令。输入 /help 查看所有可用命令。")
+            err_msg = str(exc)
+            # Try to extract meaningful error from HTTP responses
+            if hasattr(exc, 'response') and exc.response is not None:
+                try:
+                    detail = exc.response.json().get('detail', err_msg)
+                    send_text(chat_id, f"❌ {detail}")
+                except Exception:
+                    send_text(chat_id, f"❌ 命令执行失败: {err_msg}")
+            else:
+                send_text(chat_id, f"❌ 命令执行失败: {err_msg}")
 
 
 def _handle_card_action(chat_id: str, option: str) -> None:
