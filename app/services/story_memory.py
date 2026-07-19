@@ -39,11 +39,15 @@ _STORY_HEADINGS = (
 _EPISODE_HEADINGS = ("剧情摘要", "状态变化", "承诺与伏笔")
 _HEADING = re.compile(r"^##[ \t]+(?P<name>[^\r\n]+?)[ \t]*\r?$", re.MULTILINE)
 _MACHINE_MARKER = re.compile(r"\[(?:open|closed|done)\]", re.IGNORECASE)
-_PLOT_STATE_HEADING = re.compile(
-    r"^##[ \t]+(?:(?:未完成|已完成)(?:剧情线|伏笔|承诺)|"
-    r"(?:剧情线|伏笔|承诺)状态|"
-    r"Open[ \t]+Threads|Plot[ \t]+State)[ \t]*\r?$",
-    re.IGNORECASE | re.MULTILINE,
+_ATX_HEADING = re.compile(
+    r"^[ \t]{0,3}#{1,6}(?:[ \t]+(?P<title>.*?))?[ \t]*$"
+)
+_ATX_CLOSING_HASHES = re.compile(r"[ \t]+#+[ \t]*\Z")
+_SETEXT_TITLE = re.compile(r"^[ \t]{0,3}(?P<title>\S(?:.*?\S)?)[ \t]*$")
+_SETEXT_UNDERLINE = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
+_FENCE_OPEN = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})")
+_CHINESE_PLOT_STATE_TITLE = re.compile(
+    r"(?:(?:未完成|已完成)(?:剧情线|伏笔|承诺)|(?:剧情线|伏笔|承诺)状态)\Z"
 )
 _EPISODE_FILENAME = re.compile(r"episode-(?P<number>\d{6})\.md\Z")
 _EPISODE_DOCUMENT = re.compile(
@@ -90,8 +94,75 @@ def _completion_text(value: object, *, label: str) -> str:
     return value.strip()
 
 
+def _markdown_heading_titles(text: str) -> list[str]:
+    lines = text.splitlines()
+    titles: list[str] = []
+    fence: tuple[str, int] | None = None
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if fence is not None:
+            marker, minimum = fence
+            stripped = line.lstrip(" ")
+            if len(line) - len(stripped) <= 3 and re.fullmatch(
+                rf"{re.escape(marker)}{{{minimum},}}[ \t]*",
+                stripped,
+            ):
+                fence = None
+            index += 1
+            continue
+
+        fence_match = _FENCE_OPEN.match(line)
+        if fence_match is not None:
+            opening = fence_match.group("fence")
+            fence = (opening[0], len(opening))
+            index += 1
+            continue
+
+        atx_match = _ATX_HEADING.fullmatch(line)
+        if atx_match is not None:
+            title = atx_match.group("title") or ""
+            titles.append(_ATX_CLOSING_HASHES.sub("", title).strip())
+            index += 1
+            continue
+
+        title_match = _SETEXT_TITLE.fullmatch(line)
+        if (
+            title_match is not None
+            and index + 1 < len(lines)
+            and _SETEXT_UNDERLINE.fullmatch(lines[index + 1]) is not None
+        ):
+            titles.append(title_match.group("title").strip())
+            index += 2
+            continue
+        index += 1
+    return titles
+
+
+def _is_plot_state_title(title: str) -> bool:
+    normalized = " ".join(title.split())
+    if _CHINESE_PLOT_STATE_TITLE.fullmatch(normalized) is not None:
+        return True
+
+    words = normalized.casefold().split()
+    states = {"open", "closed", "unresolved", "completed"}
+    return (
+        len(words) == 2
+        and (
+            (words[0] in states and words[1] in {"threads", "foreshadowing"})
+            or (words[0] == "plot" and words[1] in {"threads", "state", "status"})
+        )
+    ) or (
+        len(words) == 3
+        and words[0] in states
+        and words[1:] == ["plot", "threads"]
+    )
+
+
 def _reject_plot_classification(text: str, *, label: str) -> None:
-    if _MACHINE_MARKER.search(text) or _PLOT_STATE_HEADING.search(text):
+    if _MACHINE_MARKER.search(text) or any(
+        _is_plot_state_title(title) for title in _markdown_heading_titles(text)
+    ):
         raise ValueError(f"{label} must not classify plot state")
 
 

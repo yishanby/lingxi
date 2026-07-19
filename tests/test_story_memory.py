@@ -63,6 +63,148 @@ def episode_document(number: int, start: int, end: int, label: str = "完成章�
     )
 
 
+_PLOT_STATE_HEADING_CASES = [
+    pytest.param("### 未完成剧情线", id="reported-story-bypass"),
+    pytest.param("### 已完成剧情线", id="reported-episode-bypass"),
+    pytest.param("## Closed Threads", id="reported-summary-bypass"),
+    pytest.param("# 未完成剧情线", id="h1-unfinished-plot"),
+    pytest.param(" ## 已完成剧情线 ## ", id="h2-finished-plot-spaced-closed"),
+    pytest.param("  ### 剧情线状态 ###  ", id="h3-plot-state-spaced-closed"),
+    pytest.param("#### 未完成伏笔 ####", id="h4-unfinished-foreshadowing-closed"),
+    pytest.param(" ##### 已完成伏笔 ##### ", id="h5-finished-foreshadowing-closed"),
+    pytest.param("###### oPeN tHrEaDs ######", id="h6-open-threads-mixed-case"),
+    pytest.param("### cLoSeD tHrEaDs ###", id="closed-threads-mixed-case"),
+    pytest.param("### uNrEsOlVeD tHrEaDs", id="unresolved-threads-mixed-case"),
+    pytest.param("### cOmPlEtEd tHrEaDs", id="completed-threads-mixed-case"),
+    pytest.param("### pLoT tHrEaDs", id="plot-threads-mixed-case"),
+    pytest.param("### pLoT sTaTuS", id="plot-status-mixed-case"),
+    pytest.param("### oPeN pLoT tHrEaDs", id="open-plot-threads-mixed-case"),
+    pytest.param("### cLoSeD pLoT tHrEaDs", id="closed-plot-threads-mixed-case"),
+    pytest.param("### oPeN fOrEsHaDoWiNg", id="open-foreshadowing-mixed-case"),
+    pytest.param("### cLoSeD fOrEsHaDoWiNg", id="closed-foreshadowing-mixed-case"),
+    pytest.param("Closed Threads\n---", id="setext-closed-threads"),
+    pytest.param("剧情线状态\n===", id="setext-plot-state"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode", "summary"])
+@pytest.mark.parametrize("heading", _PLOT_STATE_HEADING_CASES)
+async def test_generated_plot_state_markdown_heading_is_rejected_before_write(
+    tmp_path: Path,
+    target: str,
+    heading: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    generated_suffix = f"\n\n{heading}\n- 不应写入"
+
+    if target == "story":
+        old = legacy_story_state() + "\n"
+        await store.write_text(1, "story_state.md", old)
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return story_state() + generated_suffix
+
+        with pytest.raises(ValueError, match="story state"):
+            await update_story_state(store, 1, records(2), fake_complete)
+
+        assert await store.read_text(1, "story_state.md") == old
+    elif target == "episode":
+        old = episode_document(1, 1, 20, "旧章节")
+        await store.write_text(1, "episodes/episode-000001.md", old)
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return episode_body("新章节") + generated_suffix
+
+        with pytest.raises(ValueError, match="episode"):
+            await create_due_episodes(
+                store,
+                1,
+                records(40),
+                20,
+                fake_complete,
+                episode_size=20,
+            )
+
+        assert await store.read_text(1, "episodes/episode-000001.md") == old
+        assert not (tmp_path / "1" / "episodes" / "episode-000002.md").exists()
+    else:
+        old = "旧摘要\n- [open] 旧格式伏笔\n"
+        await store.write_text(1, "summary.md", old)
+        await store.write_text(
+            1,
+            "episodes/episode-000001.md",
+            episode_document(1, 1, 20),
+        )
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return "# 整体剧情\n\n新摘要" + generated_suffix
+
+        with pytest.raises(ValueError, match="summary"):
+            await update_summary_from_episodes(
+                store,
+                1,
+                0,
+                fake_complete,
+                max_tokens=200,
+            )
+
+        assert await store.read_text(1, "summary.md") == old
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode", "summary"])
+async def test_generated_narrative_plot_state_words_are_not_headings_and_are_allowed(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    narrative = "Closed Threads and Completed Threads are phrases discussed in the journal."
+
+    if target == "story":
+        generated = story_state().replace("- 正在交谈", f"- 正在交谈\n\n{narrative}")
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await update_story_state(store, 1, records(2), fake_complete) == generated
+        assert await store.read_text(1, "story_state.md") == generated + "\n"
+    elif target == "episode":
+        generated = episode_body().replace("完成章节", f"完成章节\n\n{narrative}")
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await create_due_episodes(
+            store,
+            1,
+            records(20),
+            0,
+            fake_complete,
+            episode_size=20,
+        ) == 20
+        assert narrative in await store.read_text(1, "episodes/episode-000001.md")
+    else:
+        await store.write_text(
+            1,
+            "episodes/episode-000001.md",
+            episode_document(1, 1, 20),
+        )
+        generated = f"# 整体剧情\n\n{narrative}"
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await update_summary_from_episodes(
+            store,
+            1,
+            0,
+            fake_complete,
+            max_tokens=200,
+        ) == 20
+        assert await store.read_text(1, "summary.md") == generated + "\n"
+
+
 def test_render_records_preserves_numbers_roles_multiline_and_unicode() -> None:
     source = [
         ChatRecord(7, "user", "第一行\n第二行 🙂", "2026-01-01 00:00", "用户"),
