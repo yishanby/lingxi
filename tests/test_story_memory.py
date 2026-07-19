@@ -120,6 +120,65 @@ _SEMANTIC_PLOT_STATE_HEADING_CASES = [
 ]
 
 
+_NORMALIZED_CONCEPT_HEADING_CASES = [
+    pytest.param("### Unfinished Threads", id="unfinished-threads"),
+    pytest.param("## Unfinished Threads", id="h2-unfinished-threads"),
+    pytest.param("Unfinished Threads\n---", id="setext-unfinished-threads"),
+    pytest.param("### Finished Storylines", id="finished-storylines"),
+    pytest.param("### Open Promises", id="open-promises"),
+    pytest.param("## Promise Status", id="h2-promise-status"),
+    pytest.param("### Promise Status", id="promise-status"),
+    pytest.param("Storyline Progress\n---", id="setext-storyline-progress"),
+    pytest.param("### Storyline Progress", id="storyline-progress"),
+    pytest.param("### Foreshadowing Progress", id="foreshadowing-progress"),
+    pytest.param("### 未完剧情线", id="unfinished-chinese-plot-line"),
+    pytest.param("未完剧情线\n===", id="setext-unfinished-chinese-plot-line"),
+    pytest.param("## 待完成承诺 ##", id="h2-pending-chinese-promise"),
+    pytest.param("### 待完成承诺", id="pending-chinese-promise"),
+    pytest.param("剧情线进度\n---", id="setext-chinese-plot-progress"),
+    pytest.param("### 剧情线进度", id="chinese-plot-progress"),
+    pytest.param("### uNfInIsHeD THREADS!!! ###", id="case-punctuation-closing"),
+    pytest.param("### unfinished thread", id="singular-unfinished-thread"),
+    pytest.param("### FINISHED STORYLINE", id="singular-finished-storyline"),
+    pytest.param("### Open Promise", id="singular-open-promise"),
+    pytest.param("### Promise-Status", id="hyphenated-promise-status"),
+    pytest.param("### Story-Arc Progress", id="story-arc-progress"),
+    pytest.param("### Outstanding Quests", id="outstanding-quests"),
+    pytest.param("### Remaining Objectives", id="remaining-objectives"),
+    pytest.param("### Todo Goals", id="todo-goals"),
+    pytest.param("### Incomplete Goal", id="incomplete-goal"),
+    pytest.param("### Ongoing Quest", id="ongoing-quest"),
+    pytest.param("### Closed Objective", id="closed-objective"),
+    pytest.param("### Completed Story Arcs", id="completed-story-arcs"),
+    pytest.param("### Resolving Plot-Line", id="resolving-plot-line"),
+    pytest.param("### Unresolved Plot Thread", id="unresolved-plot-thread"),
+    pytest.param("### Commitment State", id="commitment-state"),
+    pytest.param("### Active Objective", id="active-objective"),
+    pytest.param("### Inactive Goal", id="inactive-goal"),
+    pytest.param("### Done Quest", id="done-quest"),
+    pytest.param("### Pending Promise", id="pending-promise"),
+    pytest.param("### Outstanding Foreshadowings", id="outstanding-foreshadowings"),
+    pytest.param("### Remaining Commitments", id="remaining-commitments"),
+    pytest.param("### TODO: Plot Lines", id="todo-plot-lines"),
+    pytest.param("### 已完故事线", id="completed-chinese-storyline-short"),
+    pytest.param("### 完成情节线", id="completed-chinese-story-thread"),
+    pytest.param("### 未解决伏笔", id="unresolved-chinese-foreshadowing"),
+    pytest.param("### 已解决约定", id="resolved-chinese-agreement"),
+    pytest.param("### 解决状态任务", id="resolution-state-chinese-quest"),
+    pytest.param("### 目标进度", id="chinese-goal-progress"),
+    pytest.param("### 承诺状态", id="chinese-promise-status"),
+    pytest.param("### 开放故事线", id="open-chinese-storyline-short"),
+    pytest.param("### 关闭情节线", id="closed-chinese-story-thread"),
+    pytest.param("### 【待完成】目标 ###", id="punctuated-pending-chinese-goal"),
+    pytest.param("### 待处理任务", id="pending-chinese-quest-short"),
+    pytest.param("### 进行中目标", id="ongoing-chinese-goal"),
+    pytest.param("### 剩余伏笔", id="remaining-chinese-foreshadowing"),
+    pytest.param("### 未结剧情线", id="unclosed-chinese-plot-line"),
+    pytest.param("### 已结承诺", id="closed-chinese-promise-short"),
+    pytest.param("### 任务结束", id="ended-chinese-quest"),
+]
+
+
 async def _assert_generated_heading_rejected(
     tmp_path: Path,
     target: str,
@@ -206,6 +265,17 @@ async def test_semantic_plot_state_heading_is_rejected_before_write(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", ["story", "episode", "summary"])
+@pytest.mark.parametrize("heading", _NORMALIZED_CONCEPT_HEADING_CASES)
+async def test_normalized_topic_state_heading_is_rejected_before_write(
+    tmp_path: Path,
+    target: str,
+    heading: str,
+) -> None:
+    await _assert_generated_heading_rejected(tmp_path, target, heading)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode", "summary"])
 async def test_generated_narrative_plot_state_words_are_not_headings_and_are_allowed(
     tmp_path: Path,
     target: str,
@@ -262,6 +332,15 @@ async def test_generated_narrative_plot_state_words_are_not_headings_and_are_all
 @pytest.mark.parametrize(
     "heading",
     [
+        "### Story State",
+        "### 时间与地点",
+        "### 在场角色",
+        "### 当前场景",
+        "### 最近变化",
+        "### 剧情摘要",
+        "### 状态变化",
+        "### Important Foreshadowing",
+        "### Promises Made",
         "### Plot Background",
         "### Storylines and Characters",
         "### Foreshadowing and Commitments",

@@ -50,48 +50,84 @@ _SETEXT_UNDERLINE = re.compile(
     r"^[ \t]{0,3}(?P<underline>=+|-+)[ \t]*$"
 )
 _FENCE_OPEN = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})")
-_ENGLISH_PLOT_TOPICS = frozenset(
+_REQUIRED_FACTUAL_HEADINGS = frozenset(
     {
-        "thread",
-        "threads",
-        "storyline",
-        "storylines",
-        "foreshadowing",
-        "foreshadowings",
-        "commitment",
-        "commitments",
-        "plotline",
-        "plotlines",
+        "Story State",
+        "时间与地点",
+        "在场角色",
+        "当前场景",
+        "最近变化",
+        "剧情摘要",
+        "状态变化",
+        "承诺与伏笔",
     }
 )
-_ENGLISH_PLOT_STATES = frozenset(
+_ENGLISH_PLOT_TOPIC_WORDS = frozenset(
+    {
+        "thread",
+        "storyline",
+        "promise",
+        "commitment",
+        "quest",
+        "objective",
+        "goal",
+        "plotline",
+    }
+)
+_ENGLISH_PLOT_STATE_WORDS = frozenset(
     {
         "open",
-        "closed",
-        "completed",
-        "completion",
-        "resolved",
         "resolution",
-        "unresolved",
+        "unfinished",
         "status",
+        "state",
+        "progress",
         "pending",
         "done",
         "active",
         "inactive",
+        "ongoing",
+        "outstanding",
+        "remaining",
+        "todo",
     }
 )
-_CHINESE_PLOT_TOPICS = ("剧情线", "故事线", "伏笔", "承诺")
+_ENGLISH_PLOT_STATE_STEMS = (
+    "clos",
+    "complet",
+    "incomplet",
+    "finish",
+    "resolv",
+    "unresolv",
+)
+_CHINESE_PLOT_TOPICS = (
+    "剧情线",
+    "故事线",
+    "情节线",
+    "伏笔",
+    "承诺",
+    "约定",
+    "任务",
+    "目标",
+)
 _CHINESE_PLOT_STATES = (
-    "未完成",
-    "已完成",
-    "完成状态",
+    "未完",
+    "已完",
+    "完成",
     "未解决",
     "已解决",
+    "解决状态",
+    "进度",
+    "状态",
     "开放",
     "关闭",
-    "状态",
+    "待完成",
     "待处理",
     "进行中",
+    "剩余",
+    "未结",
+    "已结",
+    "结束",
 )
 _EPISODE_FILENAME = re.compile(r"episode-(?P<number>\d{6})\.md\Z")
 _EPISODE_DOCUMENT = re.compile(
@@ -227,6 +263,10 @@ def _markdown_headings(text: str) -> list[_MarkdownHeading]:
 
 
 def _is_plot_state_title(title: str) -> bool:
+    normalized = " ".join(title.split())
+    if normalized in _REQUIRED_FACTUAL_HEADINGS:
+        return False
+
     compact = re.sub(r"\s+", "", title)
     if any(topic in compact for topic in _CHINESE_PLOT_TOPICS) and any(
         state in compact for state in _CHINESE_PLOT_STATES
@@ -235,17 +275,32 @@ def _is_plot_state_title(title: str) -> bool:
 
     words = re.findall(r"[a-z]+", title.casefold())
     word_set = set(words)
-    line_words = {"line", "lines"}
-    thread_words = {"thread", "threads"}
-    has_specific_topic = bool(word_set & _ENGLISH_PLOT_TOPICS) or (
-        bool(word_set & {"plot", "story"}) and bool(word_set & line_words)
+    singular_words = {
+        word[:-1] if word.endswith("s") else word for word in word_set
+    }
+    has_specific_topic = (
+        bool(singular_words & _ENGLISH_PLOT_TOPIC_WORDS)
+        or any(word.startswith("foreshadow") for word in word_set)
+        or (
+            "plot" in singular_words
+            and bool(singular_words & {"line", "thread"})
+        )
+        or (
+            "story" in singular_words
+            and bool(singular_words & {"line", "arc"})
+        )
     )
-    has_state = bool(word_set & _ENGLISH_PLOT_STATES)
+    has_state = bool(word_set & _ENGLISH_PLOT_STATE_WORDS) or any(
+        word.startswith(stem)
+        for word in word_set
+        for stem in _ENGLISH_PLOT_STATE_STEMS
+    )
     bare_plot_section = (
-        "plot" in word_set and bool(word_set & (line_words | thread_words))
-    ) or bool(word_set & {"plotline", "plotlines"})
+        "plot" in singular_words
+        and bool(singular_words & {"line", "thread"})
+    ) or "plotline" in singular_words
     return bare_plot_section or (
-        has_state and (has_specific_topic or "plot" in word_set)
+        has_state and (has_specific_topic or "plot" in singular_words)
     )
 
 
