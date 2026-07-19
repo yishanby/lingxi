@@ -30,15 +30,20 @@ def records(start: int, end: int | None = None) -> list[ChatRecord]:
     ]
 
 
-def story_state(*open_threads: str) -> str:
-    threads = "\n".join(f"- [open] {thread}" for thread in open_threads) or "- （无）"
+def story_state() -> str:
     return (
         "# Story State\n\n"
         "## 时间与地点\n- 当前地点：门厅\n\n"
         "## 在场角色\n- 旅人\n\n"
         "## 当前场景\n- 正在交谈\n\n"
-        f"## 未完成剧情线\n{threads}\n\n"
         "## 最近变化\n- 开始行动"
+    )
+
+
+def legacy_story_state() -> str:
+    return story_state().replace(
+        "\n\n## 最近变化",
+        "\n\n## 未完成剧情线\n- [open] 找到钥匙\n\n## 最近变化",
     )
 
 
@@ -46,7 +51,7 @@ def episode_body(label: str = "完成章节") -> str:
     return (
         f"## 剧情摘要\n{label}\n\n"
         "## 状态变化\n- 无\n\n"
-        "## 承诺与伏笔\n- [open] 约定"
+        "## 承诺与伏笔\n- 约定在月圆前返回"
     )
 
 
@@ -68,27 +73,30 @@ def test_render_records_preserves_numbers_roles_multiline_and_unicode() -> None:
 
 
 @pytest.mark.asyncio
-async def test_story_state_preserves_open_threads_and_writes_complete_state(
+async def test_story_state_migrates_legacy_state_to_current_snapshot(
     tmp_path: Path,
 ) -> None:
     store = MarkdownMemoryStore(tmp_path)
-    existing = "## 未完成剧情线\n- [open] 找到钥匙"
+    existing = legacy_story_state()
     await store.write_text(1, "story_state.md", existing)
-    expected = story_state("找到钥匙")
+    expected = story_state()
     calls: list[list[dict[str, str]]] = []
 
     async def fake_complete(messages: list[dict[str, str]]) -> str:
         calls.append(messages)
         assert existing in messages[-1]["content"]
         assert "[1] user: message 1" in messages[-1]["content"]
+        assert "不判断剧情线是否完成" in messages[0]["content"]
+        assert "不得输出 [open]" in messages[0]["content"]
         return f"\n{expected}\n"
 
     result = await update_story_state(store, 1, records(2), fake_complete)
 
     assert result == expected
-    assert "[open] 找到钥匙" in result
+    assert "未完成剧情线" not in result
+    assert all(marker not in result for marker in ("[open]", "[closed]", "[done]"))
     assert await store.read_text(1, "story_state.md") == expected + "\n"
-    assert calls[0][0]["role"] == "system"
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
@@ -96,18 +104,32 @@ async def test_story_state_preserves_open_threads_and_writes_complete_state(
     "invalid",
     [
         "",
-        "## 未完成剧情线\n- [open] 找到钥匙",
-        story_state().replace("## 当前场景", "## 其他场景"),
-        story_state().replace("## 未完成剧情线", "## Open Threads"),
+        story_state().replace(
+            "## 当前场景\n- 正在交谈\n\n",
+            "",
+        ),
+        story_state() + "\n\n## 未完成剧情线\n- 找到钥匙",
+        story_state() + "\n- [open] 找到钥匙",
+        story_state() + "\n- [closed] 找到钥匙",
+        story_state() + "\n- [done] 找到钥匙",
+        story_state() + "\n\n## Plot State\n- resolved",
     ],
-    ids=["empty", "incomplete", "missing-scene", "missing-open-section"],
+    ids=[
+        "empty",
+        "missing-scene",
+        "legacy-plot-heading",
+        "open-marker",
+        "closed-marker",
+        "done-marker",
+        "plot-state-heading",
+    ],
 )
-async def test_invalid_story_state_output_does_not_replace_valid_file(
+async def test_invalid_story_snapshot_does_not_replace_prior_file(
     tmp_path: Path,
     invalid: str,
 ) -> None:
     store = MarkdownMemoryStore(tmp_path)
-    old = story_state("旧伏笔") + "\n"
+    old = story_state() + "\n"
     await store.write_text(1, "story_state.md", old)
 
     async def fake_complete(_messages: list[dict[str, str]]) -> str:
@@ -115,232 +137,6 @@ async def test_invalid_story_state_output_does_not_replace_valid_file(
 
     with pytest.raises(ValueError, match="story state"):
         await update_story_state(store, 1, records(2), fake_complete)
-
-    assert await store.read_text(1, "story_state.md") == old
-
-
-@pytest.mark.asyncio
-async def test_story_state_cannot_silently_drop_an_open_thread(tmp_path: Path) -> None:
-    store = MarkdownMemoryStore(tmp_path)
-    old = story_state("找到钥匙") + "\n"
-    await store.write_text(1, "story_state.md", old)
-
-    async def fake_complete(_messages: list[dict[str, str]]) -> str:
-        return story_state()
-
-    with pytest.raises(ValueError, match="open thread"):
-        await update_story_state(store, 1, records(2), fake_complete)
-
-    assert await store.read_text(1, "story_state.md") == old
-
-
-@pytest.mark.asyncio
-async def test_story_state_allows_explicitly_closed_thread(tmp_path: Path) -> None:
-    store = MarkdownMemoryStore(tmp_path)
-    await store.write_text(1, "story_state.md", story_state("找到钥匙") + "\n")
-    dialogue = [
-        ChatRecord(
-            3,
-            "user",
-            "[closed] 找到钥匙",
-            "2026-01-01 00:02",
-            "name",
-        )
-    ]
-
-    async def fake_complete(_messages: list[dict[str, str]]) -> str:
-        return story_state()
-
-    assert await update_story_state(store, 1, dialogue, fake_complete) == story_state()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("thread", "evidence"),
-    [
-        ("找到钥匙", "旅人终于在地毯下找到了钥匙。"),
-        (
-            "Find the silver key",
-            "At last: the silver key was FOUND beneath the rug!",
-        ),
-    ],
-    ids=["chinese-result", "english-punctuation-and-inflection"],
-)
-async def test_story_state_allows_natural_explicit_completion_evidence(
-    tmp_path: Path,
-    thread: str,
-    evidence: str,
-) -> None:
-    store = MarkdownMemoryStore(tmp_path)
-    await store.write_text(1, "story_state.md", story_state(thread) + "\n")
-    dialogue = [
-        ChatRecord(3, "assistant", evidence, "2026-01-01 00:02", "name")
-    ]
-
-    async def fake_complete(_messages: list[dict[str, str]]) -> str:
-        return story_state()
-
-    assert await update_story_state(store, 1, dialogue, fake_complete) == story_state()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("thread", "evidence", "closes"),
-    [
-        ("找到银色钥匙", "旅人终于在地毯下找到了银色钥匙。", True),
-        ("找到银色钥匙", "旅人找到了藏在地毯下的银色钥匙。", True),
-        ("找到银色钥匙", "据传言，旅人终于找到了银色钥匙。", False),
-        ("找到银色钥匙", "有人声称旅人找到了银色钥匙。", False),
-        ("找到银色钥匙", "据称旅人找到了银色钥匙。", False),
-        ("找到银色钥匙", "旅人找到了晚餐，并讨论银色钥匙。", False),
-        ("找到银色钥匙", "旅人找到了银色钥匙的画像。", False),
-        ("找到银色钥匙", "旅人找到了银色钥匙复制品。", False),
-        ("找到银色钥匙", "已经确认，没有在地下室找到银色钥匙。", False),
-        ("找到银色钥匙", "已经发誓，明天会找到银色钥匙。", False),
-        (
-            "Find the silver key",
-            "At last, the traveler found the silver key under the rug.",
-            True,
-        ),
-        (
-            "Find the silver key",
-            "The traveler found, beneath the rug, the silver key.",
-            True,
-        ),
-        (
-            "Find the silver key",
-            "Rumor has it: the traveler finally found the silver key.",
-            False,
-        ),
-        (
-            "Find the silver key",
-            "Apparently, the traveler found the silver key.",
-            False,
-        ),
-        (
-            "Find the silver key",
-            "A witness claimed the traveler found the silver key.",
-            False,
-        ),
-        (
-            "Find the silver key",
-            "The traveler found dinner and discussed the silver key.",
-            False,
-        ),
-        (
-            "Find the silver key",
-            "The traveler found a picture of the silver key.",
-            False,
-        ),
-        (
-            "Find the silver key",
-            "The traveler found the silver key replica.",
-            False,
-        ),
-        (
-            "Find the silver key",
-            "The traveler found dinner; then discussed the silver key.",
-            False,
-        ),
-        (
-            "Find the silver key",
-            "It is confirmed: the traveler did not find the silver key.",
-            False,
-        ),
-        (
-            "Find the silver key",
-            "The traveler swore: tomorrow, they will find the silver key.",
-            False,
-        ),
-    ],
-    ids=[
-        "zh-direct-result",
-        "zh-locative-target",
-        "zh-hearsay",
-        "zh-source-claim",
-        "zh-reported-claim",
-        "zh-unrelated-object",
-        "zh-picture",
-        "zh-replica",
-        "zh-negated-result",
-        "zh-future-intent",
-        "en-direct-result",
-        "en-comma-locative-target",
-        "en-hearsay",
-        "en-apparently",
-        "en-witness-claim",
-        "en-unrelated-object",
-        "en-picture",
-        "en-replica",
-        "en-clause-boundary",
-        "en-negated-result",
-        "en-future-intent",
-    ],
-)
-async def test_story_state_natural_completion_requires_direct_target_evidence(
-    tmp_path: Path,
-    thread: str,
-    evidence: str,
-    closes: bool,
-) -> None:
-    store = MarkdownMemoryStore(tmp_path)
-    old = story_state(thread) + "\n"
-    await store.write_text(1, "story_state.md", old)
-    dialogue = [
-        ChatRecord(3, "assistant", evidence, "2026-01-01 00:02", "name")
-    ]
-
-    async def fake_complete(_messages: list[dict[str, str]]) -> str:
-        return story_state()
-
-    if closes:
-        assert await update_story_state(store, 1, dialogue, fake_complete) == story_state()
-        assert await store.read_text(1, "story_state.md") == story_state() + "\n"
-    else:
-        with pytest.raises(ValueError, match="open thread"):
-            await update_story_state(store, 1, dialogue, fake_complete)
-        assert await store.read_text(1, "story_state.md") == old
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("thread", "evidence"),
-    [
-        ("找到钥匙", "旅人完成了晚餐，但仍未找到钥匙。"),
-        ("找到钥匙", "旅人计划明天找到钥匙。"),
-        ("找到钥匙", "下一步是找到钥匙。"),
-        ("找到钥匙", "旅人谈起钥匙，也完成了另一项无关任务。"),
-        ("找到钥匙", "旅人可能找到了钥匙。"),
-        ("找到钥匙", "钥匙找到了吗？"),
-        ("钥匙的下落", "旅人完成了晚餐，同时讨论钥匙的下落。"),
-    ],
-    ids=[
-        "explicitly-unresolved",
-        "future-intent",
-        "next-step-intent",
-        "unrelated-completion",
-        "uncertain-result",
-        "question",
-        "generic-unrelated-completion",
-    ],
-)
-async def test_story_state_natural_evidence_does_not_close_unresolved_thread(
-    tmp_path: Path,
-    thread: str,
-    evidence: str,
-) -> None:
-    store = MarkdownMemoryStore(tmp_path)
-    old = story_state(thread) + "\n"
-    await store.write_text(1, "story_state.md", old)
-    dialogue = [
-        ChatRecord(3, "assistant", evidence, "2026-01-01 00:02", "name")
-    ]
-
-    async def fake_complete(_messages: list[dict[str, str]]) -> str:
-        return story_state()
-
-    with pytest.raises(ValueError, match="open thread"):
-        await update_story_state(store, 1, dialogue, fake_complete)
 
     assert await store.read_text(1, "story_state.md") == old
 
@@ -356,7 +152,7 @@ async def test_story_state_completion_failure_preserves_old_file(
     failure: BaseException,
 ) -> None:
     store = MarkdownMemoryStore(tmp_path)
-    old = story_state("保留") + "\n"
+    old = legacy_story_state() + "\n"
     await store.write_text(1, "story_state.md", old)
 
     async def fake_complete(_messages: list[dict[str, str]]) -> str:
@@ -372,8 +168,10 @@ async def test_story_state_completion_failure_preserves_old_file(
 async def test_episode_covers_exact_message_range(tmp_path: Path) -> None:
     store = MarkdownMemoryStore(tmp_path)
     prompts: list[str] = []
+    systems: list[str] = []
 
     async def fake_complete(messages: list[dict[str, str]]) -> str:
+        systems.append(messages[0]["content"])
         prompts.append(messages[-1]["content"])
         return episode_body()
 
@@ -394,6 +192,8 @@ async def test_episode_covers_exact_message_range(tmp_path: Path) -> None:
     assert "<!-- messages: 1-20 -->" in text
     assert "[20] assistant: message 20" in prompts[0]
     assert "message 21" not in prompts[0]
+    assert "不判断剧情线是否完成" in systems[0]
+    assert all(marker not in text for marker in ("[open]", "[closed]", "[done]"))
 
 
 @pytest.mark.asyncio
@@ -533,8 +333,24 @@ async def test_conflicting_existing_episode_is_never_overwritten(tmp_path: Path)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "invalid",
-    ["", "plain text", episode_body().replace("## 状态变化", "## 改变")],
-    ids=["empty", "plain", "missing-heading"],
+    [
+        "",
+        "plain text",
+        episode_body().replace("## 状态变化", "## 改变"),
+        episode_body().replace("- 约定", "- [open] 约定"),
+        episode_body().replace("- 约定", "- [closed] 约定"),
+        episode_body().replace("- 约定", "- [done] 约定"),
+        episode_body() + "\n\n## 未完成剧情线\n- 找到钥匙",
+    ],
+    ids=[
+        "empty",
+        "plain",
+        "missing-heading",
+        "open-marker",
+        "closed-marker",
+        "done-marker",
+        "plot-state-heading",
+    ],
 )
 async def test_invalid_episode_output_does_not_create_file(
     tmp_path: Path,
@@ -635,30 +451,40 @@ async def test_summary_uses_only_pending_episodes_and_returns_last_end(
     tmp_path: Path,
 ) -> None:
     store = MarkdownMemoryStore(tmp_path)
-    await store.write_text(1, "episodes/episode-000001.md", episode_document(1, 1, 20, "第一章"))
-    await store.write_text(1, "episodes/episode-000002.md", episode_document(2, 21, 40, "第二章"))
-    await store.write_text(1, "episodes/episode-000003.md", episode_document(3, 41, 60, "第三章"))
-    await store.write_text(1, "summary.md", "旧摘要\n")
-    prompts: list[str] = []
+    first = episode_document(1, 1, 20, "序章救援")
+    legacy_pending = episode_document(2, 21, 40, "第二章约定").replace(
+        "- 约定在月圆前返回",
+        "- [open] 约定在月圆前返回",
+    )
+    await store.write_text(1, "episodes/episode-000001.md", first)
+    await store.write_text(1, "episodes/episode-000002.md", legacy_pending)
+    old = "早期事件：旅人在序章救下守门人。\n- [open] 旧格式承诺\n"
+    await store.write_text(1, "summary.md", old)
+    calls: list[list[dict[str, str]]] = []
 
     async def fake_complete(messages: list[dict[str, str]]) -> str:
-        prompts.append(messages[-1]["content"])
-        return "完整新摘要"
+        calls.append(messages)
+        prompt = messages[-1]["content"]
+        assert old in prompt
+        assert "序章救援" not in prompt
+        assert "第二章约定" in prompt
+        assert "[open] 约定在月圆前返回" in prompt
+        return "# 整体剧情\n\n早期事件：旅人在序章救下守门人。\n\n人物关系与后续约定均已记录。"
 
     checkpoint = await update_summary_from_episodes(
         store,
         1,
         20,
         fake_complete,
-        max_tokens=100,
+        max_tokens=200,
     )
 
-    assert checkpoint == 60
-    assert "旧摘要" in prompts[0]
-    assert "第一章" not in prompts[0]
-    assert "第二章" in prompts[0]
-    assert "第三章" in prompts[0]
-    assert await store.read_text(1, "summary.md") == "完整新摘要\n"
+    assert checkpoint == 40
+    summary = await store.read_text(1, "summary.md")
+    assert "早期事件：旅人在序章救下守门人" in summary
+    assert all(marker not in summary for marker in ("[open]", "[closed]", "[done]"))
+    assert "保留完整故事弧" in calls[0][0]["content"]
+    assert "不判断剧情线或伏笔是否完成" in calls[0][0]["content"]
 
 
 @pytest.mark.asyncio
@@ -751,6 +577,54 @@ async def test_summary_is_truncated_to_token_bound_even_for_one_long_line(
     assert checkpoint == 20
     assert summary
     assert estimate_tokens(summary) <= 12
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "# 整体剧情\n\n- [open] 找到钥匙",
+        "# 整体剧情\n\n- [closed] 找到钥匙",
+        "# 整体剧情\n\n- [done] 找到钥匙",
+        "# 整体剧情\n\n## 未完成剧情线\n- 找到钥匙",
+        "# 整体剧情\n\n## 未完成伏笔\n- 月圆约定",
+    ],
+    ids=[
+        "open-marker",
+        "closed-marker",
+        "done-marker",
+        "plot-state-heading",
+        "foreshadowing-state-heading",
+    ],
+)
+async def test_invalid_summary_classification_preserves_legacy_summary(
+    tmp_path: Path,
+    invalid: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    legacy_episode = episode_document(1, 1, 20).replace(
+        "- 约定在月圆前返回",
+        "- [open] 约定在月圆前返回",
+    )
+    await store.write_text(1, "episodes/episode-000001.md", legacy_episode)
+    old = "早期事件仍需保留\n- [open] 旧格式伏笔\n"
+    await store.write_text(1, "summary.md", old)
+
+    async def fake_complete(messages: list[dict[str, str]]) -> str:
+        assert old in messages[-1]["content"]
+        assert "[open] 约定在月圆前返回" in messages[-1]["content"]
+        return invalid
+
+    with pytest.raises(ValueError, match="summary"):
+        await update_summary_from_episodes(
+            store,
+            1,
+            0,
+            fake_complete,
+            max_tokens=100,
+        )
+
+    assert await store.read_text(1, "summary.md") == old
 
 
 @pytest.mark.asyncio
