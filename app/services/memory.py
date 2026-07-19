@@ -13,11 +13,13 @@ from typing import Any
 import aiofiles
 
 from app.services.llm import chat_completion
+from app.services.md_store import MarkdownMemoryStore
 
 logger = logging.getLogger(__name__)
 
 # Base directory for memory data
 MEMORY_BASE = Path("data/memory")
+md_store = MarkdownMemoryStore()
 
 MEMORY_TEMPLATE = """# Session Memory
 
@@ -86,6 +88,27 @@ def _ensure_dir(session_id: int) -> Path:
 
 # ── 1. append_chat_md ───────────────────────────────────────────────────────
 
+
+async def append_chat_pair(
+    session_id: int,
+    user_text: str,
+    assistant_text: str,
+    *,
+    char_name: str,
+    user_name: str,
+    msg_type: str = "ic",
+) -> None:
+    """Append one complete user/assistant pair under the session lock."""
+    await md_store.append_pair(
+        session_id,
+        user_text,
+        assistant_text,
+        char_name=char_name,
+        user_name=user_name,
+        msg_type=msg_type,
+    )
+
+
 async def append_chat_md(
     session_id: int,
     role: str,
@@ -95,76 +118,43 @@ async def append_chat_md(
     msg_type: str = "ic",
 ) -> None:
     """Append a message to chat.md with timestamp."""
-    d = _ensure_dir(session_id)
-    path = d / "chat.md"
-
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-
     if role == "user":
-        if msg_type == "ooc":
-            header = f"## [{now}] {user_name} ((OOC)) <!-- role:user -->"
-        else:
-            header = f"## [{now}] {user_name} <!-- role:user -->"
+        record_role = "user"
+        name = user_name
+        record_type = "ooc" if msg_type == "ooc" else "ic"
     elif role == "assistant":
-        header = f"## [{now}] {char_name} <!-- role:assistant -->"
+        record_role = "assistant"
+        name = char_name
+        record_type = "ic"
     else:
-        header = f"## [{now}] System <!-- role:system -->"
+        record_role = "system"
+        name = "System"
+        record_type = "ic"
 
-    entry = f"\n{header}\n{content}\n"
-
-    async with aiofiles.open(path, mode="a", encoding="utf-8") as f:
-        await f.write(entry)
+    await md_store.append_record(
+        session_id,
+        record_role,
+        content,
+        name=name,
+        msg_type=record_type,
+    )
 
 
 # ── 2. load_chat_md ─────────────────────────────────────────────────────────
 
 async def load_chat_md(session_id: int) -> list[dict[str, Any]]:
     """Parse chat.md back into message dicts."""
-    path = _session_dir(session_id) / "chat.md"
-    if not path.exists():
-        return []
-
-    async with aiofiles.open(path, mode="r", encoding="utf-8") as f:
-        text = await f.read()
-
-    messages: list[dict[str, Any]] = []
-    # Pattern: ## [timestamp] Name (optional ((OOC))) (optional <!-- role:xxx -->)
-    pattern = re.compile(
-        r"^## \[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\] (.+?)(?:\s+\(\(OOC\)\))?(?:\s+<!-- role:(\w+) -->)?\s*$",
-        re.MULTILINE,
-    )
-
-    splits = pattern.split(text)
-    # splits: [preamble, ts1, name1, role1, content1, ts2, name2, role2, content2, ...]
-    i = 1
-    while i + 3 < len(splits):
-        timestamp = splits[i]
-        name = splits[i + 1]
-        role_tag = splits[i + 2]  # from <!-- role:xxx --> or None
-        content = splits[i + 3].strip()
-
-        # Determine role: use tag if present, else fall back to heuristic
-        if role_tag:
-            role = role_tag
-        elif name == "System":
-            role = "system"
-        else:
-            role = "user"  # can't distinguish without tag
-
-        # Detect OOC from the header line
-        is_ooc = "((OOC))" in (splits[i + 1] if splits[i + 1] else "")
-
-        msg = {
-            "role": role,
-            "content": content,
-            "timestamp": timestamp,
-            "name": name,
-            "msg_type": "ooc" if is_ooc else "ic",
+    records = await md_store.load_chat(session_id)
+    return [
+        {
+            "role": record.role,
+            "content": record.content,
+            "timestamp": record.timestamp,
+            "name": record.name,
+            "msg_type": record.msg_type,
         }
-        messages.append(msg)
-        i += 4
-
-    return messages
+        for record in records
+    ]
 
 
 # ── 3. save_memory ──────────────────────────────────────────────────────────
