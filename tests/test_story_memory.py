@@ -87,10 +87,40 @@ _PLOT_STATE_HEADING_CASES = [
 ]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("target", ["story", "episode", "summary"])
-@pytest.mark.parametrize("heading", _PLOT_STATE_HEADING_CASES)
-async def test_generated_plot_state_markdown_heading_is_rejected_before_write(
+_SEMANTIC_PLOT_STATE_HEADING_CASES = [
+    pytest.param("### Resolved Plot Lines", id="resolved-plot-lines"),
+    pytest.param("## Resolved Plot Lines", id="h2-resolved-plot-lines"),
+    pytest.param("Resolved Plot Lines\n---", id="setext-resolved-plot-lines"),
+    pytest.param("### Foreshadowing Status", id="foreshadowing-status"),
+    pytest.param("## Foreshadowing Status", id="h2-foreshadowing-status"),
+    pytest.param("Foreshadowing Status\n===", id="setext-foreshadowing-status"),
+    pytest.param("### Completed Storylines", id="completed-storylines"),
+    pytest.param("### Commitment Completion", id="commitment-completion"),
+    pytest.param("### Storyline Resolution", id="storyline-resolution"),
+    pytest.param("### Unresolved Foreshadowing", id="unresolved-foreshadowing"),
+    pytest.param("### Pending Commitments", id="pending-commitments"),
+    pytest.param("### Done Plot Threads", id="done-plot-threads"),
+    pytest.param("### Active Storylines", id="active-storylines"),
+    pytest.param("### Inactive Foreshadowing", id="inactive-foreshadowing"),
+    pytest.param("### Plot Lines", id="bare-plot-lines"),
+    pytest.param("### Plot Threads", id="bare-plot-threads"),
+    pytest.param("### 未解决剧情线", id="unresolved-chinese-plot-line"),
+    pytest.param("## 未解决剧情线", id="h2-unresolved-chinese-plot-line"),
+    pytest.param("未解决剧情线\n---", id="setext-unresolved-chinese-plot-line"),
+    pytest.param("### 剧情线完成状态", id="chinese-plot-completion-status"),
+    pytest.param("## 剧情线完成状态", id="h2-chinese-plot-completion-status"),
+    pytest.param("剧情线完成状态\n===", id="setext-chinese-plot-completion-status"),
+    pytest.param("### 已完成故事线", id="completed-chinese-storyline"),
+    pytest.param("### 伏笔完成状态", id="chinese-foreshadowing-completion-status"),
+    pytest.param("### 已解决承诺", id="resolved-chinese-commitment"),
+    pytest.param("### 开放伏笔", id="open-chinese-foreshadowing"),
+    pytest.param("### 关闭故事线", id="closed-chinese-storyline"),
+    pytest.param("### 待处理承诺", id="pending-chinese-commitment"),
+    pytest.param("### 进行中伏笔", id="active-chinese-foreshadowing"),
+]
+
+
+async def _assert_generated_heading_rejected(
     tmp_path: Path,
     target: str,
     heading: str,
@@ -154,6 +184,28 @@ async def test_generated_plot_state_markdown_heading_is_rejected_before_write(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", ["story", "episode", "summary"])
+@pytest.mark.parametrize("heading", _PLOT_STATE_HEADING_CASES)
+async def test_generated_plot_state_markdown_heading_is_rejected_before_write(
+    tmp_path: Path,
+    target: str,
+    heading: str,
+) -> None:
+    await _assert_generated_heading_rejected(tmp_path, target, heading)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode", "summary"])
+@pytest.mark.parametrize("heading", _SEMANTIC_PLOT_STATE_HEADING_CASES)
+async def test_semantic_plot_state_heading_is_rejected_before_write(
+    tmp_path: Path,
+    target: str,
+    heading: str,
+) -> None:
+    await _assert_generated_heading_rejected(tmp_path, target, heading)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode", "summary"])
 async def test_generated_narrative_plot_state_words_are_not_headings_and_are_allowed(
     tmp_path: Path,
     target: str,
@@ -203,6 +255,162 @@ async def test_generated_narrative_plot_state_words_are_not_headings_and_are_all
             max_tokens=200,
         ) == 20
         assert await store.read_text(1, "summary.md") == generated + "\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode", "summary"])
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "### Plot Background",
+        "### Storylines and Characters",
+        "### Foreshadowing and Commitments",
+        "### 剧情线与人物",
+        "### 承诺与伏笔",
+    ],
+)
+async def test_factual_heading_without_state_concept_is_allowed(
+    tmp_path: Path,
+    target: str,
+    heading: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    factual_section = f"\n\n{heading}\n- 仅记录事实"
+
+    if target == "story":
+        generated = story_state() + factual_section
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await update_story_state(store, 1, records(2), fake_complete) == generated
+        assert await store.read_text(1, "story_state.md") == generated + "\n"
+    elif target == "episode":
+        generated = episode_body() + factual_section
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await create_due_episodes(
+            store,
+            1,
+            records(20),
+            0,
+            fake_complete,
+            episode_size=20,
+        ) == 20
+        assert heading in await store.read_text(1, "episodes/episode-000001.md")
+    else:
+        await store.write_text(
+            1,
+            "episodes/episode-000001.md",
+            episode_document(1, 1, 20),
+        )
+        generated = "# 整体剧情\n\n事实记录" + factual_section
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await update_summary_from_episodes(
+            store,
+            1,
+            0,
+            fake_complete,
+            max_tokens=200,
+        ) == 20
+        assert await store.read_text(1, "summary.md") == generated + "\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode", "summary"])
+@pytest.mark.parametrize("fence", ["```", "~~~"], ids=["backtick", "tilde"])
+async def test_fenced_heading_literal_does_not_count_as_document_heading(
+    tmp_path: Path,
+    target: str,
+    fence: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    code_block = f"{fence}markdown\n## Closed Threads\n- literal example\n{fence}"
+
+    if target == "story":
+        generated = story_state().replace(
+            "- 当前地点：门厅",
+            f"- 当前地点：门厅\n\n{code_block}",
+        )
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await update_story_state(store, 1, records(2), fake_complete) == generated
+        assert await store.read_text(1, "story_state.md") == generated + "\n"
+    elif target == "episode":
+        generated = episode_body().replace("完成章节", f"完成章节\n\n{code_block}")
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await create_due_episodes(
+            store,
+            1,
+            records(20),
+            0,
+            fake_complete,
+            episode_size=20,
+        ) == 20
+        assert code_block in await store.read_text(1, "episodes/episode-000001.md")
+    else:
+        await store.write_text(
+            1,
+            "episodes/episode-000001.md",
+            episode_document(1, 1, 20),
+        )
+        generated = f"# 整体剧情\n\n{code_block}"
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await update_summary_from_episodes(
+            store,
+            1,
+            0,
+            fake_complete,
+            max_tokens=200,
+        ) == 20
+        assert await store.read_text(1, "summary.md") == generated + "\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode"])
+async def test_real_extra_h2_outside_fence_is_rejected(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    extra = "\n\n## 附加事实\n- 不允许额外二级标题"
+
+    if target == "story":
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return story_state() + extra
+
+        with pytest.raises(ValueError, match="story state"):
+            await update_story_state(store, 1, records(2), fake_complete)
+        assert not (tmp_path / "1" / "story_state.md").exists()
+    else:
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return episode_body() + extra
+
+        with pytest.raises(ValueError, match="episode"):
+            await create_due_episodes(
+                store,
+                1,
+                records(20),
+                0,
+                fake_complete,
+                episode_size=20,
+            )
+        assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
 
 
 def test_render_records_preserves_numbers_roles_multiline_and_unicode() -> None:

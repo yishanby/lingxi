@@ -37,17 +37,61 @@ _STORY_HEADINGS = (
     "最近变化",
 )
 _EPISODE_HEADINGS = ("剧情摘要", "状态变化", "承诺与伏笔")
-_HEADING = re.compile(r"^##[ \t]+(?P<name>[^\r\n]+?)[ \t]*\r?$", re.MULTILINE)
+_CANONICAL_SECTION_HEADING = re.compile(
+    r"^##[ \t]+(?P<name>[^\r\n]+?)[ \t]*$"
+)
 _MACHINE_MARKER = re.compile(r"\[(?:open|closed|done)\]", re.IGNORECASE)
 _ATX_HEADING = re.compile(
-    r"^[ \t]{0,3}#{1,6}(?:[ \t]+(?P<title>.*?))?[ \t]*$"
+    r"^[ \t]{0,3}(?P<marks>#{1,6})(?:[ \t]+(?P<title>.*?))?[ \t]*$"
 )
 _ATX_CLOSING_HASHES = re.compile(r"[ \t]+#+[ \t]*\Z")
 _SETEXT_TITLE = re.compile(r"^[ \t]{0,3}(?P<title>\S(?:.*?\S)?)[ \t]*$")
-_SETEXT_UNDERLINE = re.compile(r"^[ \t]{0,3}(?:=+|-+)[ \t]*$")
+_SETEXT_UNDERLINE = re.compile(
+    r"^[ \t]{0,3}(?P<underline>=+|-+)[ \t]*$"
+)
 _FENCE_OPEN = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})")
-_CHINESE_PLOT_STATE_TITLE = re.compile(
-    r"(?:(?:未完成|已完成)(?:剧情线|伏笔|承诺)|(?:剧情线|伏笔|承诺)状态)\Z"
+_ENGLISH_PLOT_TOPICS = frozenset(
+    {
+        "thread",
+        "threads",
+        "storyline",
+        "storylines",
+        "foreshadowing",
+        "foreshadowings",
+        "commitment",
+        "commitments",
+        "plotline",
+        "plotlines",
+    }
+)
+_ENGLISH_PLOT_STATES = frozenset(
+    {
+        "open",
+        "closed",
+        "completed",
+        "completion",
+        "resolved",
+        "resolution",
+        "unresolved",
+        "status",
+        "pending",
+        "done",
+        "active",
+        "inactive",
+    }
+)
+_CHINESE_PLOT_TOPICS = ("剧情线", "故事线", "伏笔", "承诺")
+_CHINESE_PLOT_STATES = (
+    "未完成",
+    "已完成",
+    "完成状态",
+    "未解决",
+    "已解决",
+    "开放",
+    "关闭",
+    "状态",
+    "待处理",
+    "进行中",
 )
 _EPISODE_FILENAME = re.compile(r"episode-(?P<number>\d{6})\.md\Z")
 _EPISODE_DOCUMENT = re.compile(
@@ -55,6 +99,17 @@ _EPISODE_DOCUMENT = re.compile(
     r"<!-- messages: (?P<start>[1-9]\d*)-(?P<end>[1-9]\d*) -->[ \t]*\r?\n\r?\n"
     r"(?P<body>[\s\S]*?)\r?\n\Z"
 )
+
+
+@dataclass(frozen=True)
+class _MarkdownHeading:
+    title: str
+    level: int
+    start: int
+    end: int
+    source: str
+
+
 @dataclass(frozen=True)
 class _Episode:
     number: int
@@ -77,14 +132,18 @@ def _validate_sections(
     label: str,
     prefix: str,
 ) -> None:
-    matches = list(_HEADING.finditer(text))
-    if [match.group("name") for match in matches] != list(expected):
+    sections = [heading for heading in _markdown_headings(text) if heading.level == 2]
+    if [heading.title for heading in sections] != list(expected):
         raise ValueError(f"{label} must contain every required heading in order")
-    if not matches or text[: matches[0].start()].strip() != prefix:
+    for heading, name in zip(sections, expected, strict=True):
+        canonical = _CANONICAL_SECTION_HEADING.fullmatch(heading.source)
+        if canonical is None or canonical.group("name") != name:
+            raise ValueError(f"{label} must contain every required heading in order")
+    if not sections or text[: sections[0].start].strip() != prefix:
         raise ValueError(f"{label} has an invalid or incomplete preamble")
-    for index, match in enumerate(matches):
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        if not text[match.end() : end].strip():
+    for index, heading in enumerate(sections):
+        end = sections[index + 1].start if index + 1 < len(sections) else len(text)
+        if not text[heading.end : end].strip():
             raise ValueError(f"{label} contains an empty section")
 
 
@@ -94,9 +153,16 @@ def _completion_text(value: object, *, label: str) -> str:
     return value.strip()
 
 
-def _markdown_heading_titles(text: str) -> list[str]:
-    lines = text.splitlines()
-    titles: list[str] = []
+def _markdown_headings(text: str) -> list[_MarkdownHeading]:
+    raw_lines = text.splitlines(keepends=True)
+    lines = [line.rstrip("\r\n") for line in raw_lines]
+    offsets: list[int] = []
+    offset = 0
+    for raw_line in raw_lines:
+        offsets.append(offset)
+        offset += len(raw_line)
+
+    headings: list[_MarkdownHeading] = []
     fence: tuple[str, int] | None = None
     index = 0
     while index < len(lines):
@@ -122,46 +188,70 @@ def _markdown_heading_titles(text: str) -> list[str]:
         atx_match = _ATX_HEADING.fullmatch(line)
         if atx_match is not None:
             title = atx_match.group("title") or ""
-            titles.append(_ATX_CLOSING_HASHES.sub("", title).strip())
+            headings.append(
+                _MarkdownHeading(
+                    title=_ATX_CLOSING_HASHES.sub("", title).strip(),
+                    level=len(atx_match.group("marks")),
+                    start=offsets[index],
+                    end=offsets[index] + len(raw_lines[index]),
+                    source=line,
+                )
+            )
             index += 1
             continue
 
         title_match = _SETEXT_TITLE.fullmatch(line)
+        underline_match = (
+            _SETEXT_UNDERLINE.fullmatch(lines[index + 1])
+            if index + 1 < len(lines)
+            else None
+        )
         if (
             title_match is not None
-            and index + 1 < len(lines)
-            and _SETEXT_UNDERLINE.fullmatch(lines[index + 1]) is not None
+            and underline_match is not None
         ):
-            titles.append(title_match.group("title").strip())
+            underline = underline_match.group("underline")
+            headings.append(
+                _MarkdownHeading(
+                    title=title_match.group("title").strip(),
+                    level=1 if underline.startswith("=") else 2,
+                    start=offsets[index],
+                    end=offsets[index + 1] + len(raw_lines[index + 1]),
+                    source=f"{line}\n{lines[index + 1]}",
+                )
+            )
             index += 2
             continue
         index += 1
-    return titles
+    return headings
 
 
 def _is_plot_state_title(title: str) -> bool:
-    normalized = " ".join(title.split())
-    if _CHINESE_PLOT_STATE_TITLE.fullmatch(normalized) is not None:
+    compact = re.sub(r"\s+", "", title)
+    if any(topic in compact for topic in _CHINESE_PLOT_TOPICS) and any(
+        state in compact for state in _CHINESE_PLOT_STATES
+    ):
         return True
 
-    words = normalized.casefold().split()
-    states = {"open", "closed", "unresolved", "completed"}
-    return (
-        len(words) == 2
-        and (
-            (words[0] in states and words[1] in {"threads", "foreshadowing"})
-            or (words[0] == "plot" and words[1] in {"threads", "state", "status"})
-        )
-    ) or (
-        len(words) == 3
-        and words[0] in states
-        and words[1:] == ["plot", "threads"]
+    words = re.findall(r"[a-z]+", title.casefold())
+    word_set = set(words)
+    line_words = {"line", "lines"}
+    thread_words = {"thread", "threads"}
+    has_specific_topic = bool(word_set & _ENGLISH_PLOT_TOPICS) or (
+        bool(word_set & {"plot", "story"}) and bool(word_set & line_words)
+    )
+    has_state = bool(word_set & _ENGLISH_PLOT_STATES)
+    bare_plot_section = (
+        "plot" in word_set and bool(word_set & (line_words | thread_words))
+    ) or bool(word_set & {"plotline", "plotlines"})
+    return bare_plot_section or (
+        has_state and (has_specific_topic or "plot" in word_set)
     )
 
 
 def _reject_plot_classification(text: str, *, label: str) -> None:
     if _MACHINE_MARKER.search(text) or any(
-        _is_plot_state_title(title) for title in _markdown_heading_titles(text)
+        _is_plot_state_title(heading.title) for heading in _markdown_headings(text)
     ):
         raise ValueError(f"{label} must not classify plot state")
 
