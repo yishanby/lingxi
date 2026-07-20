@@ -13,6 +13,7 @@ from app.models.tables import Character, Session
 from app.routers import feishu, sessions
 from app.schemas.api import SessionCreate, SessionMessageIn
 from app.services import memory
+from app.services.chat_service import ChatService, DomainContext, TurnRequest
 from app.services.md_store import MarkdownMemoryStore
 from app.services.prompt_policy import REQUIRED_OPENING
 
@@ -195,6 +196,144 @@ async def test_sessions_rest_delegates_guarded_turn_and_records_combined_usage(
 
 
 @pytest.mark.asyncio
+async def test_established_session_without_examples_does_not_load_history_seed(
+    route_env, monkeypatch
+) -> None:
+    session, character = entities()
+    character.example_dialogues = ""
+    db = DB(session, character)
+    await route_env.store.append_pair(
+        1, "旧问题", "旧回答", char_name="灵汐", user_name="逸山"
+    )
+    seed_calls = 0
+
+    async def seed(*args, **kwargs):
+        nonlocal seed_calls
+        seed_calls += 1
+        return [{"role": "assistant", "content": "SHOULD_NOT_LOAD"}]
+
+    async def complete(**kwargs):
+        return {"content": "正文", "usage": {}}
+
+    monkeypatch.setattr(sessions, "get_history_seed", seed)
+    monkeypatch.setattr(sessions, "chat_completion", complete)
+
+    await sessions.send_message(1, SessionMessageIn(content="继续。"), db)
+
+    assert seed_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_new_session_without_examples_loads_history_seed_once(
+    route_env, monkeypatch
+) -> None:
+    session, character = entities()
+    character.example_dialogues = ""
+    db = DB(session, character)
+    seed_calls = 0
+    received: list[list[dict[str, str]]] = []
+
+    async def seed(*args, **kwargs):
+        nonlocal seed_calls
+        seed_calls += 1
+        return [{"role": "assistant", "content": "SEED_MARKER"}]
+
+    async def complete(**kwargs):
+        received.append(kwargs["messages"])
+        return {"content": "正文", "usage": {}}
+
+    monkeypatch.setattr(sessions, "get_history_seed", seed)
+    monkeypatch.setattr(sessions, "chat_completion", complete)
+
+    await sessions.send_message(1, SessionMessageIn(content="继续。"), db)
+
+    assert seed_calls == 1
+    assert "SEED_MARKER" in "\n".join(
+        message["content"] for message in received[0]
+    )
+
+
+@pytest.mark.asyncio
+async def test_sessions_context_preparation_is_serialized_and_sees_prior_commit(
+    route_env, monkeypatch
+) -> None:
+    session, character = entities()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    histories: list[list[str]] = []
+    active = 0
+    max_active = 0
+
+    async def blocking_memory(session_id, content, recent):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        histories.append([message["content"] for message in recent])
+        try:
+            if len(histories) == 1:
+                first_started.set()
+                await release_first.wait()
+            return ""
+        finally:
+            active -= 1
+
+    async def complete(**kwargs):
+        return {"content": "正文", "usage": {}}
+
+    monkeypatch.setattr(sessions, "load_memory_relevant", blocking_memory)
+    monkeypatch.setattr(sessions, "chat_completion", complete)
+
+    first = asyncio.create_task(
+        sessions.send_message(
+            1, SessionMessageIn(content="第一问"), DB(session, character)
+        )
+    )
+    await first_started.wait()
+    second = asyncio.create_task(
+        sessions.send_message(
+            1, SessionMessageIn(content="第二问"), DB(session, character)
+        )
+    )
+    await asyncio.sleep(0)
+
+    observed_before_release = max_active
+    release_first.set()
+    await asyncio.gather(first, second)
+
+    assert observed_before_release == 1
+    assert max_active == 1
+    assert histories[1][-2:] == [
+        "第一问",
+        f"{REQUIRED_OPENING}\n\n正文",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rag_provider_failure_log_is_sanitized(
+    route_env, monkeypatch, caplog
+) -> None:
+    import app.services.rag as rag
+
+    session, character = entities()
+    db = DB(session, character)
+
+    async def fail_index(session_id):
+        raise RuntimeError("provider-secret response-body")
+
+    async def complete(**kwargs):
+        return {"content": "正文", "usage": {}}
+
+    monkeypatch.setattr(rag, "load_index", fail_index)
+    monkeypatch.setattr(sessions, "chat_completion", complete)
+
+    await sessions.send_message(1, SessionMessageIn(content="继续。"), db)
+
+    assert "provider-secret" not in caplog.text
+    assert "response-body" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_sessions_rest_maps_context_budget_failure_to_safe_413(
     route_env, monkeypatch
 ) -> None:
@@ -346,6 +485,60 @@ async def test_feishu_reset_clears_markdown_chat(route_env, monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_feishu_reset_waits_for_locked_context_preparation_and_turn(
+    route_env, monkeypatch
+) -> None:
+    session, character = entities()
+    session.feishu_chat_id = "chat-1"
+    db = DB(session, character)
+    await route_env.store.append_pair(
+        1, "旧问", "旧答", char_name="灵汐", user_name="逸山"
+    )
+    loader_started = asyncio.Event()
+    release_loader = asyncio.Event()
+
+    async def loader(records):
+        loader_started.set()
+        await release_loader.wait()
+        return DomainContext()
+
+    async def complete(messages):
+        return {"content": "正文", "usage": {}}
+
+    async def send_text(chat_id, text):
+        return None
+
+    monkeypatch.setattr(feishu.feishu_client, "send_text_message", send_text)
+    turn = asyncio.create_task(
+        ChatService(
+            route_env.store,
+            route_env.manager,
+            completion=complete,
+            domain_context_loader=loader,
+        ).send(
+            TurnRequest(
+                session_id=1,
+                content="新问",
+                character={"name": "灵汐"},
+                user_name="逸山",
+            )
+        )
+    )
+    await loader_started.wait()
+    reset = asyncio.create_task(
+        feishu._handle_command("/reset", "chat-1", "sender", db)
+    )
+    await asyncio.sleep(0)
+
+    assert not reset.done()
+    assert len(await route_env.store.load_chat(1)) == 2
+    release_loader.set()
+    await asyncio.gather(turn, reset)
+
+    assert await route_env.store.load_chat(1) == []
+
+
+@pytest.mark.asyncio
 async def test_feishu_context_budget_error_is_safe_and_does_not_persist(
     route_env, monkeypatch
 ) -> None:
@@ -410,7 +603,7 @@ async def test_feishu_context_preparation_failure_sends_safe_error_without_side_
     async def send_text(chat_id, text):
         sent.append(text)
 
-    monkeypatch.setattr(sessions, "_prepare_turn_request", fail_context)
+    monkeypatch.setattr(sessions, "_prepare_domain_context", fail_context)
     monkeypatch.setattr(feishu.feishu_client, "send_text_message", send_text)
 
     await feishu._handle_message(feishu_event("继续。"), db)

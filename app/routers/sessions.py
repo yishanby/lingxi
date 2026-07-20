@@ -7,6 +7,7 @@ import datetime
 import json
 import logging
 import re
+from collections.abc import Sequence
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -25,10 +26,12 @@ from app.schemas.api import (
 from app.services.chat_service import (
     ChatService,
     ContextBudgetExceeded,
+    DomainContext,
     TurnRequest,
 )
 from app.services import memory as memory_service
 from app.services.llm import LLMError, chat_completion, chat_completion_stream
+from app.services.md_store import ChatRecord
 from app.services.output_guard import OutputGuardError
 from app.services.token_tracker import record_usage
 from app.services.memory import (
@@ -362,15 +365,28 @@ async def _load_episode_context(session_id: int) -> list[str]:
     return [episode for episode in episodes if episode]
 
 
-async def _prepare_turn_request(
+def _character_context(char: Character) -> dict[str, str]:
+    return {
+        "name": char.name,
+        "description": char.description,
+        "personality": char.personality,
+        "scenario": char.scenario,
+        "first_message": char.first_message,
+        "example_dialogues": char.example_dialogues,
+        "system_prompt": char.system_prompt,
+    }
+
+
+async def _prepare_domain_context(
     *,
     session: Session,
     char: Character,
     content: str,
     msg_type: str,
     db: AsyncSession,
-) -> TurnRequest:
-    """Load domain context; ChatService owns prompt construction and MD history."""
+    records: Sequence[ChatRecord],
+) -> DomainContext:
+    """Load domain inputs under ChatService's serialized turn operation."""
     wb_ids = json.loads(session.worldbook_ids) if session.worldbook_ids else []
     worldbook_entries: list[WorldBookEntry] = []
     for worldbook_id in wb_ids:
@@ -381,17 +397,8 @@ async def _prepare_turn_request(
                 for entry in (json.loads(worldbook.entries) if worldbook.entries else [])
             )
 
-    character = {
-        "name": char.name,
-        "description": char.description,
-        "personality": char.personality,
-        "scenario": char.scenario,
-        "first_message": char.first_message,
-        "example_dialogues": char.example_dialogues,
-        "system_prompt": char.system_prompt,
-    }
     history_seed = []
-    if not char.example_dialogues:
+    if not records and not char.example_dialogues:
         history_seed = await get_history_seed(
             db, char.id, exclude_session_id=session.id
         )
@@ -402,7 +409,6 @@ async def _prepare_turn_request(
         if persona:
             persona_position = persona.description_position or "in_prompt"
 
-    records = await memory_service.md_store.load_chat(session.id)
     recent = [
         {"role": record.role, "content": record.content}
         for record in records[-10:]
@@ -433,15 +439,14 @@ async def _prepare_turn_request(
             rag_context = "\n\n---\n\n".join(
                 result["text"] for result in results if result["score"] > 0.2
             )
-    except Exception:
-        logger.warning("RAG search failed for session %s", session.id, exc_info=True)
+    except Exception as exc:
+        logger.warning(
+            "RAG search failed for session %s (%s)",
+            session.id,
+            type(exc).__name__,
+        )
 
-    return TurnRequest(
-        session_id=session.id,
-        content=content,
-        character=character,
-        user_name=session.user_name or "用户",
-        msg_type=msg_type,
+    return DomainContext(
         user_persona=session.user_persona or "",
         persona_position=persona_position,
         worldbook_entries=worldbook_entries,
@@ -501,13 +506,23 @@ async def send_message(
 
     msg_type = "ooc" if _OOC_PATTERN.match(content) else "ic"
     backend = await _resolve_backend(body.backend_id or session.backend_id, db)
-    turn_request = await _prepare_turn_request(
-        session=session,
-        char=char,
+    turn_request = TurnRequest(
+        session_id=session.id,
         content=content,
+        character=_character_context(char),
+        user_name=session.user_name or "用户",
         msg_type=msg_type,
-        db=db,
     )
+
+    async def load_domain_context(records):
+        return await _prepare_domain_context(
+            session=session,
+            char=char,
+            content=content,
+            msg_type=msg_type,
+            db=db,
+            records=records,
+        )
 
     async def complete(messages):
         return await chat_completion(
@@ -523,6 +538,7 @@ async def send_message(
         memory_service.md_store,
         _managed_memory_manager(),
         completion=complete,
+        domain_context_loader=load_domain_context,
     )
     try:
         result = await service.send(turn_request)
@@ -963,13 +979,23 @@ async def send_message_stream(
     content = body.content.strip()
     msg_type = "ooc" if _OOC_PATTERN.match(content) else "ic"
     backend = await _resolve_backend(body.backend_id or session.backend_id, db)
-    turn_request = await _prepare_turn_request(
-        session=session,
-        char=char,
+    turn_request = TurnRequest(
+        session_id=session.id,
         content=content,
+        character=_character_context(char),
+        user_name=session.user_name or "用户",
         msg_type=msg_type,
-        db=db,
     )
+
+    async def load_domain_context(records):
+        return await _prepare_domain_context(
+            session=session,
+            char=char,
+            content=content,
+            msg_type=msg_type,
+            db=db,
+            records=records,
+        )
 
     async def stream_complete(messages):
         provider_stream = chat_completion_stream(
@@ -990,6 +1016,7 @@ async def send_message_stream(
         memory_service.md_store,
         _managed_memory_manager(),
         stream_completion=stream_complete,
+        domain_context_loader=load_domain_context,
     )
 
     async def generate():

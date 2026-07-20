@@ -124,13 +124,23 @@ async def _handle_message(event: dict[str, Any], db: AsyncSession) -> None:
 
     try:
         backend = await sessions_router._resolve_backend(session.backend_id, db)
-        turn_request = await sessions_router._prepare_turn_request(
-            session=session,
-            char=char,
+        turn_request = sessions_router.TurnRequest(
+            session_id=session.id,
             content=text,
+            character=sessions_router._character_context(char),
+            user_name=session.user_name or "用户",
             msg_type="ic",
-            db=db,
         )
+
+        async def load_domain_context(records):
+            return await sessions_router._prepare_domain_context(
+                session=session,
+                char=char,
+                content=text,
+                msg_type="ic",
+                db=db,
+                records=records,
+            )
 
         async def complete(messages):
             return await chat_completion(
@@ -146,6 +156,7 @@ async def _handle_message(event: dict[str, Any], db: AsyncSession) -> None:
             memory_service.md_store,
             sessions_router._managed_memory_manager(),
             completion=complete,
+            domain_context_loader=load_domain_context,
         )
         turn = await service.send(turn_request)
     except ContextBudgetExceeded:

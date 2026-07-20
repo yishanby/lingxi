@@ -13,11 +13,13 @@ from typing import Any, Protocol
 from app.config import settings
 from app.schemas.api import WorldBookEntry
 from app.services.context_builder import ContextBuilder, ContextSources
-from app.services.md_store import MarkdownMemoryStore
+from app.services.md_store import ChatRecord, MarkdownMemoryStore
 from app.services.output_guard import (
     _RETRY_CORRECTION,
     complete_with_guard,
     has_refusal,
+    has_substantive_output,
+    may_be_incomplete_refusal,
     normalize_opening,
 )
 from app.services.prompt import _legacy_character_context, _match_worldbook_entries
@@ -46,6 +48,31 @@ class ContextBuilderLike(Protocol):
 
 class ContextBudgetExceeded(ValueError):
     """The mandatory protected prompt content cannot fit the configured budget."""
+
+
+@dataclass(frozen=True, slots=True)
+class DomainContext:
+    """Lazy domain inputs used to build ContextSources under the turn lock."""
+
+    user_persona: str = ""
+    persona_position: str = "in_prompt"
+    worldbook_entries: Sequence[WorldBookEntry | Mapping[str, Any]] = field(
+        default_factory=tuple
+    )
+    story_state: str = ""
+    memory: str = ""
+    character_profiles: Sequence[str] = field(default_factory=tuple)
+    assets: str = ""
+    episodes: Sequence[str] = field(default_factory=tuple)
+    rag: Sequence[str] = field(default_factory=tuple)
+    overall_summary: str = ""
+    history_seed: Sequence[dict[str, str]] = field(default_factory=tuple)
+
+
+DomainContextLoader = Callable[
+    [tuple[ChatRecord, ...]],
+    Awaitable[DomainContext] | DomainContext,
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,11 +124,13 @@ class ChatService:
         completion: Completion | None = None,
         stream_completion: StreamCompletion | None = None,
         context_builder: ContextBuilderLike | None = None,
+        domain_context_loader: DomainContextLoader | None = None,
     ) -> None:
         self.store = store
         self.memory_manager = memory_manager
         self._completion = completion
         self._stream_completion = stream_completion
+        self._domain_context_loader = domain_context_loader
         self._context_builder = context_builder or ContextBuilder(
             total_budget=settings.total_token_budget,
             min_recent_messages=settings.min_recent_messages,
@@ -141,6 +170,14 @@ class ChatService:
             except ContextBudgetExceeded:
                 yield StreamEvent(error=SAFE_CONTEXT_ERROR)
                 return
+            except Exception as exc:
+                logger.warning(
+                    "Chat context preparation failed for session %s (%s)",
+                    request.session_id,
+                    type(exc).__name__,
+                )
+                yield StreamEvent(error=SAFE_STREAM_ERROR)
+                return
 
             first_usage: dict[str, Any] = {}
             for attempt in range(2):
@@ -155,6 +192,7 @@ class ChatService:
                 usage: dict[str, Any] = {}
                 validated = False
                 refused = False
+                invalid = False
                 ended_normally = False
                 try:
                     async for item in upstream:
@@ -168,9 +206,13 @@ class ChatService:
                             buffer += chunk
                             if not self._opening_guard_ready(buffer):
                                 continue
+                            if not has_substantive_output(buffer):
+                                continue
                             if has_refusal(buffer):
                                 refused = True
                                 break
+                            if may_be_incomplete_refusal(buffer):
+                                continue
                             normalized = normalize_opening(buffer)
                             accepted = normalized
                             validated = True
@@ -182,10 +224,11 @@ class ChatService:
                             yield StreamEvent(delta=chunk)
                     else:
                         ended_normally = True
-                except Exception:
-                    logger.exception(
-                        "Streaming provider failed for session %s",
+                except Exception as exc:
+                    logger.warning(
+                        "Streaming provider failed for session %s (%s)",
                         request.session_id,
+                        type(exc).__name__,
                     )
                     yield StreamEvent(error=SAFE_STREAM_ERROR)
                     return
@@ -197,13 +240,18 @@ class ChatService:
                 if ended_normally and not validated:
                     if has_refusal(buffer):
                         refused = True
+                    elif (
+                        not has_substantive_output(buffer)
+                        or may_be_incomplete_refusal(buffer, final=True)
+                    ):
+                        invalid = True
                     else:
                         accepted = normalize_opening(buffer)
                         validated = True
                         if accepted:
                             yield StreamEvent(delta=accepted)
 
-                if refused:
+                if refused or invalid:
                     if attempt == 0:
                         first_usage = usage
                         continue
@@ -233,18 +281,24 @@ class ChatService:
 
     async def _build_messages(self, request: TurnRequest) -> list[dict[str, Any]]:
         records = await self.store.load_chat(request.session_id)
+        domain = await self._load_domain_context(request, records)
         recent = [
             {"role": record.role, "content": record.content}
             for record in records
         ]
         character = copy.deepcopy(dict(request.character))
-        if request.history_seed:
-            character["_history_seed"] = copy.deepcopy(list(request.history_seed))
+        is_new = (
+            not records
+            if request.is_new_conversation is None
+            else request.is_new_conversation
+        )
+        if domain.history_seed and is_new:
+            character["_history_seed"] = copy.deepcopy(list(domain.history_seed))
         entries = [
             entry
             if isinstance(entry, WorldBookEntry)
             else WorldBookEntry.model_validate(entry)
-            for entry in request.worldbook_entries
+            for entry in domain.worldbook_entries
         ]
         recent_text = " ".join(
             message["content"] for message in recent[-10:]
@@ -253,32 +307,27 @@ class ChatService:
         ordered_character_context = _legacy_character_context(
             character,
             user_name=request.user_name,
-            user_persona=request.user_persona,
-            persona_position=request.persona_position,
+            user_persona=domain.user_persona,
+            persona_position=domain.persona_position,
             worldbook_before=before,
             worldbook_after=after,
         )
-        is_new = (
-            not records
-            if request.is_new_conversation is None
-            else request.is_new_conversation
-        )
         context_persona = (
-            request.user_persona
-            if request.persona_position != "none"
+            domain.user_persona
+            if domain.persona_position != "none"
             else ""
         )
         sources = ContextSources(
             character=character,
             user_name=request.user_name,
             user_persona=context_persona,
-            story_state=request.story_state,
-            memory=request.memory,
-            character_profiles=list(request.character_profiles),
-            assets=request.assets,
-            episodes=list(request.episodes),
-            rag=list(request.rag),
-            summary=request.overall_summary,
+            story_state=domain.story_state,
+            memory=domain.memory,
+            character_profiles=list(domain.character_profiles),
+            assets=domain.assets,
+            episodes=list(domain.episodes),
+            rag=list(domain.rag),
+            summary=domain.overall_summary,
             recent=recent,
             user_message=request.content,
             is_new_conversation=is_new,
@@ -290,6 +339,32 @@ class ChatService:
             raise ContextBudgetExceeded(SAFE_CONTEXT_ERROR) from exc
         return copy.deepcopy(result.messages)
 
+    async def _load_domain_context(
+        self,
+        request: TurnRequest,
+        records: Sequence[ChatRecord],
+    ) -> DomainContext:
+        if self._domain_context_loader is None:
+            return DomainContext(
+                user_persona=request.user_persona,
+                persona_position=request.persona_position,
+                worldbook_entries=request.worldbook_entries,
+                story_state=request.story_state,
+                memory=request.memory,
+                character_profiles=request.character_profiles,
+                assets=request.assets,
+                episodes=request.episodes,
+                rag=request.rag,
+                overall_summary=request.overall_summary,
+                history_seed=request.history_seed,
+            )
+        loaded = self._domain_context_loader(tuple(records))
+        if inspect.isawaitable(loaded):
+            loaded = await loaded
+        if not isinstance(loaded, DomainContext):
+            raise TypeError("domain context loader returned an invalid value")
+        return loaded
+
     async def _submit_memory(self, session_id: int) -> None:
         if self.memory_manager is None:
             return
@@ -297,10 +372,11 @@ class ChatService:
             result = self.memory_manager.submit(session_id)
             if inspect.isawaitable(result):
                 await result
-        except Exception:
-            logger.exception(
-                "Committed chat turn but failed to submit managed memory for session %s",
+        except Exception as exc:
+            logger.warning(
+                "Committed chat turn but failed to submit managed memory for session %s (%s)",
                 session_id,
+                type(exc).__name__,
             )
 
     @staticmethod
@@ -309,7 +385,8 @@ class ChatService:
 
     @staticmethod
     def _opening_guard_ready(buffer: str) -> bool:
-        if len(buffer) >= settings.stream_guard_chars:
+        threshold = max(1, settings.stream_guard_chars)
+        if len(buffer) >= threshold:
             return True
         substantive = buffer.lstrip()
         while substantive.startswith(REQUIRED_OPENING):

@@ -50,7 +50,15 @@ async def get_history_seed(
 
         chat_path = memory.md_store.file_path(sess.id, "chat.md")
         if chat_path.exists():
-            records = await memory.md_store.load_chat(sess.id)
+            try:
+                records = await memory.md_store.load_chat(sess.id)
+            except Exception as exc:
+                logger.warning(
+                    "Skipping unreadable Markdown history seed for session %s (%s)",
+                    sess.id,
+                    type(exc).__name__,
+                )
+                continue
             messages = [
                 {"role": record.role, "content": record.content}
                 for record in records

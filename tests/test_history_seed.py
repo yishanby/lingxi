@@ -90,3 +90,23 @@ async def test_history_seed_uses_v1_db_only_when_chat_markdown_is_absent(
         {"role": "user", "content": "v1-user"},
         {"role": "assistant", "content": "v1-assistant"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_history_seed_skips_corrupt_markdown_without_stale_db_fallback(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    monkeypatch.setattr(memory, "md_store", store)
+    await store.write_text(1, "chat.md", "corrupt-secret invalid markdown")
+    corrupt = SimpleNamespace(id=1, messages=_legacy_messages("stale"))
+    fallback = SimpleNamespace(id=2, messages=_legacy_messages("v1"))
+
+    seed = await history_seed.get_history_seed(_DB([corrupt, fallback]), 7)
+
+    assert seed == [
+        {"role": "user", "content": "v1-user"},
+        {"role": "assistant", "content": "v1-assistant"},
+    ]
+    assert "corrupt-secret" not in caplog.text
+    assert "session 1" in caplog.text.casefold()

@@ -192,6 +192,32 @@ def test_has_refusal_detects_complete_legacy_set_at_response_opening(
 
 
 @pytest.mark.parametrize(
+    ("legacy_marker", "response"),
+    LEGACY_REFUSAL_RESPONSE_OPENINGS,
+    ids=[f"incremental-{marker}" for marker, _ in LEGACY_REFUSAL_RESPONSE_OPENINGS],
+)
+def test_incremental_classifier_waits_at_every_boundary_before_known_refusal(
+    fixed_opening: str,
+    legacy_marker: str,
+    response: str,
+) -> None:
+    guard = _guard()
+    first_detected = next(
+        index
+        for index in range(1, len(response) + 1)
+        if guard.has_refusal(response[:index])
+    )
+
+    for index in range(1, first_detected):
+        buffered = f"{fixed_opening}\r\n \t{response[:index]}"
+        assert guard.may_be_incomplete_refusal(buffered), (
+            legacy_marker,
+            index,
+            response[:index],
+        )
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "As an AI model, I cannot assist you.",

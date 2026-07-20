@@ -10,6 +10,7 @@ import pytest
 from app.services.chat_service import (
     ChatService,
     ContextBudgetExceeded,
+    DomainContext,
     StreamEvent,
     TurnRequest,
 )
@@ -260,6 +261,107 @@ async def test_different_sessions_are_not_globally_serialized(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_same_session_domain_context_loaders_are_serialized_and_see_commit(
+    tmp_path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    first_loader_started = asyncio.Event()
+    release_first_loader = asyncio.Event()
+    histories: list[list[str]] = []
+    active = 0
+    max_active = 0
+
+    async def loader(records):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        histories.append([record.content for record in records])
+        try:
+            if len(histories) == 1:
+                first_loader_started.set()
+                await release_first_loader.wait()
+            return DomainContext()
+        finally:
+            active -= 1
+
+    async def complete(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        return {"content": "正文", "usage": USAGE}
+
+    first = asyncio.create_task(
+        ChatService(
+            store,
+            MemoryManager(),
+            completion=complete,
+            domain_context_loader=loader,
+        ).send(request(content="第一问"))
+    )
+    await first_loader_started.wait()
+    second = asyncio.create_task(
+        ChatService(
+            store,
+            MemoryManager(),
+            completion=complete,
+            domain_context_loader=loader,
+        ).send(request(content="第二问"))
+    )
+    await asyncio.sleep(0)
+
+    assert max_active == 1
+    assert len(histories) == 1
+    release_first_loader.set()
+    await asyncio.gather(first, second)
+
+    assert max_active == 1
+    assert histories[1][-2:] == [
+        "第一问",
+        f"{REQUIRED_OPENING}\n\n正文",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_different_session_domain_context_loaders_run_independently(
+    tmp_path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    both_active = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    max_active = 0
+
+    async def loader(records):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        if active == 2:
+            both_active.set()
+        try:
+            await release.wait()
+            return DomainContext()
+        finally:
+            active -= 1
+
+    async def complete(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        return {"content": "正文", "usage": USAGE}
+
+    tasks = [
+        asyncio.create_task(
+            ChatService(
+                store,
+                MemoryManager(),
+                completion=complete,
+                domain_context_loader=loader,
+            ).send(request(session_id=session_id))
+        )
+        for session_id in (1, 2)
+    ]
+
+    await asyncio.wait_for(both_active.wait(), timeout=1)
+    assert max_active == 2
+    release.set()
+    await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
 async def test_memory_submit_failure_does_not_rollback_or_fail_committed_turn(
     tmp_path, caplog
 ) -> None:
@@ -276,7 +378,8 @@ async def test_memory_submit_failure_does_not_rollback_or_fail_committed_turn(
 
     assert result.content.endswith("正文")
     assert len(await store.load_chat(1)) == 2
-    assert "memory queue unavailable" in caplog.text
+    assert "memory queue unavailable" not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -439,10 +542,224 @@ async def test_stream_does_not_treat_opening_only_boundary_as_guarded_content(
     assert "".join(event.delta for event in events) == f"{REQUIRED_OPENING}\n\n正文"
 
 
+@pytest.mark.asyncio
+async def test_stream_waits_when_refusal_prefix_is_split_at_guard_threshold(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 6)
+    calls = 0
+
+    async def stream(messages: list[dict[str, Any]]):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield "I cann"
+            yield "ot continue this story."
+        else:
+            yield "正文"
+        yield {"usage": USAGE}
+
+    events = await collect(
+        ChatService(
+            MarkdownMemoryStore(tmp_path),
+            MemoryManager(),
+            stream_completion=stream,
+        ).stream(request())
+    )
+
+    assert calls == 2
+    assert not any("cannot continue" in event.delta for event in events)
+    assert events[-1].done
+
+
+@pytest.mark.asyncio
+async def test_stream_refusal_prefix_stays_buffered_across_crlf_chunk_boundary(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
+    calls = 0
+
+    async def stream(messages: list[dict[str, Any]]):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield f"{REQUIRED_OPENING}\r"
+            yield "\n \tI cann"
+            yield "ot continue this story."
+        else:
+            yield "正文"
+        yield {"usage": USAGE}
+
+    events = await collect(
+        ChatService(
+            MarkdownMemoryStore(tmp_path),
+            MemoryManager(),
+            stream_completion=stream,
+        ).stream(request())
+    )
+
+    assert calls == 2
+    assert not any("cannot continue" in event.delta for event in events)
+    assert events[-1].done
+
+
+@pytest.mark.parametrize(
+    "split_at",
+    range(1, len("I cannot continue this story.")),
+)
+@pytest.mark.asyncio
+async def test_stream_waits_at_every_refusal_prefix_split_after_opening_whitespace(
+    tmp_path, monkeypatch, split_at: int
+) -> None:
+    refusal = "I cannot continue this story."
+    opening = f"{REQUIRED_OPENING}\r\n \t"
+    first_chunk = opening + refusal[:split_at]
+    monkeypatch.setattr(
+        "app.services.chat_service.settings.stream_guard_chars",
+        len(first_chunk),
+    )
+    calls = 0
+
+    async def stream(messages: list[dict[str, Any]]):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield first_chunk
+            yield refusal[split_at:]
+        else:
+            yield "正文"
+        yield {"usage": USAGE}
+
+    events = await collect(
+        ChatService(
+            MarkdownMemoryStore(tmp_path),
+            MemoryManager(),
+            stream_completion=stream,
+        ).stream(request())
+    )
+
+    assert calls == 2
+    assert not any("cannot continue" in event.delta for event in events)
+    assert events[-1].done
+
+
+@pytest.mark.asyncio
+async def test_stream_nonpositive_guard_setting_still_waits_for_classification(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 0)
+
+    async def stream(messages: list[dict[str, Any]]):
+        yield "正文"
+        yield {"usage": USAGE}
+
+    events = await collect(
+        ChatService(
+            MarkdownMemoryStore(tmp_path),
+            MemoryManager(),
+            stream_completion=stream,
+        ).stream(request())
+    )
+
+    assert "".join(event.delta for event in events if event.delta).endswith("正文")
+    assert events[-1].done
+
+
+@pytest.mark.asyncio
+async def test_stream_does_not_reclassify_later_narrative_as_opening_refusal(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 5)
+    calls = 0
+
+    async def stream(messages: list[dict[str, Any]]):
+        nonlocal calls
+        calls += 1
+        yield "骑士穿过城门。"
+        yield " 他低声说：I cannot continue walking in this rain."
+        yield {"usage": USAGE}
+
+    events = await collect(
+        ChatService(
+            MarkdownMemoryStore(tmp_path),
+            MemoryManager(),
+            stream_completion=stream,
+        ).stream(request())
+    )
+
+    assert calls == 1
+    assert events[-1].done
+    assert "I cannot continue walking" in "".join(
+        event.delta for event in events
+    )
+
+
+@pytest.mark.parametrize("first_candidate", ["", REQUIRED_OPENING])
+@pytest.mark.asyncio
+async def test_stream_retries_empty_or_opening_only_candidate_before_emission(
+    tmp_path, monkeypatch, first_candidate: str
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
+    calls = 0
+
+    async def stream(messages: list[dict[str, Any]]):
+        nonlocal calls
+        calls += 1
+        if calls == 1 and first_candidate:
+            yield first_candidate
+        elif calls == 2:
+            yield "正文"
+        yield {"usage": USAGE}
+
+    store = MarkdownMemoryStore(tmp_path)
+    manager = MemoryManager()
+    events = await collect(
+        ChatService(store, manager, stream_completion=stream).stream(request())
+    )
+
+    assert calls == 2
+    assert "".join(event.delta for event in events if event.delta) == (
+        f"{REQUIRED_OPENING}\n\n正文"
+    )
+    assert events[-1].done
+    assert events[-1].usage == {
+        "prompt_tokens": 6,
+        "completion_tokens": 10,
+        "total_tokens": 16,
+    }
+    assert len(await store.load_chat(1)) == 2
+    assert manager.submitted == [1]
+
+
+@pytest.mark.parametrize("candidate", ["", REQUIRED_OPENING, f" {REQUIRED_OPENING}\r\n\t"])
+@pytest.mark.asyncio
+async def test_stream_two_non_substantive_candidates_emit_error_without_side_effects(
+    tmp_path, monkeypatch, candidate: str
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
+
+    async def stream(messages: list[dict[str, Any]]):
+        if candidate:
+            yield candidate
+        yield {"usage": USAGE}
+
+    store = MarkdownMemoryStore(tmp_path)
+    manager = MemoryManager()
+    events = await collect(
+        ChatService(store, manager, stream_completion=stream).stream(request())
+    )
+
+    assert events[-1].error
+    assert not any(event.done for event in events)
+    assert not any(event.delta for event in events)
+    assert await store.load_chat(1) == []
+    assert manager.submitted == []
+
+
 @pytest.mark.parametrize("fail_after_text", [False, True])
 @pytest.mark.asyncio
 async def test_stream_provider_failure_never_persists_partial_pair(
-    tmp_path, monkeypatch, fail_after_text: bool
+    tmp_path, monkeypatch, caplog, fail_after_text: bool
 ) -> None:
     monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
     store = MarkdownMemoryStore(tmp_path)
@@ -460,6 +777,8 @@ async def test_stream_provider_failure_never_persists_partial_pair(
 
     assert events[-1].error
     assert "secret" not in events[-1].error
+    assert "api-key=secret" not in caplog.text
+    assert "RuntimeError" in caplog.text
     assert not events[-1].done
     assert await store.load_chat(1) == []
     assert manager.submitted == []

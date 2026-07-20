@@ -111,6 +111,25 @@ _CHINESE_REFUSAL_OPENING_VARIANTS = (
     "我无法参与",
     "不能参与",
 )
+_ENGLISH_REFUSAL_PREAMBLE_PREFIXES = (
+    "sorry",
+    "i am sorry",
+    "i'm sorry",
+    "i apologize",
+    "i need to be direct",
+    "to be direct",
+    "as an ai",
+    "as an ai model",
+    "as an ai language model",
+    "as an ai assistant",
+    "as a language model",
+)
+_CHINESE_REFUSAL_PREAMBLE_PREFIXES = (
+    "抱歉",
+    "对不起",
+    "我需要直说",
+    "我必须直说",
+)
 _ENGLISH_FIRST_PERSON_REFUSAL_CONTEXT = re.compile(
     r"\bi\s+(?:(?:cannot|can't|will not|won't|am not able to)\s+"
     r"(?:provide|create|assist|continue|produce|support|help|depict)\b|"
@@ -164,6 +183,54 @@ def normalize_opening(text: str) -> str:
     if not body:
         return REQUIRED_OPENING
     return f"{REQUIRED_OPENING}\n\n{body}"
+
+
+def has_substantive_output(text: str) -> bool:
+    """Return whether output contains content beyond fixed openings/whitespace."""
+    return bool(_strip_leading_openings(text))
+
+
+def may_be_incomplete_refusal(text: str, *, final: bool = False) -> bool:
+    """Return whether more bytes could turn the guarded opening into a refusal."""
+    raw_body = _strip_leading_openings(text)
+    if not raw_body:
+        return False
+    if REQUIRED_OPENING.startswith(raw_body.strip()):
+        return True
+
+    body = _strip_recognized_refusal_preambles(raw_body)
+    if not body:
+        return True
+    folded = body.casefold().replace("\u2019", "'")
+    english_clear_candidates = (
+        _LEGACY_ENGLISH_REFUSAL_OPENINGS
+        + _ENGLISH_REFUSAL_OPENING_VARIANTS
+        + _ENGLISH_REFUSAL_PREAMBLE_PREFIXES
+    )
+    if any(
+        candidate.startswith(folded) for candidate in english_clear_candidates
+    ):
+        return True
+    chinese_clear_candidates = (
+        _LEGACY_CHINESE_REFUSAL_OPENINGS
+        + _CHINESE_REFUSAL_OPENING_VARIANTS
+        + _CHINESE_REFUSAL_PREAMBLE_PREFIXES
+    )
+    if any(candidate.startswith(body) for candidate in chinese_clear_candidates):
+        return True
+
+    paragraph_complete = re.search(r"\r?\n\s*\r?\n", body) is not None
+    for candidate in _AMBIGUOUS_ENGLISH_TOPIC_OPENINGS:
+        if candidate.startswith(folded):
+            return not (final and candidate == folded)
+        if folded.startswith(candidate):
+            return not final and not paragraph_complete
+    for candidate in _AMBIGUOUS_CHINESE_TOPIC_OPENINGS:
+        if candidate.startswith(body):
+            return not (final and candidate == body)
+        if body.startswith(candidate):
+            return not final and not paragraph_complete
+    return False
 
 
 def has_refusal(text: str) -> bool:
