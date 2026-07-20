@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
-from weakref import WeakValueDictionary
 
 from app.config import settings
 from app.services import llm, memory, rag, story_memory
@@ -18,18 +16,6 @@ class MemoryPipeline:
 
     def __init__(self, store: MarkdownMemoryStore) -> None:
         self.store = store
-        self._run_locks: WeakValueDictionary[int, asyncio.Lock] = (
-            WeakValueDictionary()
-        )
-        self._run_locks_guard = asyncio.Lock()
-
-    async def _run_lock_for(self, session_id: int) -> asyncio.Lock:
-        async with self._run_locks_guard:
-            lock = self._run_locks.get(session_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._run_locks[session_id] = lock
-            return lock
 
     def _complete_text(
         self,
@@ -85,7 +71,7 @@ class MemoryPipeline:
         ]
 
     async def run(self, session_id: int, backend: dict[str, Any]) -> None:
-        lock = await self._run_lock_for(session_id)
+        lock = await self.store.pipeline_lock_for(session_id)
         async with lock:
             await self._run_serialized(session_id, backend)
 

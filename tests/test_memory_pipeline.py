@@ -10,7 +10,7 @@ import pytest
 
 from app.config import settings
 from app.services import memory, rag, story_memory
-from app.services.md_store import MarkdownMemoryStore, MemoryState
+from app.services.md_store import MarkdownMemoryStore, MemoryState, render_chat_records
 from app.services.memory_pipeline import MemoryPipeline
 from app.services.memory_tasks import MemoryTaskManager
 
@@ -783,9 +783,12 @@ async def test_concurrent_runs_for_different_sessions_can_overlap(
         return "updated"
 
     monkeypatch.setattr(story_memory, "update_story_state", update_story)
-    pipeline = MemoryPipeline(store)
+    pipelines = {
+        session_id: MemoryPipeline(store)
+        for session_id in (1, 2)
+    }
     tasks = [
-        asyncio.create_task(pipeline.run(session_id, BACKEND))
+        asyncio.create_task(pipelines[session_id].run(session_id, BACKEND))
         for session_id in (1, 2)
     ]
     await asyncio.wait_for(both_entered.wait(), timeout=1)
@@ -1053,3 +1056,271 @@ def test_memory_services_have_no_direct_artifact_writer_bypasses(module) -> None
             offenders.append(node.lineno)
 
     assert offenders == []
+
+
+@pytest.mark.asyncio
+async def test_refused_memory_output_preserves_artifact_and_checkpoints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "story_state_interval_messages", 100)
+    monkeypatch.setattr(settings, "memory_extract_interval_messages", 2)
+    monkeypatch.setattr(settings, "episode_size_messages", 100)
+    monkeypatch.setattr(settings, "rag_index_interval_messages", 100)
+    monkeypatch.setattr(settings, "assets_interval_messages", 100)
+    store = MarkdownMemoryStore(tmp_path)
+    monkeypatch.setattr(memory, "MEMORY_BASE", tmp_path)
+    monkeypatch.setattr(memory, "md_store", store)
+    await store.append_pair(
+        1,
+        "hello",
+        "hi",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "memory.md", "old memory")
+
+    async def refuse(**kwargs):
+        return {"content": "## Relationships\n- I won't create memory systems"}
+
+    monkeypatch.setattr(memory, "chat_completion", refuse)
+
+    with pytest.raises(ValueError, match="refusal"):
+        await MemoryPipeline(store).run(1, BACKEND)
+
+    state = await store.load_state(1)
+    assert await store.read_text(1, "memory.md") == "old memory"
+    assert state.last_memory_message == 0
+    assert state.last_character_message == 0
+    assert "refusal" in state.last_error
+
+
+@pytest.mark.asyncio
+async def test_refused_character_output_preserves_artifacts_and_checkpoints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "story_state_interval_messages", 100)
+    monkeypatch.setattr(settings, "memory_extract_interval_messages", 2)
+    monkeypatch.setattr(settings, "episode_size_messages", 100)
+    monkeypatch.setattr(settings, "rag_index_interval_messages", 100)
+    monkeypatch.setattr(settings, "assets_interval_messages", 100)
+    store = MarkdownMemoryStore(tmp_path)
+    monkeypatch.setattr(memory, "MEMORY_BASE", tmp_path)
+    monkeypatch.setattr(memory, "md_store", store)
+    await store.append_pair(
+        1,
+        "hello",
+        "hi",
+        char_name="Alice",
+        user_name="User",
+    )
+    await store.write_text(1, "memory.md", "old memory")
+    await memory.save_character_profile(1, "Alice", "# Alice\nold profile")
+
+    async def refuse(**kwargs):
+        return {
+            "content": (
+                "## Relationships\n- new memory\n"
+                "===CHARACTERS===\n# Alice\nI won't produce"
+            )
+        }
+
+    monkeypatch.setattr(memory, "chat_completion", refuse)
+
+    with pytest.raises(memory.MemoryRefusalError, match="refusal"):
+        await MemoryPipeline(store).run(1, BACKEND)
+
+    state = await store.load_state(1)
+    assert await store.read_text(1, "memory.md") == "old memory"
+    assert await memory.load_character_profile(1, "Alice") == "# Alice\nold profile"
+    assert state.last_memory_message == 0
+    assert state.last_character_message == 0
+    assert "refusal" in state.last_error
+
+
+@pytest.mark.asyncio
+async def test_asset_partial_write_retry_repairs_summary_before_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    monkeypatch.setattr(settings, "story_state_interval_messages", 100)
+    monkeypatch.setattr(settings, "memory_extract_interval_messages", 100)
+    monkeypatch.setattr(settings, "episode_size_messages", 100)
+    monkeypatch.setattr(settings, "rag_index_interval_messages", 100)
+    monkeypatch.setattr(settings, "assets_interval_messages", 2)
+    store = MarkdownMemoryStore(tmp_path)
+    monkeypatch.setattr(memory, "MEMORY_BASE", tmp_path)
+    monkeypatch.setattr(memory, "md_store", store)
+    await store.append_pair(
+        1,
+        "bought a house",
+        "purchase complete",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "assets.md", "old assets")
+    await store.write_text(1, "assets_summary.txt", "old summary")
+
+    responses = iter(
+        [
+            "new assets",
+            "new summary",
+            "NO_CHANGE",
+            "repaired summary",
+        ]
+    )
+
+    async def complete(**kwargs):
+        return {"content": next(responses)}
+
+    real_replace = md_store_module.os.replace
+    failed_summary = False
+
+    def fail_summary_once(source: Path, target: Path) -> None:
+        nonlocal failed_summary
+        if target.name == "assets_summary.txt" and not failed_summary:
+            failed_summary = True
+            raise OSError("summary replace failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr(memory, "chat_completion", complete)
+    monkeypatch.setattr(md_store_module.os, "replace", fail_summary_once)
+    pipeline = MemoryPipeline(store)
+
+    with pytest.raises(OSError, match="summary replace failed"):
+        await pipeline.run(1, BACKEND)
+
+    failed_state = await store.load_state(1)
+    assert await store.read_text(1, "assets.md") == "new assets"
+    assert await store.read_text(1, "assets_summary.txt") == "old summary"
+    assert failed_state.last_assets_message == 0
+
+    await pipeline.run(1, BACKEND)
+
+    state = await store.load_state(1)
+    assert await store.read_text(1, "assets.md") == "new assets"
+    assert await store.read_text(1, "assets_summary.txt") == "repaired summary"
+    assert state.last_assets_message == 2
+    assert state.last_error == ""
+
+
+@pytest.mark.asyncio
+async def test_rag_invalidate_crossing_chunk_rebuilds_retained_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    monkeypatch.setattr(rag, "MEMORY_BASE", tmp_path)
+    for number in range(1, 6):
+        await store.append_pair(
+            1,
+            f"u{number}",
+            f"a{number}",
+            char_name="Character",
+            user_name="User",
+        )
+
+    async def embed(texts, **kwargs):
+        return [[1.0, 0.0] for _ in texts]
+
+    async def embed_query(text, **kwargs):
+        return [1.0, 0.0]
+
+    monkeypatch.setattr(rag, "get_embeddings", embed)
+    monkeypatch.setattr(rag, "get_embedding", embed_query)
+    await rag.build_index(1)
+    records = await store.load_chat(1)
+    await store.write_text(1, "chat.md", render_chat_records(records[:8]))
+
+    await rag.invalidate_after(1, 8)
+    invalidated = await rag.load_index(1)
+    rebuilt = await rag.build_index(1)
+    results = await rag.search(1, "u4", top_k=10)
+
+    assert invalidated["indexed_messages"] == 5
+    assert [
+        (chunk["start_message"], chunk["end_message"])
+        for chunk in rebuilt["chunks"]
+        if isinstance(chunk, dict)
+    ] == [(1, 5), (6, 8)]
+    assert len(rebuilt["chunks"]) == len(rebuilt["embeddings"])
+    searchable = "\n".join(result["text"] for result in results)
+    assert "a3" in searchable
+    assert "u4" in searchable
+    assert "a4" in searchable
+    assert "u5" not in searchable
+    assert "a5" not in searchable
+
+
+@pytest.mark.asyncio
+async def test_app_lifespan_disposes_engine_when_database_begin_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    events: list[str] = []
+
+    class Engine:
+        def begin(self):
+            events.append("database-begin")
+            raise RuntimeError("database unavailable")
+
+        async def dispose(self):
+            events.append("dispose")
+
+    monkeypatch.setattr(main, "engine", Engine())
+    monkeypatch.setattr(main, "memory_pipeline", None)
+    monkeypatch.setattr(main, "memory_task_manager", None)
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        async with main.lifespan(main.app):
+            pytest.fail("lifespan should not yield")
+
+    assert events == ["database-begin", "dispose"]
+
+
+@pytest.mark.asyncio
+async def test_two_pipelines_sharing_store_serialize_same_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolate_story_stage(monkeypatch)
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "hello",
+        "hi",
+        char_name="Character",
+        user_name="User",
+    )
+    entered = asyncio.Event()
+    entered_twice = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def update_story(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        if calls == 2:
+            entered_twice.set()
+        await release.wait()
+        return "updated"
+
+    monkeypatch.setattr(story_memory, "update_story_state", update_story)
+    first_pipeline = MemoryPipeline(store)
+    second_pipeline = MemoryPipeline(store)
+    first = asyncio.create_task(first_pipeline.run(1, BACKEND))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    second = asyncio.create_task(second_pipeline.run(1, BACKEND))
+    try:
+        await asyncio.wait_for(entered_twice.wait(), timeout=0.25)
+    except TimeoutError:
+        pass
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert calls == 1

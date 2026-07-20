@@ -192,6 +192,10 @@ class MarkdownMemoryStore:
         self.base = Path(base).resolve()
         self._locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
         self._locks_guard = asyncio.Lock()
+        self._pipeline_locks: WeakValueDictionary[int, asyncio.Lock] = (
+            WeakValueDictionary()
+        )
+        self._pipeline_locks_guard = asyncio.Lock()
 
     async def lock_for(self, session_id: int) -> asyncio.Lock:
         """Return the stable lock while any caller retains it."""
@@ -201,6 +205,20 @@ class MarkdownMemoryStore:
             if lock is None:
                 lock = asyncio.Lock()
                 self._locks[session_id] = lock
+            return lock
+
+    async def pipeline_lock_for(self, session_id: int) -> asyncio.Lock:
+        """Return a shared lock for whole pipeline operations.
+
+        This lock is separate from the non-reentrant transaction lock so stages
+        may safely call helpers that open their own short store transactions.
+        """
+        _validate_session_id(session_id)
+        async with self._pipeline_locks_guard:
+            lock = self._pipeline_locks.get(session_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._pipeline_locks[session_id] = lock
             return lock
 
     @asynccontextmanager

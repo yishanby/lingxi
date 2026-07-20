@@ -196,6 +196,10 @@ _MEMORY_REFUSAL_MARKERS = [
 ]
 
 
+class MemoryRefusalError(ValueError):
+    """Provider output was rejected and must not advance memory state."""
+
+
 def _contains_refusal(text: str) -> bool:
     """Check if text contains refusal markers that should not be persisted."""
     lower = text.lower()
@@ -206,7 +210,7 @@ async def save_memory(session_id: int, memory_text: str) -> None:
     """Write memory.md. Rejects writes that contain model refusal content."""
     if _contains_refusal(memory_text):
         logger.warning(f"Session {session_id}: refusing to save memory.md — refusal content detected.")
-        return
+        raise MemoryRefusalError("memory output contained refusal content")
     await md_store.write_text(session_id, "memory.md", memory_text)
 
 
@@ -449,6 +453,9 @@ async def extract_memory_and_characters(
             params=backend_config.get("params", {}),
         ))["content"]
 
+        if _contains_refusal(extraction):
+            raise MemoryRefusalError("memory output contained refusal content")
+
         # Split by ===CHARACTERS=== marker
         marker = "===CHARACTERS==="
         if marker in extraction:
@@ -599,6 +606,20 @@ async def update_assets(
         ))["content"]
 
         if "NO_CHANGE" in result.strip():
+            if existing_assets.strip():
+                summary_messages = [
+                    {"role": "system", "content": ASSET_SUMMARY_PROMPT},
+                    {"role": "user", "content": existing_assets.strip()},
+                ]
+                summary = (await chat_completion(
+                    provider=backend_config["provider"],
+                    api_key=backend_config["api_key"],
+                    model=backend_config["model"],
+                    base_url=backend_config["base_url"],
+                    messages=summary_messages,
+                    params=backend_config.get("params", {}),
+                ))["content"]
+                await save_assets_summary(session_id, summary.strip())
             logger.info(f"No asset changes for session {session_id}")
             return False
 

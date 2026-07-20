@@ -51,29 +51,31 @@ async def _resolve_memory_backend(session_id: int) -> dict:
 async def lifespan(app: FastAPI):
     global memory_pipeline, memory_task_manager
 
-    # Create tables on startup
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-        # Migrate: add summary columns if missing (SQLite)
-        if await _column_missing(conn, "sessions", "summary"):
-            await conn.execute(
-                __import__("sqlalchemy").text(
-                    "ALTER TABLE sessions ADD COLUMN summary TEXT DEFAULT ''"
-                )
-            )
-        if await _column_missing(conn, "sessions", "summary_up_to"):
-            await conn.execute(
-                __import__("sqlalchemy").text(
-                    "ALTER TABLE sessions ADD COLUMN summary_up_to INTEGER DEFAULT 0"
-                )
-            )
-
-    logger.info("Database tables ready")
-
+    memory_pipeline = None
+    memory_task_manager = None
     stop_ws_client = None
     ws_start_attempted = False
     try:
+        # Create tables on startup
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+            # Migrate: add summary columns if missing (SQLite)
+            if await _column_missing(conn, "sessions", "summary"):
+                await conn.execute(
+                    __import__("sqlalchemy").text(
+                        "ALTER TABLE sessions ADD COLUMN summary TEXT DEFAULT ''"
+                    )
+                )
+            if await _column_missing(conn, "sessions", "summary_up_to"):
+                await conn.execute(
+                    __import__("sqlalchemy").text(
+                        "ALTER TABLE sessions ADD COLUMN summary_up_to INTEGER DEFAULT 0"
+                    )
+                )
+
+        logger.info("Database tables ready")
+
         if settings.memory_v2_enabled:
             memory_pipeline = MemoryPipeline(memory.md_store)
             memory_task_manager = MemoryTaskManager(
@@ -82,9 +84,6 @@ async def lifespan(app: FastAPI):
             )
             await memory_task_manager.start()
             await memory_task_manager.scan_pending_sessions()
-        else:
-            memory_pipeline = None
-            memory_task_manager = None
 
         from app.services.feishu_ws import set_session_factory, start_ws_client
         from app.services.feishu_ws import stop_ws_client as stop_client

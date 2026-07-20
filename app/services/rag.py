@@ -204,6 +204,7 @@ async def invalidate_after(session_id: int, message_number: int) -> None:
     index = await load_index(session_id)
     retained_chunks: list[Any] = []
     retained_embeddings: list[Any] = []
+    retained_range_ends: list[int] = []
     for chunk, embedding in zip(
         index.get("chunks", []),
         index.get("embeddings", []),
@@ -217,12 +218,14 @@ async def invalidate_after(session_id: int, message_number: int) -> None:
             continue
         retained_chunks.append(chunk)
         retained_embeddings.append(embedding)
+        if type(end_message) is int and end_message > 0:
+            retained_range_ends.append(end_message)
 
     index["chunks"] = retained_chunks
     index["embeddings"] = retained_embeddings
     index["indexed_messages"] = min(
         index.get("indexed_messages", 0),
-        message_number,
+        max(retained_range_ends, default=0),
     )
     await save_index(session_id, index)
 
