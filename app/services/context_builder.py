@@ -330,30 +330,22 @@ def _fit_optional_message(
 
 
 def _truncate_context_to_tokens(text: str, max_tokens: int) -> str:
-    if max_tokens <= 0:
+    if max_tokens <= 0 or not text:
         return ""
     if estimate_tokens(text) <= max_tokens:
         return text
-    kept_lines: list[str] = []
-    for line in text.split("\n"):
-        candidate = "\n".join([*kept_lines, line])
-        if estimate_tokens(candidate) <= max_tokens:
-            kept_lines.append(line)
-            continue
-
-        prefix = "\n".join(kept_lines)
-        separator = "\n" if kept_lines else ""
-        low = 0
-        high = len(line)
-        while low < high:
-            middle = (low + high + 1) // 2
-            candidate = prefix + separator + line[:middle]
-            if estimate_tokens(candidate) <= max_tokens:
-                low = middle
-            else:
-                high = middle - 1
-        return prefix + separator + line[:low]
-    return "\n".join(kept_lines)
+    low = 0
+    high = len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if estimate_tokens(text[:middle]) <= max_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    truncated = text[:low]
+    if estimate_tokens(truncated) > max_tokens:
+        raise RuntimeError("context truncation exceeded its token budget")
+    return truncated
 
 
 def _recall_message(sources: ContextSources) -> dict[str, str] | None:

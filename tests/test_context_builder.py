@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import random
 
 import pytest
 
+import app.services.context_builder as context_builder_module
 from app.config import settings
 from app.schemas.api import MessageItem, WorldBookEntry
 from app.services.context_builder import ContextBuilder, ContextSources
@@ -428,3 +430,66 @@ def test_history_seed_has_separate_exact_token_diagnostics() -> None:
         [seed]
     )
     assert sum(result.tokens_by_layer.values()) == result.total_tokens
+
+
+def test_context_truncation_does_not_add_an_over_budget_separator() -> None:
+    truncated = context_builder_module._truncate_context_to_tokens(
+        "abcdefg\nx", 1
+    )
+
+    assert truncated == "abcdefg"
+    assert estimate_tokens(truncated) <= 1
+
+
+def test_builder_never_exceeds_301_tokens_at_newline_boundary() -> None:
+    sources = ContextSources(
+        character={"name": "C"},
+        recent=[{"role": "assistant", "content": "abcdefg\nx"}],
+        user_message="",
+    )
+
+    result = ContextBuilder(total_budget=301, min_recent_messages=0).build(sources)
+
+    assert result.total_tokens == estimate_messages_tokens(result.messages)
+    assert result.total_tokens <= 301
+
+
+def test_context_truncation_returns_longest_feasible_random_prefixes() -> None:
+    rng = random.Random(20260720)
+    alphabet = "abc XYZ中文\n\u2003"
+    for _ in range(100):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randrange(200)))
+        budget = rng.randrange(40)
+
+        truncated = context_builder_module._truncate_context_to_tokens(
+            text, budget
+        )
+
+        assert text.startswith(truncated)
+        assert estimate_tokens(truncated) <= budget
+        if budget == 0:
+            assert truncated == ""
+            continue
+        if len(truncated) < len(text):
+            assert estimate_tokens(text[: len(truncated) + 1]) > budget
+
+
+def test_context_truncation_uses_logarithmic_estimate_calls(monkeypatch) -> None:
+    original_estimate = context_builder_module.estimate_tokens
+    estimate_calls = 0
+
+    def counted_estimate(text: str) -> int:
+        nonlocal estimate_calls
+        estimate_calls += 1
+        return original_estimate(text)
+
+    monkeypatch.setattr(
+        context_builder_module, "estimate_tokens", counted_estimate
+    )
+    text = "line\n" * 5000 + "tail"
+
+    truncated = context_builder_module._truncate_context_to_tokens(text, 1000)
+
+    assert text.startswith(truncated)
+    assert original_estimate(truncated) <= 1000
+    assert estimate_calls <= 32
