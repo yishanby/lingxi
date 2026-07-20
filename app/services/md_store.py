@@ -6,8 +6,10 @@ import asyncio
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 import re
+import shutil
 import tempfile
 import unicodedata
 from collections.abc import AsyncIterator, Mapping
@@ -17,6 +19,9 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from weakref import WeakValueDictionary
 
 import aiofiles
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -181,6 +186,16 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"LPT{number}" for number in "¹²³"),
 }
 _WINDOWS_INVALID_CHARACTERS = frozenset('<>:"|?*')
+_CRITICAL_TOP_LEVEL_FILES = frozenset(
+    {
+        "assets.md",
+        "assets_summary.txt",
+        "chat.md",
+        "memory.md",
+        "story_state.md",
+        "summary.md",
+    }
+)
 
 
 def _contains_control_character(value: str) -> bool:
@@ -231,6 +246,33 @@ def _safe_relative_parts(relative: str | Path) -> tuple[str, ...]:
     for component in parts:
         _validate_path_component(component)
     return parts
+
+
+def _is_critical_memory_file(parts: tuple[str, ...]) -> bool:
+    folded = tuple(part.casefold() for part in parts)
+    if len(folded) == 1:
+        return folded[0] in _CRITICAL_TOP_LEVEL_FILES
+    return (
+        len(folded) == 2
+        and folded[0] == "characters"
+        and folded[1].endswith(".md")
+    )
+
+
+def _backup_slot_for_name(
+    target_name: str,
+    candidate_name: str,
+    *,
+    windows: bool | None = None,
+) -> int | None:
+    use_windows_semantics = os.name == "nt" if windows is None else windows
+    flags = re.IGNORECASE if use_windows_semantics else 0
+    match = re.fullmatch(
+        rf"{re.escape(target_name)}\.bak\.([1-9][0-9]*)",
+        candidate_name,
+        flags=flags,
+    )
+    return int(match.group(1)) if match is not None else None
 
 
 def _validate_chat_name(name: str) -> None:
@@ -306,8 +348,16 @@ class MarkdownMemoryStore:
     avoid nested acquisition of the same non-reentrant lock.
     """
 
-    def __init__(self, base: Path = Path("data/memory")) -> None:
+    def __init__(
+        self,
+        base: Path = Path("data/memory"),
+        *,
+        backup_count: int = 3,
+    ) -> None:
+        if type(backup_count) is not int or backup_count < 0:
+            raise ValueError("backup_count must be a nonnegative integer")
         self.base = Path(base).resolve()
+        self.backup_count = backup_count
         self._locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
         self._locks_guard = asyncio.Lock()
         self._pipeline_locks: WeakValueDictionary[int, asyncio.Lock] = (
@@ -472,8 +522,25 @@ class MarkdownMemoryStore:
         relative: str | Path,
         text: str,
     ) -> None:
+        parts = _safe_relative_parts(relative)
         target = self.file_path(session_id, relative)
         target.parent.mkdir(parents=True, exist_ok=True)
+        backups: list[tuple[int, Path]] | None = None
+        if target.exists() and _is_critical_memory_file(parts):
+            backups = self._discover_backups_unlocked(
+                session_id,
+                parts,
+                target,
+            )
+            if await self._text_file_matches(target, text):
+                excess = [
+                    (number, path)
+                    for number, path in backups
+                    if number > self.backup_count
+                ]
+                if excess:
+                    self._prune_excess_backups_unlocked(excess)
+                return
         file_descriptor, raw_temp = tempfile.mkstemp(
             prefix=f".{target.name}.",
             suffix=".tmp",
@@ -490,9 +557,286 @@ class MarkdownMemoryStore:
             ) as handle:
                 await handle.write(text)
                 await handle.flush()
-            os.replace(temp, target)
+            if backups is not None:
+                if self.backup_count > 0 or backups:
+                    await self._replace_with_backups_unlocked(
+                        session_id,
+                        parts,
+                        target,
+                        temp,
+                        backups,
+                    )
+                else:
+                    os.replace(temp, target)
+            else:
+                os.replace(temp, target)
         finally:
             temp.unlink(missing_ok=True)
+
+    @staticmethod
+    async def _text_file_matches(path: Path, text: str) -> bool:
+        expected = text.encode("utf-8")
+        if path.stat().st_size != len(expected):
+            return False
+        async with aiofiles.open(path, "rb") as handle:
+            return await handle.read() == expected
+
+    def _prune_excess_backups_unlocked(
+        self,
+        excess: list[tuple[int, Path]],
+    ) -> None:
+        staging_paths: list[Path] = []
+        moved: list[tuple[Path, Path]] = []
+        try:
+            for _, original in excess:
+                stage = self._temporary_backup_path(
+                    original.parent,
+                    "backup-prune",
+                )
+                staging_paths.append(stage)
+                os.replace(original, stage)
+                moved.append((original, stage))
+        except BaseException:
+            try:
+                rollback_errors: list[BaseException] = []
+                for original, stage in reversed(moved):
+                    try:
+                        os.replace(stage, original)
+                    except BaseException as exc:
+                        rollback_errors.append(exc)
+                if rollback_errors:
+                    raise RuntimeError(
+                        "failed to roll back backup pruning"
+                    ) from rollback_errors[0]
+            finally:
+                self._cleanup_backup_staging(staging_paths)
+            raise
+        else:
+            try:
+                self._cleanup_backup_staging(staging_paths)
+            except OSError:
+                logger.warning(
+                    "backup prune cleanup failed after commit",
+                    exc_info=True,
+                )
+
+    def _backup_path(
+        self,
+        session_id: int,
+        parts: tuple[str, ...],
+        number: int,
+    ) -> Path:
+        relative = Path(*parts[:-1], f"{parts[-1]}.bak.{number}")
+        return self.file_path(session_id, relative)
+
+    def _discover_backups_unlocked(
+        self,
+        session_id: int,
+        parts: tuple[str, ...],
+        target: Path,
+    ) -> list[tuple[int, Path]]:
+        backups: dict[int, Path] = {}
+        for candidate in target.parent.iterdir():
+            number = _backup_slot_for_name(target.name, candidate.name)
+            if number is None:
+                continue
+            if number in backups:
+                raise ValueError("ambiguous backup slot")
+            relative = Path(*parts[:-1], candidate.name)
+            path = self.file_path(session_id, relative)
+            if path.is_dir():
+                raise ValueError("backup path must be a file")
+            backups[number] = path
+        return sorted(backups.items())
+
+    @staticmethod
+    def _temporary_backup_path(parent: Path, name: str) -> Path:
+        file_descriptor, raw_temp = tempfile.mkstemp(
+            prefix=f".{name}.",
+            suffix=".tmp",
+            dir=parent,
+        )
+        os.close(file_descriptor)
+        return Path(raw_temp)
+
+    async def _copy_backup_stage(
+        self,
+        source: Path,
+        name: str,
+        staging_paths: list[Path],
+    ) -> Path:
+        stage = self._temporary_backup_path(source.parent, name)
+        staging_paths.append(stage)
+        await asyncio.to_thread(shutil.copyfile, source, stage)
+        return stage
+
+    async def _link_or_copy_backup_stage(
+        self,
+        source: Path,
+        name: str,
+        staging_paths: list[Path],
+    ) -> Path:
+        stage = self._temporary_backup_path(source.parent, name)
+        staging_paths.append(stage)
+        os.unlink(stage)
+        try:
+            os.link(source, stage)
+        except OSError:
+            await asyncio.to_thread(shutil.copyfile, source, stage)
+        return stage
+
+    async def _replace_with_backups_unlocked(
+        self,
+        session_id: int,
+        parts: tuple[str, ...],
+        target: Path,
+        new_temp: Path,
+        backups: list[tuple[int, Path]],
+    ) -> None:
+        staging_paths: list[Path] = []
+        rollback_stages: dict[Path, Path] = {}
+        desired_stages: dict[int, Path] = {}
+        original_by_slot = dict(backups)
+        committed_slots: list[int] = []
+        deleted_originals: list[Path] = []
+        live_replaced = False
+        try:
+            old_live_stage = await self._copy_backup_stage(
+                target,
+                "backup-live",
+                staging_paths,
+            )
+            if self.backup_count > 0:
+                desired_stages[1] = await self._link_or_copy_backup_stage(
+                    old_live_stage,
+                    "backup-desired",
+                    staging_paths,
+                )
+
+            for number, original in backups:
+                rollback = await self._link_or_copy_backup_stage(
+                    original,
+                    "backup-rollback",
+                    staging_paths,
+                )
+                rollback_stages[original] = rollback
+                if number < self.backup_count:
+                    desired = await self._link_or_copy_backup_stage(
+                        rollback,
+                        "backup-desired",
+                        staging_paths,
+                    )
+                    desired_stages[number + 1] = desired
+
+            os.replace(new_temp, target)
+            live_replaced = True
+
+            for number, desired in sorted(desired_stages.items()):
+                os.replace(
+                    desired,
+                    self._backup_path(
+                        session_id,
+                        parts,
+                        number,
+                    ),
+                )
+                committed_slots.append(number)
+
+            for number, original in backups:
+                if number in desired_stages:
+                    continue
+                original.unlink()
+                deleted_originals.append(original)
+        except BaseException:
+            try:
+                if live_replaced:
+                    self._rollback_backup_replace(
+                        session_id,
+                        parts,
+                        target,
+                        old_live_stage,
+                        original_by_slot,
+                        rollback_stages,
+                        committed_slots,
+                        deleted_originals,
+                    )
+            finally:
+                self._cleanup_backup_staging(staging_paths)
+            raise
+        else:
+            try:
+                self._cleanup_backup_staging(staging_paths)
+            except OSError:
+                logger.warning(
+                    "backup staging cleanup failed after commit",
+                    exc_info=True,
+                )
+
+    def _rollback_backup_replace(
+        self,
+        session_id: int,
+        parts: tuple[str, ...],
+        target: Path,
+        old_live_stage: Path,
+        original_by_slot: dict[int, Path],
+        rollback_stages: dict[Path, Path],
+        committed_slots: list[int],
+        deleted_originals: list[Path],
+    ) -> None:
+        rollback_errors: list[BaseException] = []
+        try:
+            os.replace(old_live_stage, target)
+        except BaseException as exc:
+            rollback_errors.append(exc)
+
+        for number in committed_slots:
+            original = original_by_slot.get(number)
+            try:
+                if original is None:
+                    self._backup_path(
+                        session_id,
+                        parts,
+                        number,
+                    ).unlink(missing_ok=True)
+                else:
+                    os.replace(rollback_stages[original], original)
+            except BaseException as exc:
+                rollback_errors.append(exc)
+
+        for original in deleted_originals:
+            try:
+                os.replace(rollback_stages[original], original)
+            except BaseException as exc:
+                rollback_errors.append(exc)
+
+        if rollback_errors:
+            raise RuntimeError("failed to roll back backup transaction") from rollback_errors[0]
+
+    @classmethod
+    def _cleanup_backup_staging(cls, paths: list[Path]) -> None:
+        cleanup_errors: list[OSError] = []
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_errors.append(exc)
+                cls._scrub_backup_stage(path)
+
+        if cleanup_errors:
+            raise OSError("failed to clean backup staging files") from cleanup_errors[0]
+
+    @classmethod
+    def _scrub_backup_stage(cls, path: Path) -> None:
+        empty = cls._temporary_backup_path(path.parent, "backup-empty")
+        try:
+            os.replace(empty, path)
+        finally:
+            if empty.exists():
+                os.unlink(empty)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     async def _delete_file_unlocked(
         self,

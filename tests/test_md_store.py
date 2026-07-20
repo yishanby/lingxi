@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import gc
 import hashlib
+import logging
 import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -1185,12 +1186,674 @@ def test_character_path_allows_superscript_device_near_names(
     assert store.character_path(1, safe).name == f"{safe}.md"
 
 
+@pytest.mark.parametrize("backup_count", [-1, True, 1.5, "3", None])
+def test_backup_count_requires_a_nonnegative_integer(
+    tmp_path: Path,
+    backup_count: object,
+) -> None:
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        MarkdownMemoryStore(tmp_path, backup_count=backup_count)  # type: ignore[arg-type]
+
+
+def test_memory_singleton_uses_configured_backup_count() -> None:
+    from app.services import memory
+
+    assert memory.md_store.backup_count == settings.memory_backup_count
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "chat.md",
+        "memory.md",
+        "story_state.md",
+        "summary.md",
+        "assets.md",
+        "assets_summary.txt",
+        "characters/Alice.md",
+    ],
+)
+@pytest.mark.asyncio
+async def test_existing_critical_file_is_backed_up_before_overwrite(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=1)
+
+    await store.write_text(1, relative, "old")
+    await store.write_text(1, relative, "new")
+
+    target = tmp_path / "1" / relative
+    backup = target.with_name(f"{target.name}.bak.1")
+    assert target.read_text(encoding="utf-8") == "new"
+    assert backup.read_text(encoding="utf-8") == "old"
+    assert backup.is_relative_to(store.session_dir(1))
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "rag/index.json",
+        "memory_state.md",
+        "rebuild_receipts/memory.json",
+        "invalidation_intent.md",
+        "scratch.tmp",
+        "episodes/episode-000001.md",
+        "memory_backup_20260721.md",
+    ],
+)
+@pytest.mark.asyncio
+async def test_disposable_or_immutable_file_is_not_backed_up(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=1)
+
+    await store.write_text(1, relative, "old")
+    await store.write_text(1, relative, "new")
+
+    target = tmp_path / "1" / relative
+    assert target.read_text(encoding="utf-8") == "new"
+    assert not target.with_name(f"{target.name}.bak.1").exists()
+
+
+@pytest.mark.asyncio
+async def test_critical_backups_rotate_newest_first_and_stop_at_configured_count(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=3)
+
+    for version in range(5):
+        await store.write_text(1, "memory.md", f"version-{version}")
+
+    session = tmp_path / "1"
+    assert (session / "memory.md").read_text(encoding="utf-8") == "version-4"
+    assert (session / "memory.md.bak.1").read_text(encoding="utf-8") == "version-3"
+    assert (session / "memory.md.bak.2").read_text(encoding="utf-8") == "version-2"
+    assert (session / "memory.md.bak.3").read_text(encoding="utf-8") == "version-1"
+    assert sorted(path.name for path in session.glob("memory.md.bak.*")) == [
+        "memory.md.bak.1",
+        "memory.md.bak.2",
+        "memory.md.bak.3",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lower_backup_count_prunes_stale_slots_on_next_overwrite(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=4)
+    for version in range(5):
+        await store.write_text(1, "memory.md", f"version-{version}")
+
+    restarted = MarkdownMemoryStore(tmp_path, backup_count=2)
+    await restarted.write_text(1, "memory.md", "version-5")
+
+    session = tmp_path / "1"
+    assert sorted(path.name for path in session.glob("memory.md.bak.*")) == [
+        "memory.md.bak.1",
+        "memory.md.bak.2",
+    ]
+    assert (session / "memory.md.bak.1").read_text(encoding="utf-8") == "version-4"
+    assert (session / "memory.md.bak.2").read_text(encoding="utf-8") == "version-3"
+
+
+@pytest.mark.asyncio
+async def test_lower_backup_count_with_same_content_only_prunes_excess_slots(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=3)
+    for version in range(4):
+        await store.write_text(1, "memory.md", f"v{version}")
+
+    await MarkdownMemoryStore(tmp_path, backup_count=2).write_text(
+        1,
+        "memory.md",
+        "v3",
+    )
+
+    session = tmp_path / "1"
+    assert {
+        path.name: path.read_text(encoding="utf-8")
+        for path in session.iterdir()
+        if path.name.startswith("memory.md")
+    } == {
+        "memory.md": "v3",
+        "memory.md.bak.1": "v2",
+        "memory.md.bak.2": "v1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_zero_backup_count_with_same_content_prunes_without_replacing_live(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path, backup_count=2)
+    for version in range(3):
+        await store.write_text(1, "memory.md", f"v{version}")
+    real_replace = md_store_module.os.replace
+    live_replaces = 0
+
+    def spy_replace(source: Path, target: Path) -> None:
+        nonlocal live_replaces
+        if target.name == "memory.md":
+            live_replaces += 1
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", spy_replace)
+
+    await MarkdownMemoryStore(tmp_path, backup_count=0).write_text(
+        1,
+        "memory.md",
+        "v2",
+    )
+
+    session = tmp_path / "1"
+    assert live_replaces == 0
+    assert (session / "memory.md").read_text(encoding="utf-8") == "v2"
+    assert not [
+        path
+        for path in session.iterdir()
+        if path.name.casefold().startswith("memory.md.bak.")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_same_content_prune_failure_restores_every_excess_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path, backup_count=4)
+    for version in range(5):
+        await store.write_text(1, "memory.md", f"v{version}")
+    session = tmp_path / "1"
+    before = {path.name: path.read_bytes() for path in session.iterdir()}
+    real_replace = md_store_module.os.replace
+    prune_moves = 0
+
+    def fail_second_prune_move(source: Path, target: Path) -> None:
+        nonlocal prune_moves
+        if target.name.startswith(".backup-prune."):
+            prune_moves += 1
+            if prune_moves == 2:
+                raise OSError("prune staging failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_second_prune_move)
+
+    with pytest.raises(OSError, match="prune staging failure"):
+        await MarkdownMemoryStore(tmp_path, backup_count=2).write_text(
+            1,
+            "memory.md",
+            "v4",
+        )
+
+    assert {path.name: path.read_bytes() for path in session.iterdir()} == before
+
+
+@pytest.mark.asyncio
+async def test_committed_same_content_prune_cleanup_failure_warns_and_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=3)
+    for version in range(4):
+        await store.write_text(1, "memory.md", f"v{version}")
+    real_unlink = Path.unlink
+
+    def fail_prune_cleanup(path: Path, *args, **kwargs) -> None:
+        if (
+            path.name.startswith(".backup-prune.")
+            and path.name.endswith(".tmp")
+            and path.exists()
+        ):
+            raise OSError("persistent prune cleanup failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_prune_cleanup)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.md_store"):
+        result = await MarkdownMemoryStore(tmp_path, backup_count=2).write_text(
+            1,
+            "memory.md",
+            "v3",
+        )
+
+    session = tmp_path / "1"
+    assert result is None
+    assert {
+        path.name: path.read_text(encoding="utf-8")
+        for path in session.iterdir()
+        if path.name.startswith("memory.md")
+    } == {
+        "memory.md": "v3",
+        "memory.md.bak.1": "v2",
+        "memory.md.bak.2": "v1",
+    }
+    assert "backup prune cleanup failed after commit" in caplog.text
+    staging = [
+        path
+        for path in session.iterdir()
+        if path.name.startswith(".backup-prune.") and path.name.endswith(".tmp")
+    ]
+    assert staging
+    assert all(path.read_bytes() == b"" for path in staging)
+
+
+@pytest.mark.asyncio
+async def test_failed_live_replace_leaves_target_and_backup_chain_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path, backup_count=3)
+    for version in range(4):
+        await store.write_text(1, "memory.md", f"version-{version}")
+    session = tmp_path / "1"
+    before = {path.name: path.read_bytes() for path in session.iterdir()}
+    real_replace = md_store_module.os.replace
+    failed = False
+
+    def fail_live_once(source: Path, target: Path) -> None:
+        nonlocal failed
+        if target.name == "memory.md" and not failed:
+            failed = True
+            raise OSError("simulated live replace failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_live_once)
+
+    with pytest.raises(OSError, match="simulated live replace failure"):
+        await store.write_text(1, "memory.md", "version-4")
+
+    assert {path.name: path.read_bytes() for path in session.iterdir()} == before
+
+
+@pytest.mark.asyncio
+async def test_backup_finalization_failure_rolls_back_live_and_backup_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path, backup_count=3)
+    for version in range(4):
+        await store.write_text(1, "memory.md", f"version-{version}")
+    session = tmp_path / "1"
+    before = {path.name: path.read_bytes() for path in session.iterdir()}
+    real_replace = md_store_module.os.replace
+    failed = False
+
+    def fail_rotation_once(source: Path, target: Path) -> None:
+        nonlocal failed
+        if target.name == "memory.md.bak.2" and not failed:
+            failed = True
+            raise OSError("simulated backup finalization failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_rotation_once)
+
+    with pytest.raises(OSError, match="simulated backup finalization failure"):
+        await store.write_text(1, "memory.md", "version-4")
+
+    assert {path.name: path.read_bytes() for path in session.iterdir()} == before
+
+
+@pytest.mark.asyncio
+async def test_persistent_slot_failure_leaves_live_and_full_chain_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path, backup_count=3)
+    for version in range(4):
+        await store.write_text(1, "memory.md", f"version-{version}")
+    session = tmp_path / "1"
+    before = {path.name: path.read_bytes() for path in session.iterdir()}
+    real_replace = md_store_module.os.replace
+
+    def fail_slot(source: Path, target: Path) -> None:
+        if target.name == "memory.md.bak.2":
+            raise OSError("persistent backup slot failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_slot)
+
+    with pytest.raises(OSError, match="persistent backup slot failure"):
+        await store.write_text(1, "memory.md", "version-4")
+
+    assert {path.name: path.read_bytes() for path in session.iterdir()} == before
+
+
+@pytest.mark.asyncio
+async def test_zero_backup_count_prunes_existing_chain_on_next_overwrite(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=2)
+    for version in range(3):
+        await store.write_text(1, "memory.md", f"version-{version}")
+
+    restarted = MarkdownMemoryStore(tmp_path, backup_count=0)
+    await restarted.write_text(1, "memory.md", "version-3")
+
+    session = tmp_path / "1"
+    assert (session / "memory.md").read_text(encoding="utf-8") == "version-3"
+    assert not [
+        path
+        for path in session.iterdir()
+        if path.name.casefold().startswith("memory.md.bak.")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_backup_discovery_uses_platform_case_semantics(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=2)
+    await store.write_text(1, "memory.md", "old-live")
+    session = tmp_path / "1"
+    (session / "MEMORY.MD.BAK.1").write_text("older", encoding="utf-8")
+    (session / "MEMORY.MD.BAK.3").write_text("stale", encoding="utf-8")
+
+    await store.write_text(1, "memory.md", "new-live")
+
+    assert (session / "memory.md").read_text(encoding="utf-8") == "new-live"
+    if os.name == "nt":
+        backups = {
+            path.name.casefold(): path.read_text(encoding="utf-8")
+            for path in session.iterdir()
+            if path.name.casefold().startswith("memory.md.bak.")
+        }
+        assert backups == {
+            "memory.md.bak.1": "old-live",
+            "memory.md.bak.2": "older",
+        }
+    else:
+        backups = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in session.iterdir()
+            if ".bak." in path.name.casefold()
+        }
+        assert backups == {
+            "memory.md.bak.1": "old-live",
+            "MEMORY.MD.BAK.1": "older",
+            "MEMORY.MD.BAK.3": "stale",
+        }
+
+
+def test_backup_slot_name_matching_is_case_insensitive_only_on_windows() -> None:
+    from app.services.md_store import _backup_slot_for_name
+
+    assert _backup_slot_for_name("memory.md", "MEMORY.MD.BAK.2", windows=True) == 2
+    assert _backup_slot_for_name("memory.md", "MEMORY.MD.BAK.2", windows=False) is None
+    assert _backup_slot_for_name("memory.md", "memory.md.bak.2", windows=False) == 2
+
+
+@pytest.mark.asyncio
+async def test_rotation_copies_only_the_old_live_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path, backup_count=3)
+    for version in range(4):
+        await store.write_text(1, "memory.md", f"version-{version}")
+    real_copyfile = md_store_module.shutil.copyfile
+    copied_sources: list[Path] = []
+
+    def spy_copyfile(source: Path, destination: Path) -> str:
+        copied_sources.append(Path(source))
+        return real_copyfile(source, destination)
+
+    monkeypatch.setattr(md_store_module.shutil, "copyfile", spy_copyfile)
+
+    await store.write_text(1, "memory.md", "version-4")
+
+    assert [path.name for path in copied_sources] == ["memory.md"]
+
+
+@pytest.mark.asyncio
+async def test_hardlink_unavailable_falls_back_to_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path, backup_count=2)
+    await store.write_text(1, "memory.md", "old")
+    link_attempts = 0
+
+    def unavailable_link(source: Path, destination: Path) -> None:
+        nonlocal link_attempts
+        link_attempts += 1
+        raise OSError("hardlinks unavailable")
+
+    monkeypatch.setattr(md_store_module.os, "link", unavailable_link)
+
+    await store.write_text(1, "memory.md", "new")
+
+    session = tmp_path / "1"
+    assert link_attempts > 0
+    assert (session / "memory.md").read_text(encoding="utf-8") == "new"
+    assert (session / "memory.md.bak.1").read_text(encoding="utf-8") == "old"
+
+
+@pytest.mark.asyncio
+async def test_post_commit_cleanup_failure_returns_success_and_retry_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=2)
+    for version in range(3):
+        await store.write_text(1, "memory.md", f"v{version}")
+    real_unlink = Path.unlink
+
+    def fail_staging_unlink(path: Path, *args, **kwargs) -> None:
+        if (
+            path.name.startswith(".backup-")
+            and path.name.endswith(".tmp")
+            and path.exists()
+        ):
+            raise OSError("persistent staging cleanup failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_staging_unlink)
+
+    restarted = MarkdownMemoryStore(tmp_path, backup_count=2)
+    with caplog.at_level(logging.WARNING, logger="app.services.md_store"):
+        first_result = await restarted.write_text(
+            1,
+            "memory.md",
+            "v3",
+        )
+        after_first = {
+            path.name: path.read_bytes()
+            for path in (tmp_path / "1").iterdir()
+            if path.name.startswith("memory.md")
+        }
+        retry_result = await restarted.write_text(1, "memory.md", "v3")
+
+    session = tmp_path / "1"
+    assert first_result is None
+    assert retry_result is None
+    assert after_first == {
+        "memory.md": b"v3",
+        "memory.md.bak.1": b"v2",
+        "memory.md.bak.2": b"v1",
+    }
+    assert {
+        path.name: path.read_bytes()
+        for path in session.iterdir()
+        if path.name.startswith("memory.md")
+    } == after_first
+    assert "backup staging cleanup failed after commit" in caplog.text
+    staging = [
+        path
+        for path in session.iterdir()
+        if path.name.startswith(".backup-") and path.name.endswith(".tmp")
+    ]
+    assert staging
+    assert all(path.read_bytes() == b"" for path in staging)
+
+
+@pytest.mark.asyncio
+async def test_partial_stage_copy_failure_cannot_orphan_story_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path, backup_count=1)
+    await store.write_text(1, "memory.md", "secret-old-live")
+    real_unlink = md_store_module.os.unlink
+
+    def fail_copy(source: Path, destination: Path) -> None:
+        Path(destination).write_bytes(b"partial-secret-story")
+        raise OSError("stage copy failure")
+
+    def fail_helper_unlink(path: Path) -> None:
+        if Path(path).name.startswith(".backup-live."):
+            raise OSError("helper unlink failure")
+        real_unlink(path)
+
+    monkeypatch.setattr(md_store_module.shutil, "copyfile", fail_copy)
+    monkeypatch.setattr(md_store_module.os, "unlink", fail_helper_unlink)
+
+    with pytest.raises(OSError):
+        await store.write_text(1, "memory.md", "new")
+
+    session = tmp_path / "1"
+    assert (session / "memory.md").read_text(encoding="utf-8") == "secret-old-live"
+    staging = [
+        path
+        for path in session.iterdir()
+        if path.name.startswith(".backup-") and path.name.endswith(".tmp")
+    ]
+    assert staging
+    assert all(path.read_bytes() == b"" for path in staging)
+
+
+@pytest.mark.asyncio
+async def test_rollback_failure_still_cleans_all_staging_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path, backup_count=3)
+    for version in range(4):
+        await store.write_text(1, "memory.md", f"version-{version}")
+    real_replace = md_store_module.os.replace
+
+    def fail_commit_and_rollback(source: Path, target: Path) -> None:
+        if target.name == "memory.md.bak.2":
+            raise OSError("backup commit failure")
+        if target.name == "memory.md" and source.name.startswith(".backup-live."):
+            raise OSError("live rollback failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_commit_and_rollback)
+
+    with pytest.raises(RuntimeError, match="roll back backup transaction"):
+        await store.write_text(1, "memory.md", "version-4")
+
+    session = tmp_path / "1"
+    assert not [
+        path
+        for path in session.iterdir()
+        if path.name.startswith(".backup-") and path.name.endswith(".tmp")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_backup_failure_aborts_overwrite_and_preserves_original_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path, backup_count=1)
+    await store.write_text(1, "memory.md", "old")
+    real_replace = md_store_module.os.replace
+
+    def fail_backup(source: Path, target: Path) -> None:
+        if target.name == "memory.md.bak.1":
+            raise OSError("simulated backup failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_backup)
+
+    with pytest.raises(OSError, match="simulated backup failure"):
+        await store.write_text(1, "memory.md", "new")
+
+    session = tmp_path / "1"
+    assert (session / "memory.md").read_text(encoding="utf-8") == "old"
+    assert list(session.glob("*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_zero_backup_count_disables_critical_backups(tmp_path: Path) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=0)
+
+    await store.write_text(1, "memory.md", "old")
+    await store.write_text(1, "memory.md", "new")
+
+    session = tmp_path / "1"
+    assert (session / "memory.md").read_text(encoding="utf-8") == "new"
+    assert list(session.glob("memory.md.bak.*")) == []
+
+
+@pytest.mark.asyncio
+async def test_unsafe_backup_alias_aborts_overwrite_without_following_alias(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=1)
+    await store.write_text(1, "memory.md", "old")
+    session = tmp_path / "1"
+    external = tmp_path / "external.txt"
+    external.write_text("external", encoding="utf-8")
+    backup_alias = session / "memory.md.bak.1"
+    try:
+        backup_alias.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable on this platform: {exc}")
+
+    with pytest.raises(ValueError, match="safe relative path"):
+        await store.write_text(1, "memory.md", "new")
+
+    assert (session / "memory.md").read_text(encoding="utf-8") == "old"
+    assert external.read_text(encoding="utf-8") == "external"
+
+
+@pytest.mark.asyncio
+async def test_unsafe_critical_path_is_rejected_before_backup(tmp_path: Path) -> None:
+    store = MarkdownMemoryStore(tmp_path, backup_count=1)
+    external = tmp_path / "memory.md"
+    external.write_text("external", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="safe relative path"):
+        await store.write_text(1, "../memory.md", "new")
+
+    assert external.read_text(encoding="utf-8") == "external"
+    assert list(tmp_path.glob("memory.md.bak.*")) == []
+
+
 @pytest.mark.asyncio
 async def test_atomic_write_preserves_old_file_and_removes_temp_on_replace_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = MarkdownMemoryStore(tmp_path)
+    store = MarkdownMemoryStore(tmp_path, backup_count=0)
     await store.write_text(1, "memory.md", "old")
 
     def fail_replace(source: Path, target: Path) -> None:

@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Base directory for memory data
 MEMORY_BASE = Path("data/memory")
-md_store = MarkdownMemoryStore()
+md_store = MarkdownMemoryStore(backup_count=settings.memory_backup_count)
 
 MEMORY_TEMPLATE = """# Session Memory
 
