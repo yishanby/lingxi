@@ -43,13 +43,23 @@ class ContextBuildResult:
 class ContextBuilder:
     """Build prompts without allowing optional context to displace invariants."""
 
-    def __init__(self, total_budget: int, min_recent_messages: int) -> None:
+    def __init__(
+        self,
+        total_budget: int,
+        min_recent_messages: int,
+        reply_token_reserve: int = 0,
+    ) -> None:
         if type(total_budget) is not int or total_budget <= 0:
             raise ValueError("total_budget must be a positive integer")
         if type(min_recent_messages) is not int or min_recent_messages < 0:
             raise ValueError("min_recent_messages must be a non-negative integer")
+        if type(reply_token_reserve) is not int or reply_token_reserve < 0:
+            raise ValueError(
+                "reply_token_reserve must be a non-negative integer"
+            )
         self.total_budget = total_budget
         self.min_recent_messages = min_recent_messages
+        self.reply_token_reserve = reply_token_reserve
 
     def build(self, sources: ContextSources) -> ContextBuildResult:
         char_name = str(sources.character.get("name") or "角色")
@@ -80,12 +90,13 @@ class ContextBuilder:
 
         mandatory = invariant + story_state + priming + protected_recent + user_message
         mandatory_tokens = estimate_messages_tokens(mandatory)
-        if mandatory_tokens > self.total_budget:
+        prompt_budget = self.total_budget - self.reply_token_reserve
+        if mandatory_tokens > prompt_budget:
             raise ValueError(
-                "mandatory prompt context exceeds total token budget "
-                f"({mandatory_tokens} > {self.total_budget})"
+                "mandatory prompt context exceeds prompt token budget "
+                f"({mandatory_tokens} > {prompt_budget})"
             )
-        remaining = self.total_budget - mandatory_tokens
+        remaining = prompt_budget - mandatory_tokens
         seen_sources: set[str] = set()
         for message in [*protected_recent, *user_message]:
             fingerprint = _fingerprint(message["content"])

@@ -142,6 +142,7 @@ def assemble_prompt(
     result = ContextBuilder(
         total_budget=settings.total_token_budget,
         min_recent_messages=settings.min_recent_messages,
+        reply_token_reserve=settings.reply_token_reserve,
     ).build(sources)
 
     logger.debug(

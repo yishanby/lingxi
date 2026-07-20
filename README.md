@@ -58,10 +58,10 @@ background pipeline; it does not switch authoritative chat history back to SQLit
 | `RAG_INDEX_INTERVAL_MESSAGES` | `10` | Messages between derived RAG index updates |
 | `ASSETS_INTERVAL_MESSAGES` | `10` | Messages between asset-state updates |
 | `MEMORY_BACKUP_COUNT` | `3` | Number of memory backups retained |
-| `TOTAL_TOKEN_BUDGET` | `40000` | Hard limit for the assembled prompt context |
+| `TOTAL_TOKEN_BUDGET` | `40000` | Combined hard limit for prompt context and reserved reply |
+| `REPLY_TOKEN_RESERVE` | `4096` | Tokens reserved for the generated reply |
 | `MIN_RECENT_MESSAGES` | `4` | Minimum recent messages protected in context |
 | `SUMMARY_MAX_TOKENS` | `3000` | Token limit for the overall plot recap |
-| `OUTPUT_RETRY_COUNT` | `1` | Retry allowance for guarded non-stream output |
 | `STREAM_GUARD_CHARS` | `512` | Initial streamed text held for refusal checks |
 
 The roleplay policy remains enabled: every model reply begins with the exact fixed

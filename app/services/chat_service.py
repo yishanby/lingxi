@@ -138,6 +138,7 @@ class ChatService:
         self._context_builder = context_builder or ContextBuilder(
             total_budget=settings.total_token_budget,
             min_recent_messages=settings.min_recent_messages,
+            reply_token_reserve=settings.reply_token_reserve,
         )
 
     async def send(self, request: TurnRequest) -> TurnResult:

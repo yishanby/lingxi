@@ -8,7 +8,9 @@ import pytest
 import app.services.context_builder as context_builder_module
 from app.config import settings
 from app.schemas.api import MessageItem, WorldBookEntry
+from app.services.chat_service import ChatService
 from app.services.context_builder import ContextBuilder, ContextSources
+from app.services.md_store import MarkdownMemoryStore
 from app.services.token_utils import estimate_messages_tokens, estimate_tokens
 from app.services.prompt_policy import (
     REQUIRED_OPENING,
@@ -103,6 +105,105 @@ def test_build_clips_single_line_optional_history_with_framing_overhead() -> Non
     assert result.total_tokens == estimate_messages_tokens(result.messages)
     assert result.total_tokens <= 330
     assert result.messages[-1] == {"role": "user", "content": "继续。"}
+
+
+def test_build_reserves_reply_tokens_from_the_total_budget() -> None:
+    sources = ContextSources(
+        character=_character(description="optional detail " * 500),
+        user_message="continue",
+    )
+    mandatory = [
+        {"role": "system", "content": build_invariant_prompt()},
+        {"role": "user", "content": "continue"},
+    ]
+    prompt_budget = estimate_messages_tokens(mandatory) + 25
+    reply_token_reserve = 128
+
+    result = ContextBuilder(
+        total_budget=prompt_budget + reply_token_reserve,
+        min_recent_messages=0,
+        reply_token_reserve=reply_token_reserve,
+    ).build(sources)
+
+    assert result.total_tokens == prompt_budget
+    assert result.total_tokens + reply_token_reserve <= (
+        prompt_budget + reply_token_reserve
+    )
+
+
+@pytest.mark.parametrize("reply_token_reserve", [-1, True, 1.5])
+def test_builder_rejects_invalid_reply_token_reserve(
+    reply_token_reserve: object,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="reply_token_reserve must be a non-negative integer",
+    ):
+        ContextBuilder(
+            total_budget=800,
+            min_recent_messages=0,
+            reply_token_reserve=reply_token_reserve,  # type: ignore[arg-type]
+        )
+
+
+def test_mandatory_context_error_compares_against_prompt_budget() -> None:
+    sources = ContextSources(
+        character=_character(),
+        user_message="continue",
+    )
+    mandatory = [
+        {"role": "system", "content": build_invariant_prompt()},
+        {"role": "user", "content": "continue"},
+    ]
+    mandatory_tokens = estimate_messages_tokens(mandatory)
+    prompt_budget = mandatory_tokens - 1
+    reply_token_reserve = 128
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "mandatory prompt context exceeds prompt token budget "
+            rf"\({mandatory_tokens} > {prompt_budget}\)"
+        ),
+    ):
+        ContextBuilder(
+            total_budget=prompt_budget + reply_token_reserve,
+            min_recent_messages=0,
+            reply_token_reserve=reply_token_reserve,
+        ).build(sources)
+
+
+def test_production_context_builders_use_configured_reply_reserve(
+    tmp_path, monkeypatch
+) -> None:
+    total_budget = 1300
+    reply_token_reserve = 200
+    prompt_budget = total_budget - reply_token_reserve
+    monkeypatch.setattr(settings, "total_token_budget", total_budget)
+    monkeypatch.setattr(settings, "reply_token_reserve", reply_token_reserve)
+    character = _character(description="optional detail " * 500)
+
+    assembled = assemble_prompt(
+        character=character,
+        worldbook_entries=[],
+        chat_history=[],
+        user_message="continue",
+    )
+    service_result = ChatService(
+        MarkdownMemoryStore(tmp_path),
+        None,
+    )._context_builder.build(
+        ContextSources(character=character, user_message="continue")
+    )
+
+    assert estimate_messages_tokens(assembled) <= prompt_budget
+    assert service_result.total_tokens <= prompt_budget
+    assert service_result.total_tokens + reply_token_reserve <= total_budget
+
+
+def test_runtime_config_has_reply_reserve_without_dead_output_retry_count() -> None:
+    assert settings.reply_token_reserve == 4096
+    assert not hasattr(settings, "output_retry_count")
 
 
 def test_assemble_prompt_logs_layer_tokens_without_writing_plaintext_debug(

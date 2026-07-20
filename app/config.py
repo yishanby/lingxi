@@ -31,6 +31,7 @@ class Settings(BaseSettings):
 
     # Token budget system
     total_token_budget: int = 40000
+    reply_token_reserve: int = 4096
     layer0_budget: int = 5000             # fixed layer (system prompt, character, worldbook)
     layer1_budget: int = 5000             # recall layer (memory, assets, character profiles)
     layer2_budget: int = 30000            # conversation layer (summary + recent messages)
@@ -57,7 +58,6 @@ class Settings(BaseSettings):
     rag_index_interval_messages: int = 10
     assets_interval_messages: int = 10
     memory_backup_count: int = 3
-    output_retry_count: int = 1
     stream_guard_chars: int = 512
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
