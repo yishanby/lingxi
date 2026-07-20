@@ -142,7 +142,9 @@ data/memory/{session_id}/
 - ...
 ```
 
-正常更新只创建新章节，不重写旧章节。`undo` 或 `retry` 若触及已覆盖区间，则删除受影响区间及其后的派生章节并重新生成。除 episode 标题和上述三个二级标题外，不允许其他真实 Markdown 标题；代码围栏内的标题字面量不计入结构。
+正常更新只创建新章节，不重写旧章节。Episode H1 和消息范围元数据由应用写入；模型生成的正文只包含上述三个二级标题。`undo` 或 `retry` 若触及已覆盖区间，则删除受影响区间及其后的派生章节并重新生成。除 Episode H1 和上述三个二级标题外，不允许其他真实 Markdown 标题；代码围栏内的标题字面量不计入结构。
+
+一次调用连续生成多个 episode 时，会话 transaction/lock 只负责串行化操作，不承诺多文件批量回滚。每个 episode 必须先完成输出校验，再以独立的原子替换提交为不可变文件。若后续 episode 的模型调用、校验或任务取消失败，该 episode 及其后的文件都不创建；本次调用中已经成功提交的更早 episode 保持有效并作为可复用的部分进度，任何预先存在的 episode 都不被改写。Memory Pipeline 在 `create_due_episodes` 抛错时不推进 `last_episode_message`；使用旧 checkpoint 重试时先校验完整现有链，复用匹配的已有 episode（不再次调用模型，也不重写文件），再从第一个缺失范围继续。
 
 ### 5.6 `memory_state.md`
 

@@ -840,6 +840,83 @@ async def test_episode_completion_failure_does_not_create_file(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("second provider call failed"), asyncio.CancelledError()],
+    ids=["failure", "cancellation"],
+)
+async def test_later_episode_failure_preserves_progress_and_retry_reuses_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    attempt_prompts: list[str] = []
+
+    async def fail_second(messages: list[dict[str, str]]) -> str:
+        attempt_prompts.append(messages[-1]["content"])
+        if len(attempt_prompts) == 1:
+            return episode_body("第一章")
+        raise failure
+
+    with pytest.raises(type(failure)):
+        await create_due_episodes(
+            store,
+            1,
+            records(40),
+            0,
+            fail_second,
+            episode_size=20,
+        )
+
+    first_expected = episode_document(1, 1, 20, "第一章")
+    assert await store.read_text(1, "episodes/episode-000001.md") == first_expected
+    assert not (tmp_path / "1" / "episodes" / "episode-000002.md").exists()
+    assert "[20] assistant: message 20" in attempt_prompts[0]
+    assert "message 21" not in attempt_prompts[0]
+    assert "[21] user: message 21" in attempt_prompts[1]
+    assert "[40] assistant: message 40" in attempt_prompts[1]
+
+    writes: list[str] = []
+    original_write = store._write_text_unlocked
+
+    async def track_write(
+        session_id: int,
+        relative: str | Path,
+        text: str,
+    ) -> None:
+        writes.append(str(relative))
+        await original_write(session_id, relative, text)
+
+    monkeypatch.setattr(store, "_write_text_unlocked", track_write)
+    retry_prompts: list[str] = []
+
+    async def complete_missing(messages: list[dict[str, str]]) -> str:
+        retry_prompts.append(messages[-1]["content"])
+        return episode_body("第二章")
+
+    assert await create_due_episodes(
+        store,
+        1,
+        records(40),
+        0,
+        complete_missing,
+        episode_size=20,
+    ) == 40
+
+    assert len(retry_prompts) == 1
+    assert "[21] user: message 21" in retry_prompts[0]
+    assert "[40] assistant: message 40" in retry_prompts[0]
+    assert "message 20" not in retry_prompts[0]
+    assert writes == ["episodes/episode-000002.md"]
+    assert await store.read_text(1, "episodes/episode-000001.md") == first_expected
+    assert await store.read_text(
+        1,
+        "episodes/episode-000002.md",
+    ) == episode_document(2, 21, 40, "第二章")
+
+
+@pytest.mark.asyncio
 async def test_summary_uses_only_pending_episodes_and_returns_last_end(
     tmp_path: Path,
 ) -> None:
