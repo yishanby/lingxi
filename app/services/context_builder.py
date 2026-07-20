@@ -11,7 +11,6 @@ from app.services.prompt_policy import build_invariant_prompt, build_priming_his
 from app.services.token_utils import (
     estimate_messages_tokens,
     estimate_tokens,
-    truncate_to_tokens,
 )
 
 
@@ -87,6 +86,11 @@ class ContextBuilder:
                 f"({mandatory_tokens} > {self.total_budget})"
             )
         remaining = self.total_budget - mandatory_tokens
+        seen_sources: set[str] = set()
+        for message in [*protected_recent, *user_message]:
+            fingerprint = _fingerprint(message["content"])
+            if fingerprint is not None:
+                seen_sources.add(fingerprint)
 
         character_context: list[dict[str, str]] = []
         character_examples: list[dict[str, str]] = []
@@ -100,6 +104,11 @@ class ContextBuilder:
         for candidate, destination in self._character_candidates(sources, char_name):
             if not selection_open:
                 break
+            if destination == "seed":
+                fingerprint = _fingerprint(candidate["content"])
+                if fingerprint is None or fingerprint in seen_sources:
+                    continue
+                seen_sources.add(fingerprint)
             fitted, remaining, complete = _fit_optional_message(candidate, remaining)
             if fitted is not None:
                 if destination == "example":
@@ -119,25 +128,41 @@ class ContextBuilder:
             if not complete:
                 selection_open = False
 
-        episodes = _episode_rag_message(sources.episodes, sources.rag)
-        if selection_open and episodes is not None:
-            fitted, remaining, complete = _fit_optional_message(episodes, remaining)
-            if fitted is not None:
-                episode_context.append(fitted)
-            if not complete:
-                selection_open = False
+        if selection_open:
+            episodes = _episode_rag_message(
+                sources.episodes, sources.rag, seen_sources
+            )
+            if episodes is not None:
+                fitted, remaining, complete = _fit_optional_message(
+                    episodes, remaining
+                )
+                if fitted is not None:
+                    episode_context.append(fitted)
+                if not complete:
+                    selection_open = False
 
         if selection_open and sources.summary:
-            fitted, remaining, complete = _fit_labeled_system_message(
-                "[Story So Far]", sources.summary, remaining
-            )
-            if fitted is not None:
-                summary_context.append(fitted)
-            if not complete:
-                selection_open = False
+            fingerprint = _fingerprint(sources.summary)
+            if fingerprint is not None and fingerprint not in seen_sources:
+                seen_sources.add(fingerprint)
+                fitted, remaining, complete = _fit_optional_message(
+                    {
+                        "role": "system",
+                        "content": f"[Story So Far]\n{sources.summary}",
+                    },
+                    remaining,
+                )
+                if fitted is not None:
+                    summary_context.append(fitted)
+                if not complete:
+                    selection_open = False
 
         if selection_open:
             for message in reversed(older_recent):
+                fingerprint = _fingerprint(message["content"])
+                if fingerprint is None or fingerprint in seen_sources:
+                    continue
+                seen_sources.add(fingerprint)
                 fitted, remaining, complete = _fit_optional_message(
                     message, remaining
                 )
@@ -150,8 +175,8 @@ class ContextBuilder:
 
         messages = (
             invariant
-            + story_state
             + character_context
+            + story_state
             + recall_context
             + episode_context
             + summary_context
@@ -165,8 +190,9 @@ class ContextBuilder:
             "invariant": estimate_messages_tokens(invariant),
             "story_state": estimate_messages_tokens(story_state),
             "character_persona_worldbook": estimate_messages_tokens(
-                character_context + character_examples + history_seed
+                character_context + character_examples
             ),
+            "history_seed": estimate_messages_tokens(history_seed),
             "memory_profiles_assets": estimate_messages_tokens(recall_context),
             "episodes_rag": estimate_messages_tokens(episode_context),
             "summary": estimate_messages_tokens(summary_context),
@@ -295,7 +321,7 @@ def _fit_optional_message(
     content_budget = remaining - 4
     if content_budget <= 0:
         return None, remaining, False
-    clipped = _truncate_prefix_to_tokens(message["content"], content_budget)
+    clipped = _truncate_context_to_tokens(message["content"], content_budget)
     if not clipped:
         return None, remaining, False
     fitted = {"role": message["role"], "content": clipped}
@@ -303,47 +329,31 @@ def _fit_optional_message(
     return fitted, remaining - fitted_tokens, False
 
 
-def _truncate_prefix_to_tokens(text: str, max_tokens: int) -> str:
+def _truncate_context_to_tokens(text: str, max_tokens: int) -> str:
     if max_tokens <= 0:
         return ""
     if estimate_tokens(text) <= max_tokens:
         return text
-    low = 0
-    high = len(text)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if estimate_tokens(text[:middle]) <= max_tokens:
-            low = middle
-        else:
-            high = middle - 1
-    return text[:low]
+    kept_lines: list[str] = []
+    for line in text.split("\n"):
+        candidate = "\n".join([*kept_lines, line])
+        if estimate_tokens(candidate) <= max_tokens:
+            kept_lines.append(line)
+            continue
 
-
-def _fit_labeled_system_message(
-    label: str, text: str, remaining: int
-) -> tuple[dict[str, str] | None, int, bool]:
-    full_message = {"role": "system", "content": f"{label}\n{text}"}
-    full_tokens = estimate_messages_tokens([full_message])
-    if full_tokens <= remaining:
-        return full_message, remaining - full_tokens, True
-
-    header = f"{label}\n"
-    body_budget = remaining - estimate_tokens(header) - 4
-    if body_budget <= 0:
-        fitted, remaining_after_label, _ = _fit_optional_message(
-            {"role": "system", "content": label}, remaining
-        )
-        return fitted, remaining_after_label, False
-    clipped = truncate_to_tokens(text, body_budget)
-    fitted = {"role": "system", "content": header + clipped}
-    while clipped and estimate_messages_tokens([fitted]) > remaining:
-        body_budget -= 1
-        clipped = truncate_to_tokens(text, body_budget)
-        fitted = {"role": "system", "content": header + clipped}
-    fitted_tokens = estimate_messages_tokens([fitted])
-    if fitted_tokens > remaining:
-        return None, remaining, False
-    return fitted, remaining - fitted_tokens, False
+        prefix = "\n".join(kept_lines)
+        separator = "\n" if kept_lines else ""
+        low = 0
+        high = len(line)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = prefix + separator + line[:middle]
+            if estimate_tokens(candidate) <= max_tokens:
+                low = middle
+            else:
+                high = middle - 1
+        return prefix + separator + line[:low]
+    return "\n".join(kept_lines)
 
 
 def _recall_message(sources: ContextSources) -> dict[str, str] | None:
@@ -360,19 +370,22 @@ def _recall_message(sources: ContextSources) -> dict[str, str] | None:
     return {"role": "system", "content": "\n\n".join(parts)}
 
 
+def _fingerprint(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", text).strip().casefold()
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _episode_rag_message(
-    episodes: list[str], rag: list[str]
+    episodes: list[str], rag: list[str], seen_sources: set[str]
 ) -> dict[str, str] | None:
     unique: list[str] = []
-    fingerprints: set[str] = set()
     for text in [*episodes, *rag]:
-        normalized = " ".join(text.split()).strip().casefold()
-        if not normalized:
+        fingerprint = _fingerprint(text)
+        if fingerprint is None or fingerprint in seen_sources:
             continue
-        fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        if fingerprint in fingerprints:
-            continue
-        fingerprints.add(fingerprint)
+        seen_sources.add(fingerprint)
         unique.append(text)
     if not unique:
         return None

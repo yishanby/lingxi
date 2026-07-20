@@ -321,3 +321,110 @@ def test_assemble_prompt_preserves_persona_and_worldbook_position_order(
         assert "PERSONA_MARKER" not in combined
         assert scenario_index < before_index
     assert before_index < description_index < after_index
+
+
+def test_optional_episode_summary_and_recent_share_deduplication() -> None:
+    duplicate = "SHARED_OPTIONAL_FACT"
+    sources = ContextSources(
+        character={"name": "C"},
+        episodes=[duplicate],
+        summary=duplicate,
+        recent=[{"role": "assistant", "content": duplicate}],
+        user_message="continue",
+    )
+
+    result = ContextBuilder(total_budget=2000, min_recent_messages=0).build(sources)
+
+    combined = "\n".join(message["content"] for message in result.messages)
+    assert combined.count(duplicate) == 1
+
+
+def test_protected_recent_tail_wins_deduplication_over_optional_sources() -> None:
+    duplicate = "PROTECTED_SHARED_FACT"
+    protected = {"role": "assistant", "content": duplicate}
+    sources = ContextSources(
+        character={
+            "name": "C",
+            "_history_seed": [{"role": "assistant", "content": duplicate}],
+        },
+        episodes=[duplicate],
+        summary=duplicate,
+        recent=[protected],
+        user_message="continue",
+        is_new_conversation=True,
+    )
+
+    result = ContextBuilder(total_budget=3000, min_recent_messages=1).build(sources)
+
+    combined = "\n".join(message["content"] for message in result.messages)
+    assert combined.count(duplicate) == 1
+    assert result.messages[-2] == protected
+
+
+def test_multiline_summary_uses_full_200_token_optional_budget() -> None:
+    optional_budget = 200
+    mandatory = [
+        {"role": "system", "content": build_invariant_prompt()},
+        {"role": "user", "content": "continue"},
+    ]
+    sources = ContextSources(
+        character={"name": "C"},
+        summary=(
+            "SUMMARY_FIRST_LINE\n"
+            "SECOND_LINE_FACT " + "detail " * 1000
+        ),
+        recent=[{"role": "assistant", "content": "LOWER_RECENT_FACT"}],
+        user_message="continue",
+    )
+    budget = estimate_messages_tokens(mandatory) + optional_budget
+
+    result = ContextBuilder(total_budget=budget, min_recent_messages=0).build(sources)
+
+    combined = "\n".join(message["content"] for message in result.messages)
+    assert "SUMMARY_FIRST_LINE" in combined
+    assert "SECOND_LINE_FACT" in combined
+    assert "LOWER_RECENT_FACT" not in combined
+    assert result.tokens_by_layer["summary"] == optional_budget
+    assert result.total_tokens == budget
+
+
+def test_emits_core_before_story_then_recalled_context() -> None:
+    sources = ContextSources(
+        character={"name": "C", "description": "CORE_SETTING_MARKER"},
+        story_state="CURRENT_STORY_MARKER",
+        memory="LONG_MEMORY_MARKER",
+        episodes=["EPISODE_MARKER"],
+        summary="SUMMARY_MARKER",
+        recent=[{"role": "assistant", "content": "RECENT_MARKER"}],
+        user_message="CURRENT_USER_MARKER",
+    )
+
+    result = ContextBuilder(total_budget=3000, min_recent_messages=1).build(sources)
+
+    combined = "\n".join(message["content"] for message in result.messages)
+    assert (
+        combined.index(REQUIRED_OPENING)
+        < combined.index("CORE_SETTING_MARKER")
+        < combined.index("CURRENT_STORY_MARKER")
+        < combined.index("LONG_MEMORY_MARKER")
+        < combined.index("EPISODE_MARKER")
+        < combined.index("SUMMARY_MARKER")
+        < combined.index("RECENT_MARKER")
+        < combined.index("CURRENT_USER_MARKER")
+    )
+
+
+def test_history_seed_has_separate_exact_token_diagnostics() -> None:
+    seed = {"role": "assistant", "content": "UNIQUE_HISTORY_SEED"}
+    sources = ContextSources(
+        character={"name": "C", "_history_seed": [seed]},
+        user_message="continue",
+        is_new_conversation=True,
+    )
+
+    result = ContextBuilder(total_budget=3000, min_recent_messages=0).build(sources)
+
+    assert result.tokens_by_layer["history_seed"] == estimate_messages_tokens(
+        [seed]
+    )
+    assert sum(result.tokens_by_layer.values()) == result.total_tokens
