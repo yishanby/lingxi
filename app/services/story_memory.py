@@ -6,6 +6,8 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from markdown_it import MarkdownIt
+
 from app.services.md_store import (
     ChatRecord,
     MarkdownMemoryStore,
@@ -17,18 +19,23 @@ Completion = Callable[[list[dict[str, str]]], Awaitable[str]]
 
 STORY_STATE_SYSTEM = """你是长篇互动故事的当前场景快照维护器。输出完整的 Story State Markdown。
 只根据对话证据记录当前场景，不得猜测或补造事实。
-不判断剧情线是否完成，不维护剧情线状态。
-不得输出 [open]、[closed] 或 [done] 标记，不得输出剧情线状态标题。
-固定标题且按此顺序输出：时间与地点、在场角色、当前场景、最近变化。"""
+不判断剧情线是否完成，不维护剧情线状态；完整剧情脉络由 summary.md 负责。
+只允许一个 # Story State，随后只允许四个按顺序的二级标题：时间与地点、在场角色、当前场景、最近变化；各节都必须非空。
+不得输出任何其他真实 Markdown 标题（ATX 或 Setext）；代码围栏中的标题文字可作为正文内容。
+不得输出 [open]、[closed] 或 [done] 标记。"""
 
 EPISODE_SYSTEM = """你是长篇互动故事章节压缩器。只记录提供的精确消息范围内的事实。
-输出完整 Markdown，固定标题且按此顺序输出：剧情摘要、状态变化、承诺与伏笔。
+Episode 一级标题和消息范围元数据由系统添加，不要输出。
+只允许三个按顺序的二级标题：剧情摘要、状态变化、承诺与伏笔；各节都必须非空。
+不得输出任何其他真实 Markdown 标题（ATX 或 Setext）；代码围栏中的标题文字可作为正文内容。
 承诺与伏笔只作为事实记录，不判断剧情线是否完成。
-不得输出 [open]、[closed] 或 [done] 标记，不得输出剧情线状态标题。"""
+不得输出 [open]、[closed] 或 [done] 标记。"""
 
 _SUMMARY_SYSTEM = """根据已有摘要和新增章节，更新可独立阅读的整体剧情回顾。
 保留完整故事弧、人物关系、关键事件、状态变化、承诺与伏笔事实，以及早期事件。
-不判断剧情线或伏笔是否完成，不得输出 [open]、[closed] 或 [done] 标记，不得输出剧情线状态标题。"""
+只输出无 Markdown 标题的连续整体剧情叙事，可使用普通段落、列表和代码围栏。
+不得输出任何真实 Markdown 标题（ATX 或 Setext）；代码围栏中的标题文字可作为正文内容。
+不判断剧情线或伏笔是否完成，不得输出 [open]、[closed] 或 [done] 标记。"""
 
 _STORY_HEADINGS = (
     "时间与地点",
@@ -37,98 +44,18 @@ _STORY_HEADINGS = (
     "最近变化",
 )
 _EPISODE_HEADINGS = ("剧情摘要", "状态变化", "承诺与伏笔")
+_STORY_GENERATED_HEADINGS = (
+    (1, "Story State"),
+    *((2, title) for title in _STORY_HEADINGS),
+)
+_EPISODE_GENERATED_HEADINGS = tuple(
+    (2, title) for title in _EPISODE_HEADINGS
+)
 _CANONICAL_SECTION_HEADING = re.compile(
     r"^##[ \t]+(?P<name>[^\r\n]+?)[ \t]*$"
 )
 _MACHINE_MARKER = re.compile(r"\[(?:open|closed|done)\]", re.IGNORECASE)
-_ATX_HEADING = re.compile(
-    r"^[ \t]{0,3}(?P<marks>#{1,6})(?:[ \t]+(?P<title>.*?))?[ \t]*$"
-)
-_ATX_CLOSING_HASHES = re.compile(r"[ \t]+#+[ \t]*\Z")
-_SETEXT_TITLE = re.compile(r"^[ \t]{0,3}(?P<title>\S(?:.*?\S)?)[ \t]*$")
-_SETEXT_UNDERLINE = re.compile(
-    r"^[ \t]{0,3}(?P<underline>=+|-+)[ \t]*$"
-)
-_FENCE_OPEN = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})")
-_REQUIRED_FACTUAL_HEADINGS = frozenset(
-    {
-        "Story State",
-        "时间与地点",
-        "在场角色",
-        "当前场景",
-        "最近变化",
-        "剧情摘要",
-        "状态变化",
-        "承诺与伏笔",
-    }
-)
-_ENGLISH_PLOT_TOPIC_WORDS = frozenset(
-    {
-        "thread",
-        "storyline",
-        "promise",
-        "commitment",
-        "quest",
-        "objective",
-        "goal",
-        "plotline",
-    }
-)
-_ENGLISH_PLOT_STATE_WORDS = frozenset(
-    {
-        "open",
-        "resolution",
-        "unfinished",
-        "status",
-        "state",
-        "progress",
-        "pending",
-        "done",
-        "active",
-        "inactive",
-        "ongoing",
-        "outstanding",
-        "remaining",
-        "todo",
-    }
-)
-_ENGLISH_PLOT_STATE_STEMS = (
-    "clos",
-    "complet",
-    "incomplet",
-    "finish",
-    "resolv",
-    "unresolv",
-)
-_CHINESE_PLOT_TOPICS = (
-    "剧情线",
-    "故事线",
-    "情节线",
-    "伏笔",
-    "承诺",
-    "约定",
-    "任务",
-    "目标",
-)
-_CHINESE_PLOT_STATES = (
-    "未完",
-    "已完",
-    "完成",
-    "未解决",
-    "已解决",
-    "解决状态",
-    "进度",
-    "状态",
-    "开放",
-    "关闭",
-    "待完成",
-    "待处理",
-    "进行中",
-    "剩余",
-    "未结",
-    "已结",
-    "结束",
-)
+_MARKDOWN = MarkdownIt("commonmark")
 _EPISODE_FILENAME = re.compile(r"episode-(?P<number>\d{6})\.md\Z")
 _EPISODE_DOCUMENT = re.compile(
     r"\A# Episode (?P<number>\d{6})[ \t]*\r?\n\r?\n"
@@ -141,6 +68,7 @@ _EPISODE_DOCUMENT = re.compile(
 class _MarkdownHeading:
     title: str
     level: int
+    container_level: int
     start: int
     end: int
     source: str
@@ -191,124 +119,50 @@ def _completion_text(value: object, *, label: str) -> str:
 
 def _markdown_headings(text: str) -> list[_MarkdownHeading]:
     raw_lines = text.splitlines(keepends=True)
-    lines = [line.rstrip("\r\n") for line in raw_lines]
-    offsets: list[int] = []
-    offset = 0
+    offsets = [0]
     for raw_line in raw_lines:
-        offsets.append(offset)
-        offset += len(raw_line)
+        offsets.append(offsets[-1] + len(raw_line))
 
+    tokens = _MARKDOWN.parse(text)
     headings: list[_MarkdownHeading] = []
-    fence: tuple[str, int] | None = None
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if fence is not None:
-            marker, minimum = fence
-            stripped = line.lstrip(" ")
-            if len(line) - len(stripped) <= 3 and re.fullmatch(
-                rf"{re.escape(marker)}{{{minimum},}}[ \t]*",
-                stripped,
-            ):
-                fence = None
-            index += 1
+    for index, token in enumerate(tokens):
+        if token.type != "heading_open" or token.map is None:
             continue
+        inline = tokens[index + 1]
+        if inline.type != "inline":
+            raise ValueError("Markdown heading has no inline content")
 
-        fence_match = _FENCE_OPEN.match(line)
-        if fence_match is not None:
-            opening = fence_match.group("fence")
-            fence = (opening[0], len(opening))
-            index += 1
-            continue
-
-        atx_match = _ATX_HEADING.fullmatch(line)
-        if atx_match is not None:
-            title = atx_match.group("title") or ""
-            headings.append(
-                _MarkdownHeading(
-                    title=_ATX_CLOSING_HASHES.sub("", title).strip(),
-                    level=len(atx_match.group("marks")),
-                    start=offsets[index],
-                    end=offsets[index] + len(raw_lines[index]),
-                    source=line,
-                )
+        start_line, end_line = token.map
+        start = offsets[start_line]
+        end = offsets[end_line]
+        headings.append(
+            _MarkdownHeading(
+                title=inline.content.strip(),
+                level=int(token.tag.removeprefix("h")),
+                container_level=token.level,
+                start=start,
+                end=end,
+                source=text[start:end].rstrip("\r\n"),
             )
-            index += 1
-            continue
-
-        title_match = _SETEXT_TITLE.fullmatch(line)
-        underline_match = (
-            _SETEXT_UNDERLINE.fullmatch(lines[index + 1])
-            if index + 1 < len(lines)
-            else None
         )
-        if (
-            title_match is not None
-            and underline_match is not None
-        ):
-            underline = underline_match.group("underline")
-            headings.append(
-                _MarkdownHeading(
-                    title=title_match.group("title").strip(),
-                    level=1 if underline.startswith("=") else 2,
-                    start=offsets[index],
-                    end=offsets[index + 1] + len(raw_lines[index + 1]),
-                    source=f"{line}\n{lines[index + 1]}",
-                )
-            )
-            index += 2
-            continue
-        index += 1
     return headings
 
 
-def _is_plot_state_title(title: str) -> bool:
-    normalized = " ".join(title.split())
-    if normalized in _REQUIRED_FACTUAL_HEADINGS:
-        return False
-
-    compact = re.sub(r"\s+", "", title)
-    if any(topic in compact for topic in _CHINESE_PLOT_TOPICS) and any(
-        state in compact for state in _CHINESE_PLOT_STATES
-    ):
-        return True
-
-    words = re.findall(r"[a-z]+", title.casefold())
-    word_set = set(words)
-    singular_words = {
-        word[:-1] if word.endswith("s") else word for word in word_set
-    }
-    has_specific_topic = (
-        bool(singular_words & _ENGLISH_PLOT_TOPIC_WORDS)
-        or any(word.startswith("foreshadow") for word in word_set)
-        or (
-            "plot" in singular_words
-            and bool(singular_words & {"line", "thread"})
-        )
-        or (
-            "story" in singular_words
-            and bool(singular_words & {"line", "arc"})
-        )
-    )
-    has_state = bool(word_set & _ENGLISH_PLOT_STATE_WORDS) or any(
-        word.startswith(stem)
-        for word in word_set
-        for stem in _ENGLISH_PLOT_STATE_STEMS
-    )
-    bare_plot_section = (
-        "plot" in singular_words
-        and bool(singular_words & {"line", "thread"})
-    ) or "plotline" in singular_words
-    return bare_plot_section or (
-        has_state and (has_specific_topic or "plot" in singular_words)
-    )
+def _validate_generated_headings(
+    text: str,
+    expected: tuple[tuple[int, str], ...],
+    *,
+    label: str,
+) -> None:
+    headings = _markdown_headings(text)
+    actual = tuple((heading.level, heading.title) for heading in headings)
+    if actual != expected or any(heading.container_level for heading in headings):
+        raise ValueError(f"{label} contains invalid Markdown headings")
 
 
-def _reject_plot_classification(text: str, *, label: str) -> None:
-    if _MACHINE_MARKER.search(text) or any(
-        _is_plot_state_title(heading.title) for heading in _markdown_headings(text)
-    ):
-        raise ValueError(f"{label} must not classify plot state")
+def _reject_machine_markers(text: str, *, label: str) -> None:
+    if _MACHINE_MARKER.search(text):
+        raise ValueError(f"{label} must not contain plot-state markers")
 
 
 def _validate_story_state(updated: str) -> None:
@@ -318,7 +172,12 @@ def _validate_story_state(updated: str) -> None:
         label="story state",
         prefix="# Story State",
     )
-    _reject_plot_classification(updated, label="story state")
+    _validate_generated_headings(
+        updated,
+        _STORY_GENERATED_HEADINGS,
+        label="story state",
+    )
+    _reject_machine_markers(updated, label="story state")
 
 
 def _validate_records(records: list[ChatRecord]) -> None:
@@ -357,7 +216,12 @@ def _parse_episode(text: str, filename: str) -> _Episode:
 def _validate_episode_body(body: str) -> str:
     cleaned = _completion_text(body, label="episode")
     _validate_sections(cleaned, _EPISODE_HEADINGS, label="episode", prefix="")
-    _reject_plot_classification(cleaned, label="episode")
+    _validate_generated_headings(
+        cleaned,
+        _EPISODE_GENERATED_HEADINGS,
+        label="episode",
+    )
+    _reject_machine_markers(cleaned, label="episode")
     return cleaned
 
 
@@ -573,9 +437,12 @@ async def update_summary_from_episodes(
             },
         ]
         raw = _completion_text(await complete(messages), label="summary")
-        _reject_plot_classification(raw, label="summary")
+        _validate_generated_headings(raw, (), label="summary")
+        _reject_machine_markers(raw, label="summary")
         updated = _truncate_summary(raw, max_tokens)
         if not updated:
             raise ValueError("summary completion was empty after truncation")
+        _validate_generated_headings(updated, (), label="summary")
+        _reject_machine_markers(updated, label="summary")
         await transaction.write_text("summary.md", updated + "\n")
         return pending[-1].end
