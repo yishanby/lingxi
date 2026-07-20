@@ -8,14 +8,6 @@ import json
 import logging
 import re
 
-# Delay for background LLM tasks to let main conversation go first
-_BG_DELAY_SECONDS = 30
-
-async def _delayed(coro, delay: float = _BG_DELAY_SECONDS):
-    """Wait *delay* seconds then run *coro*, giving the main LLM priority."""
-    await asyncio.sleep(delay)
-    return await coro
-
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
@@ -30,17 +22,21 @@ from app.schemas.api import (
     SessionOut,
     WorldBookEntry,
 )
+from app.services.chat_service import (
+    ChatService,
+    ContextBudgetExceeded,
+    TurnRequest,
+)
+from app.services import memory as memory_service
 from app.services.llm import LLMError, chat_completion, chat_completion_stream
+from app.services.output_guard import OutputGuardError
 from app.services.token_tracker import record_usage
 from app.services.memory import (
     append_chat_md,
     append_manual_memory,
-    extract_memory,
-    extract_memory_and_characters,
     extract_memory_full,
     extract_memory_rebuild,
     compact_memory,
-    inject_memory_into_prompt,
     is_asset_relevant,
     list_character_names,
     load_assets,
@@ -53,10 +49,6 @@ from app.services.memory import (
     load_summary,
     remove_last_chat_md_entries,
     save_memory,
-    should_extract_memory,
-    should_update_summary,
-    update_assets,
-    update_character_profiles,
     update_rolling_summary,
 )
 from app.services.prompt import assemble_prompt
@@ -349,57 +341,47 @@ async def update_session_status(
     return await _row_to_out(session)
 
 
-@router.post("/{session_id}/message", response_model=SessionOut)
-async def send_message(
-    session_id: int,
-    body: SessionMessageIn,
-    db: AsyncSession = Depends(get_db),
-):
-    """Core chat endpoint: append user message, call LLM, append reply.
-    Supports /commands, OOC messages, and memory integration.
-    """
-    session = await db.get(Session, session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-    if session.status != "active":
-        raise HTTPException(400, "Session is archived")
+def _managed_memory_manager():
+    # Late import avoids a router/application import cycle during startup.
+    from app import main
 
-    # Load character
-    char = await db.get(Character, session.character_id)
-    if not char:
-        raise HTTPException(500, "Character associated with session not found")
+    return main.memory_task_manager
 
-    # Current messages (from chat.md)
-    messages = await _load_session_messages(session_id)
 
-    user_name = session.user_name or "用户"
-    content = body.content.strip()
-
-    # ── /commands ────────────────────────────────────────────────────────
-    if content.startswith("/"):
-        return await _handle_command(
-            content, session, session_id, char, messages, body.backend_id, db,
+async def _load_episode_context(session_id: int) -> list[str]:
+    directory = memory_service.md_store.session_dir(session_id) / "episodes"
+    if not directory.exists():
+        return []
+    episodes: list[str] = []
+    for path in sorted(directory.glob("episode-*.md")):
+        episodes.append(
+            await memory_service.md_store.read_text(
+                session_id, f"episodes/{path.name}"
+            )
         )
+    return [episode for episode in episodes if episode]
 
-    # ── OOC detection ───────────────────────────────────────────────────
-    ooc_match = _OOC_PATTERN.match(content)
-    msg_type = "ooc" if ooc_match else "ic"
 
-    # Load worldbook entries
+async def _prepare_turn_request(
+    *,
+    session: Session,
+    char: Character,
+    content: str,
+    msg_type: str,
+    db: AsyncSession,
+) -> TurnRequest:
+    """Load domain context; ChatService owns prompt construction and MD history."""
     wb_ids = json.loads(session.worldbook_ids) if session.worldbook_ids else []
-    all_entries: list[WorldBookEntry] = []
-    for wid in wb_ids:
-        wb = await db.get(WorldBook, wid)
-        if wb:
-            for e in json.loads(wb.entries) if wb.entries else []:
-                all_entries.append(WorldBookEntry(**e))
+    worldbook_entries: list[WorldBookEntry] = []
+    for worldbook_id in wb_ids:
+        worldbook = await db.get(WorldBook, worldbook_id)
+        if worldbook:
+            worldbook_entries.extend(
+                WorldBookEntry(**entry)
+                for entry in (json.loads(worldbook.entries) if worldbook.entries else [])
+            )
 
-    # Choose backend: explicit request > session binding > default
-    effective_backend_id = body.backend_id or session.backend_id
-    backend = await _resolve_backend(effective_backend_id, db)
-
-    # Build character dict
-    char_dict = {
+    character = {
         "name": char.name,
         "description": char.description,
         "personality": char.personality,
@@ -408,146 +390,157 @@ async def send_message(
         "example_dialogues": char.example_dialogues,
         "system_prompt": char.system_prompt,
     }
+    history_seed = []
+    if not char.example_dialogues:
+        history_seed = await get_history_seed(
+            db, char.id, exclude_session_id=session.id
+        )
 
-    # Inject history seed for new conversations without example_dialogues
-    if not char.example_dialogues and not messages:
-        seed = await get_history_seed(db, char.id, exclude_session_id=session_id)
-        if seed:
-            char_dict["_history_seed"] = seed
-
-    # Resolve persona position
     persona_position = "in_prompt"
     if session.persona_id:
         persona = await db.get(Persona, session.persona_id)
         if persona:
             persona_position = persona.description_position or "in_prompt"
 
-    # Load memory context (relevant chunks only, within token budget)
-    recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-10:]]
-    memory_context = await load_memory_relevant(session_id, content, recent_dicts)
+    records = await memory_service.md_store.load_chat(session.id)
+    recent = [
+        {"role": record.role, "content": record.content}
+        for record in records[-10:]
+    ]
+    memory_context = await load_memory_relevant(session.id, content, recent)
+    if msg_type == "ooc":
+        memory_context = (
+            f"{memory_context}\n\n{_OOC_INSTRUCTION}"
+            if memory_context
+            else _OOC_INSTRUCTION
+        )
+    assets_summary = await load_assets_summary(session.id)
+    assets_full = await load_assets(session.id) if is_asset_relevant(content) else ""
+    assets_parts = []
+    if assets_summary:
+        assets_parts.append(f"[资产概览] {assets_summary}")
+    if assets_full:
+        assets_parts.append(f"[资产详情]\n{assets_full}")
+    profiles = await load_mentioned_character_profiles(session.id, content, recent)
 
-    # Load asset context (Layer 0: summary always, Layer 1: full when relevant)
-    assets_summary = await load_assets_summary(session_id)
-    assets_full = await load_assets(session_id) if is_asset_relevant(content) else ""
-
-    # Load character profiles for mentioned characters
-    character_profiles = await load_mentioned_character_profiles(session_id, content, recent_dicts)
-
-    # RAG: search history for relevant context
     rag_context = ""
     try:
-        from app.services.rag import search as rag_search, load_index
-        index = await load_index(session_id)
+        from app.services.rag import load_index, search as rag_search
+
+        index = await load_index(session.id)
         if index.get("chunks"):
-            results = await rag_search(session_id, content, top_k=5)
-            if results:
-                rag_context = "\n\n---\n\n".join(r["text"] for r in results if r["score"] > 0.2)
-    except Exception as rag_exc:
-        logger.warning(f"RAG search failed for session {session_id}: {rag_exc}")
+            results = await rag_search(session.id, content, top_k=5)
+            rag_context = "\n\n---\n\n".join(
+                result["text"] for result in results if result["score"] > 0.2
+            )
+    except Exception:
+        logger.warning("RAG search failed for session %s", session.id, exc_info=True)
 
-    # Load rolling summary
-    summary_context = await load_summary(session_id)
-
-    # Update rolling summary if history exceeds context budget
-    from app.config import settings
-    msg_dicts_for_summary = [{"role": m.role, "content": m.content} for m in messages]
-    bg_backend = await _resolve_bg_backend(backend, db)
-    if should_update_summary(msg_dicts_for_summary, settings.prompt_history_max_chars):
-        asyncio.create_task(
-            _delayed(update_rolling_summary(
-                session_id, msg_dicts_for_summary, bg_backend,
-                settings.prompt_history_max_chars,
-            ))
-        )
-
-    # Add OOC instruction if needed
-    ooc_extra = ""
-    if msg_type == "ooc":
-        ooc_extra = _OOC_INSTRUCTION
-
-    # Assemble prompt
-    full_memory = memory_context
-    if ooc_extra:
-        full_memory = (full_memory + "\n\n" + ooc_extra) if full_memory else ooc_extra
-
-    llm_messages = assemble_prompt(
-        character=char_dict,
-        worldbook_entries=all_entries,
-        chat_history=messages,
-        user_message=content,
-        user_name=user_name,
+    return TurnRequest(
+        session_id=session.id,
+        content=content,
+        character=character,
+        user_name=session.user_name or "用户",
+        msg_type=msg_type,
         user_persona=session.user_persona or "",
         persona_position=persona_position,
-        memory_context=full_memory,
-        summary_context=summary_context,
-        assets_summary=assets_summary,
-        assets_full=assets_full,
-        character_profiles=character_profiles,
-        rag_context=rag_context,
+        worldbook_entries=worldbook_entries,
+        story_state=await memory_service.md_store.read_text(
+            session.id, "story_state.md"
+        ),
+        memory=memory_context,
+        character_profiles=[profiles] if profiles else [],
+        assets="\n\n".join(assets_parts),
+        episodes=await _load_episode_context(session.id),
+        rag=[rag_context] if rag_context else [],
+        overall_summary=await memory_service.md_store.read_text(
+            session.id, "summary.md"
+        ),
+        history_seed=history_seed,
     )
 
-    # Call LLM
+
+async def _record_turn_usage(
+    *, session: Session, char: Character, backend: dict, usage: dict
+) -> None:
     try:
-        result = await chat_completion(
+        await record_usage(
+            session_id=session.id,
+            user_id=session.user_id,
+            character_name=char.name,
+            model=backend["model"],
+            usage=usage,
+        )
+    except Exception:
+        logger.exception("Failed to record token usage for session %s", session.id)
+
+
+@router.post("/{session_id}/message", response_model=SessionOut)
+async def send_message(
+    session_id: int,
+    body: SessionMessageIn,
+    db: AsyncSession = Depends(get_db),
+):
+    """Run commands or delegate an ordinary guarded turn to ChatService."""
+    session = await db.get(Session, session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.status != "active":
+        raise HTTPException(400, "Session is archived")
+
+    char = await db.get(Character, session.character_id)
+    if not char:
+        raise HTTPException(500, "Character associated with session not found")
+
+    content = body.content.strip()
+    if content.startswith("/"):
+        messages = await _load_session_messages(session_id)
+        return await _handle_command(
+            content, session, session_id, char, messages, body.backend_id, db,
+        )
+
+    msg_type = "ooc" if _OOC_PATTERN.match(content) else "ic"
+    backend = await _resolve_backend(body.backend_id or session.backend_id, db)
+    turn_request = await _prepare_turn_request(
+        session=session,
+        char=char,
+        content=content,
+        msg_type=msg_type,
+        db=db,
+    )
+
+    async def complete(messages):
+        return await chat_completion(
             provider=backend["provider"],
             api_key=backend["api_key"],
             model=backend["model"],
             base_url=backend["base_url"],
-            messages=llm_messages,
-            params=backend["params"],
+            messages=messages,
+            params=dict(backend["params"]),
         )
-        reply = result["content"]
-        asyncio.create_task(record_usage(
-            session_id=session_id, user_id=session.user_id,
-            character_name=char.name, model=backend["model"], usage=result["usage"],
-        ))
-    except LLMError as exc:
-        raise HTTPException(502, f"LLM error: {exc}")
 
-    # Check for refusal - don't persist and ask user to retry
-    if _is_refusal(reply):
-        logger.warning(f"Session {session_id}: LLM returned a refusal, discarding.")
-        raise HTTPException(422, "模型拒绝生成，请重试 /retry")
-
-    # Persist to chat.md (append user + assistant)
-    now = datetime.datetime.utcnow().isoformat()
+    service = ChatService(
+        memory_service.md_store,
+        _managed_memory_manager(),
+        completion=complete,
+    )
     try:
-        await append_chat_md(
-            session_id, "user", content,
-            char_name=char.name, user_name=user_name, msg_type=msg_type,
-        )
-        await append_chat_md(
-            session_id, "assistant", reply,
-            char_name=char.name, user_name=user_name,
-        )
-    except Exception as exc:
-        logger.error(f"Failed to append chat.md: {exc}")
+        result = await service.send(turn_request)
+    except ContextBudgetExceeded as exc:
+        raise HTTPException(413, str(exc)) from exc
+    except OutputGuardError as exc:
+        raise HTTPException(422, "模型拒绝生成，请重试 /retry") from exc
+    except LLMError as exc:
+        logger.warning("LLM request failed for session %s", session_id)
+        raise HTTPException(502, "LLM request failed") from exc
 
-    # Reload messages from chat.md for accurate count
-    messages = await _load_session_messages(session_id)
-
-    # Check if memory extraction is needed (background task)
-    msg_count = len(messages)
-    if await should_extract_memory(session_id, msg_count):
-        # Unified memory + character extraction (single LLM call)
-        asyncio.create_task(
-            _delayed(extract_memory_and_characters(
-                session_id,
-                [m.model_dump(mode="json") for m in messages],
-                bg_backend,
-            ))
-        )
-        # Update assets separately
-        asyncio.create_task(
-            _delayed(update_assets(
-                session_id,
-                [m.model_dump(mode="json") for m in messages],
-                bg_backend,
-            ), delay=_BG_DELAY_SECONDS + 5)
-        )
-
+    await _record_turn_usage(
+        session=session,
+        char=char,
+        backend=backend,
+        usage=result.usage,
+    )
     return await _row_to_out(session)
-
 
 async def _handle_command(
     content: str,
@@ -956,7 +949,7 @@ async def send_message_stream(
     body: SessionMessageIn,
     db: AsyncSession = Depends(get_db),
 ):
-    """Streaming chat endpoint: yields SSE chunks as LLM generates."""
+    """Stream a guarded turn while preserving the existing SSE wire schema."""
     session = await db.get(Session, session_id)
     if not session:
         raise HTTPException(404, "Session not found")
@@ -968,182 +961,62 @@ async def send_message_stream(
         raise HTTPException(500, "Character associated with session not found")
 
     content = body.content.strip()
-
-    # OOC detection
-    ooc_match = _OOC_PATTERN.match(content)
-    msg_type = "ooc" if ooc_match else "ic"
-
-    wb_ids = json.loads(session.worldbook_ids) if session.worldbook_ids else []
-    all_entries: list[WorldBookEntry] = []
-    for wid in wb_ids:
-        wb = await db.get(WorldBook, wid)
-        if wb:
-            for e in json.loads(wb.entries) if wb.entries else []:
-                all_entries.append(WorldBookEntry(**e))
-
-    effective_backend_id_stream = body.backend_id or session.backend_id
-    backend = await _resolve_backend(effective_backend_id_stream, db)
-
-    messages = await _load_session_messages(session_id)
-
-    char_dict = {
-        "name": char.name,
-        "description": char.description,
-        "personality": char.personality,
-        "scenario": char.scenario,
-        "first_message": char.first_message,
-        "example_dialogues": char.example_dialogues,
-        "system_prompt": char.system_prompt,
-    }
-
-    persona_position = "in_prompt"
-    if session.persona_id:
-        persona = await db.get(Persona, session.persona_id)
-        if persona:
-            persona_position = persona.description_position or "in_prompt"
-
-    # Load memory context (relevant chunks only)
-    _recent_dicts = [{"role": m.role, "content": m.content} for m in messages[-10:]]
-    memory_context = await load_memory_relevant(session_id, content, _recent_dicts)
-
-    # Load asset context (Layer 0: summary always, Layer 1: full when relevant)
-    _assets_summary = await load_assets_summary(session_id)
-    _assets_full = await load_assets(session_id) if is_asset_relevant(content) else ""
-
-    # Load character profiles for mentioned characters
-    _char_profiles = await load_mentioned_character_profiles(session_id, content, _recent_dicts)
-
-    # RAG: search history for relevant context
-    _rag_context = ""
-    try:
-        from app.services.rag import search as rag_search, load_index
-        _idx = await load_index(session_id)
-        if _idx.get("chunks"):
-            _rag_results = await rag_search(session_id, content, top_k=5)
-            if _rag_results:
-                _rag_context = "\n\n---\n\n".join(r["text"] for r in _rag_results if r["score"] > 0.2)
-    except Exception as _rag_exc:
-        logger.warning(f"RAG search failed for session {session_id}: {_rag_exc}")
-
-    # Load rolling summary
-    summary_context = await load_summary(session_id)
-
-    # Update rolling summary if needed
-    from app.config import settings as _settings
-    _bg_backend = await _resolve_bg_backend(backend, db)
-    _msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
-    if should_update_summary(_msg_dicts, _settings.prompt_history_max_chars):
-        asyncio.create_task(
-            _delayed(update_rolling_summary(
-                session_id, _msg_dicts, _bg_backend,
-                _settings.prompt_history_max_chars,
-            ))
-        )
-
-    # Add OOC instruction if needed
-    if msg_type == "ooc":
-        memory_context = (memory_context + "\n\n" + _OOC_INSTRUCTION) if memory_context else _OOC_INSTRUCTION
-
-    llm_messages = assemble_prompt(
-        character=char_dict,
-        worldbook_entries=all_entries,
-        chat_history=messages,
-        user_message=content,
-        user_name=session.user_name or "用户",
-        user_persona=session.user_persona or "",
-        persona_position=persona_position,
-        memory_context=memory_context,
-        summary_context=summary_context,
-        assets_summary=_assets_summary,
-        assets_full=_assets_full,
-        character_profiles=_char_profiles,
-        rag_context=_rag_context,
+    msg_type = "ooc" if _OOC_PATTERN.match(content) else "ic"
+    backend = await _resolve_backend(body.backend_id or session.backend_id, db)
+    turn_request = await _prepare_turn_request(
+        session=session,
+        char=char,
+        content=content,
+        msg_type=msg_type,
+        db=db,
     )
 
-    # Capture values needed for DB save after streaming
-    _session_id = session.id
-    _user_content = content
-    _current_messages = messages
-    _char_name = char.name
-    _user_name = session.user_name or "用户"
-    _msg_type = msg_type
-    _backend = backend
+    async def stream_complete(messages):
+        provider_stream = chat_completion_stream(
+            provider=backend["provider"],
+            api_key=backend["api_key"],
+            model=backend["model"],
+            base_url=backend["base_url"],
+            messages=messages,
+            params=dict(backend["params"]),
+        )
+        try:
+            async for chunk in provider_stream:
+                yield chunk
+        finally:
+            await provider_stream.aclose()
+
+    service = ChatService(
+        memory_service.md_store,
+        _managed_memory_manager(),
+        stream_completion=stream_complete,
+    )
 
     async def generate():
-        full_reply = ""
-        stream_usage = {}
+        events = service.stream(turn_request)
         try:
-            async for chunk in chat_completion_stream(
-                provider=backend["provider"],
-                api_key=backend["api_key"],
-                model=backend["model"],
-                base_url=backend["base_url"],
-                messages=llm_messages,
-                params=backend["params"],
-            ):
-                if isinstance(chunk, dict):
-                    stream_usage = chunk.get("usage", {})
-                    continue
-                full_reply += chunk
-                yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
-        except Exception as exc:
-            logger.error(f"Streaming LLM error: {exc}")
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
-
-        # Record token usage
-        if stream_usage:
-            asyncio.create_task(record_usage(
-                session_id=_session_id, user_id=session.user_id,
-                character_name=_char_name, model=_backend["model"], usage=stream_usage,
-            ))
-
-        # Schedule post-stream work as a separate task so it survives client disconnect
-        async def _post_stream_work():
-            # Skip refusals - don't persist to chat.md
-            if _is_refusal(full_reply):
-                logger.warning(f"Session {_session_id}: stream LLM returned a refusal, not saving to chat.md.")
-                return
-
-            # Write to chat.md
-            try:
-                await append_chat_md(
-                    _session_id, "user", _user_content,
-                    char_name=_char_name, user_name=_user_name, msg_type=_msg_type,
-                )
-                await append_chat_md(
-                    _session_id, "assistant", full_reply,
-                    char_name=_char_name, user_name=_user_name,
-                )
-            except Exception as exc:
-                logger.error(f"Failed to append chat.md in stream: {exc}")
-
-            # Reload messages for memory extraction count
-            current_msgs = await _load_session_messages(_session_id)
-
-            # Check memory extraction
-            msg_count = len(current_msgs)
-            should_extract = await should_extract_memory(_session_id, msg_count)
-            logger.info(f"Stream post-work: session {_session_id}, msg_count={msg_count}, extract={should_extract}")
-            if should_extract:
-                # Unified memory + character extraction (single LLM call)
-                asyncio.create_task(
-                    _delayed(extract_memory_and_characters(
-                        _session_id,
-                        [m.model_dump(mode="json") for m in current_msgs],
-                        _bg_backend,
-                    ))
-                )
-                # Update assets separately
-                asyncio.create_task(
-                    _delayed(update_assets(
-                        _session_id,
-                        [m.model_dump(mode="json") for m in current_msgs],
-                        _bg_backend,
-                    ), delay=_BG_DELAY_SECONDS + 5)
-                )
-
-        asyncio.create_task(_post_stream_work())
-
-        yield "data: [DONE]\n\n"
+            async for event in events:
+                if event.delta:
+                    yield (
+                        "data: "
+                        f"{json.dumps({'delta': event.delta}, ensure_ascii=False)}\n\n"
+                    )
+                elif event.error:
+                    yield (
+                        "data: "
+                        f"{json.dumps({'error': event.error}, ensure_ascii=False)}\n\n"
+                    )
+                    return
+                elif event.done:
+                    await _record_turn_usage(
+                        session=session,
+                        char=char,
+                        backend=backend,
+                        usage=event.usage or {},
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
+        finally:
+            await events.aclose()
 
     return StreamingResponse(generate(), media_type="text/event-stream")

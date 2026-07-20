@@ -196,6 +196,10 @@ class MarkdownMemoryStore:
             WeakValueDictionary()
         )
         self._pipeline_locks_guard = asyncio.Lock()
+        self._turn_locks: WeakValueDictionary[int, asyncio.Lock] = (
+            WeakValueDictionary()
+        )
+        self._turn_locks_guard = asyncio.Lock()
 
     async def lock_for(self, session_id: int) -> asyncio.Lock:
         """Return the stable lock while any caller retains it."""
@@ -219,6 +223,21 @@ class MarkdownMemoryStore:
             if lock is None:
                 lock = asyncio.Lock()
                 self._pipeline_locks[session_id] = lock
+            return lock
+
+    async def turn_lock_for(self, session_id: int) -> asyncio.Lock:
+        """Return the shared lock for a whole chat turn operation.
+
+        This is intentionally distinct from the transaction lock: a turn owns
+        it while loading context, calling the provider, and atomically appending
+        the completed pair, while each store access may take a short transaction.
+        """
+        _validate_session_id(session_id)
+        async with self._turn_locks_guard:
+            lock = self._turn_locks.get(session_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._turn_locks[session_id] = lock
             return lock
 
     @asynccontextmanager

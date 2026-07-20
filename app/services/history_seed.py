@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.tables import Session
+from app.services import memory
 from app.services.token_utils import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -30,10 +31,11 @@ async def get_history_seed(
     Returns a list of {"role": ..., "content": ...} dicts suitable for injecting
     into the prompt as few-shot examples.
     """
-    # Find completed sessions for this character with substantial messages
+    # Newest candidates first; each candidate still contributes pairs in its
+    # original chronological order.
     stmt = select(Session).where(
         Session.character_id == character_id,
-    ).order_by(Session.updated_at.desc()).limit(10)
+    ).order_by(Session.created_at.desc()).limit(10)
 
     result = await db.execute(stmt)
     sessions = result.scalars().all()
@@ -41,17 +43,25 @@ async def get_history_seed(
     seed_messages: list[dict[str, str]] = []
     total_tokens = 0
 
+    pairs_found = 0
     for sess in sessions:
         if exclude_session_id and sess.id == exclude_session_id:
             continue
 
-        messages = json.loads(sess.messages) if sess.messages else []
+        chat_path = memory.md_store.file_path(sess.id, "chat.md")
+        if chat_path.exists():
+            records = await memory.md_store.load_chat(sess.id)
+            messages = [
+                {"role": record.role, "content": record.content}
+                for record in records
+            ]
+        else:
+            messages = json.loads(sess.messages) if sess.messages else []
         if len(messages) < 4:
             continue
 
         # Skip the first message (usually a greeting), take pairs from early conversation
         # where the model's RP behavior is most established
-        pairs_found = 0
         i = 2  # start after first exchange
         while i < len(messages) - 1 and pairs_found < SEED_PAIRS:
             user_msg = messages[i]
@@ -80,7 +90,7 @@ async def get_history_seed(
             else:
                 i += 1
 
-        if pairs_found >= SEED_PAIRS:
+        if pairs_found >= SEED_PAIRS or total_tokens >= SEED_MAX_TOKENS:
             break
 
     if seed_messages:

@@ -13,12 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import get_db
 from app.models.tables import Character, Session
-from app.schemas.api import MessageItem, SessionCreate, WorldBookEntry
+from app.services import memory as memory_service
 from app.services import feishu_client
-from app.services.llm import LLMError, chat_completion
+from app.services.chat_service import ChatService, ContextBudgetExceeded
+from app.services.llm import chat_completion
+from app.services.output_guard import OutputGuardError
 from app.services.token_tracker import record_usage
-from app.services.prompt import assemble_prompt
-from app.services.history_seed import get_history_seed
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/feishu", tags=["feishu"])
@@ -87,28 +87,21 @@ async def _handle_bot_added(event: dict[str, Any], db: AsyncSession) -> None:
 async def _handle_message(event: dict[str, Any], db: AsyncSession) -> None:
     message = event.get("message", {})
     chat_id = message.get("chat_id", "")
-    message_id = message.get("message_id", "")
     sender = event.get("sender", {}).get("sender_id", {}).get("open_id", "")
-    msg_type = message.get("message_type", "")
-
-    if msg_type != "text":
-        return  # only handle text for now
+    if message.get("message_type", "") != "text":
+        return
 
     content_json = message.get("content", "{}")
     try:
         text = json.loads(content_json).get("text", "").strip()
     except json.JSONDecodeError:
         text = content_json.strip()
-
     if not text:
         return
-
-    # ── Commands ─────────────────────────────────────────────────────────
     if text.startswith("/"):
         await _handle_command(text, chat_id, sender, db)
         return
 
-    # ── Find active session for this chat ────────────────────────────────
     result = await db.execute(
         select(Session).where(
             Session.feishu_chat_id == chat_id, Session.status == "active"
@@ -122,104 +115,74 @@ async def _handle_message(event: dict[str, Any], db: AsyncSession) -> None:
         )
         return
 
-    # ── Load character ───────────────────────────────────────────────────
     char = await db.get(Character, session.character_id)
     if not char:
         await feishu_client.send_text_message(chat_id, "Character not found.")
         return
 
-    # ── Build prompt and call LLM ────────────────────────────────────────
-    messages = [
-        MessageItem(**m)
-        for m in (json.loads(session.messages) if session.messages else [])
-    ]
+    from app.routers import sessions as sessions_router
 
-    char_dict = {
-        "name": char.name,
-        "description": char.description,
-        "personality": char.personality,
-        "scenario": char.scenario,
-        "first_message": char.first_message,
-        "example_dialogues": char.example_dialogues,
-        "system_prompt": char.system_prompt,
-    }
-
-    # Inject history seed for new conversations without example_dialogues
-    if not char.example_dialogues and not messages:
-        seed = await get_history_seed(db, char.id, exclude_session_id=session.id)
-        if seed:
-            char_dict["_history_seed"] = seed
-
-    # Worldbook entries
-    from app.models.tables import WorldBook
-
-    wb_ids = json.loads(session.worldbook_ids) if session.worldbook_ids else []
-    all_entries: list[WorldBookEntry] = []
-    for wid in wb_ids:
-        wb = await db.get(WorldBook, wid)
-        if wb:
-            for e in json.loads(wb.entries) if wb.entries else []:
-                all_entries.append(WorldBookEntry(**e))
-
-    llm_messages = assemble_prompt(
-        character=char_dict,
-        worldbook_entries=all_entries,
-        chat_history=messages,
-        user_message=text,
-        summary_context=session.summary or "",
+    backend = await sessions_router._resolve_backend(session.backend_id, db)
+    turn_request = await sessions_router._prepare_turn_request(
+        session=session,
+        char=char,
+        content=text,
+        msg_type="ic",
+        db=db,
     )
 
-    # Resolve backend
-    from app.routers.sessions import _resolve_backend
-
-    try:
-        backend = await _resolve_backend(None, db)
-        result = await chat_completion(
+    async def complete(messages):
+        return await chat_completion(
             provider=backend["provider"],
             api_key=backend["api_key"],
             model=backend["model"],
             base_url=backend["base_url"],
-            messages=llm_messages,
-            params=backend["params"],
+            messages=messages,
+            params=dict(backend["params"]),
         )
-        reply = result["content"]
-        usage_info = result["usage"]
-        import asyncio
-        asyncio.create_task(record_usage(
-            session_id=session.id, user_id=sender,
-            character_name=char.name, model=backend["model"], usage=usage_info,
-        ))
-    except (LLMError, Exception) as exc:
-        logger.exception("LLM call failed in Feishu handler")
-        await feishu_client.send_text_message(chat_id, f"LLM error: {exc}")
+
+    service = ChatService(
+        memory_service.md_store,
+        sessions_router._managed_memory_manager(),
+        completion=complete,
+    )
+    try:
+        turn = await service.send(turn_request)
+    except ContextBudgetExceeded:
+        await feishu_client.send_text_message(
+            chat_id, "对话上下文过长，请缩短当前输入后重试。"
+        )
+        return
+    except OutputGuardError:
+        await feishu_client.send_text_message(chat_id, "模型拒绝生成，请重试。")
+        return
+    except Exception:
+        logger.warning("LLM call failed in Feishu handler")
+        await feishu_client.send_text_message(chat_id, "生成失败，请稍后重试。")
         return
 
-    # Persist messages
-    import datetime
+    try:
+        await record_usage(
+            session_id=session.id,
+            user_id=sender,
+            character_name=char.name,
+            model=backend["model"],
+            usage=turn.usage,
+        )
+    except Exception:
+        logger.exception("Failed to record Feishu token usage for session %s", session.id)
 
-    now = datetime.datetime.utcnow().isoformat()
-    messages.append(MessageItem(role="user", content=text, timestamp=now))
-    messages.append(MessageItem(role="assistant", content=reply, timestamp=now))
-    session.messages = json.dumps(
-        [m.model_dump(mode="json") for m in messages], ensure_ascii=False
+    p_tok = turn.usage.get("prompt_tokens", 0)
+    c_tok = turn.usage.get("completion_tokens", 0)
+    t_tok = turn.usage.get("total_tokens", 0)
+    usage_footer = (
+        f"\n\n---\n💡 Token: {t_tok:,} "
+        f"(输入 {p_tok:,} / 输出 {c_tok:,})"
     )
-    await db.commit()
-
-    # Trigger background summary if enough unsummarised messages accumulated
-    from app.services.summarizer import maybe_summarize
-    asyncio.create_task(maybe_summarize(session.id, backend))
-
-    # Append token usage footer
-    p_tok = usage_info.get("prompt_tokens", 0)
-    c_tok = usage_info.get("completion_tokens", 0)
-    t_tok = usage_info.get("total_tokens", 0)
-    usage_footer = f"\n\n---\n💡 Token: {t_tok:,} (输入 {p_tok:,} / 输出 {c_tok:,})"
-    display_reply = reply + usage_footer
-
-    # Reply with a card showing character name
-    card = feishu_client.build_character_reply_card(char.name, display_reply)
+    card = feishu_client.build_character_reply_card(
+        char.name, turn.content + usage_footer
+    )
     await feishu_client.send_interactive_card(chat_id, card)
-
 
 # ── Slash commands ───────────────────────────────────────────────────────────
 
@@ -236,6 +199,10 @@ async def _handle_command(
         )
         session = result.scalar_one_or_none()
         if session:
+            turn_lock = await memory_service.md_store.turn_lock_for(session.id)
+            async with turn_lock:
+                await memory_service.md_store.write_text(session.id, "chat.md", "")
+            # Keep the V1 column empty for compatibility; Markdown is authoritative.
             session.messages = "[]"
             await db.commit()
             await feishu_client.send_text_message(chat_id, "Session reset. Chat history cleared.")
@@ -273,7 +240,7 @@ async def _handle_command(
         if session:
             char = await db.get(Character, session.character_id)
             name = char.name if char else "Unknown"
-            msg_count = len(json.loads(session.messages) if session.messages else [])
+            msg_count = len(await memory_service.md_store.load_chat(session.id))
             await feishu_client.send_text_message(
                 chat_id, f"Character: {name}\nMessages: {msg_count}\nStatus: {session.status}"
             )
@@ -363,12 +330,15 @@ async def _handle_card_action(body: dict[str, Any], db: AsyncSession) -> None:
         card = feishu_client.build_character_reply_card(char.name, first_msg)
         await feishu_client.send_interactive_card(open_chat_id, card)
 
-        # Persist first message
-        import datetime
-
-        now = datetime.datetime.utcnow().isoformat()
+        # Markdown is authoritative; the V1 column remains compatibility-only.
+        await memory_service.md_store.append_record(
+            session.id,
+            "assistant",
+            first_msg,
+            name=char.name,
+        )
         session.messages = json.dumps(
-            [{"role": "assistant", "content": first_msg, "timestamp": now}],
+            [{"role": "assistant", "content": first_msg}],
             ensure_ascii=False,
         )
         await db.commit()
