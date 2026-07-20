@@ -17,6 +17,7 @@ import aiofiles
 import httpx
 
 from app.config import settings
+from app.services.md_store import ChatRecord, MarkdownMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,27 @@ def chunk_messages(messages: list[dict[str, str]], chunk_size: int = CHUNK_SIZE)
     return chunks
 
 
+def _chunk_records(
+    records: list[ChatRecord],
+    chunk_size: int = CHUNK_SIZE,
+) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    for index in range(0, len(records), chunk_size):
+        group = records[index : index + chunk_size]
+        text = "\n".join(
+            f"{'用户' if record.role == 'user' else '角色'}: {record.content}"
+            for record in group
+        )
+        chunks.append(
+            {
+                "text": text,
+                "start_message": group[0].number,
+                "end_message": group[-1].number,
+            }
+        )
+    return chunks
+
+
 def parse_chat_md(chat_md_text: str) -> list[dict[str, str]]:
     """Parse chat.md into list of {role, content} dicts."""
     messages = []
@@ -172,6 +194,37 @@ async def save_index(session_id: int, index: dict[str, Any]) -> None:
         await f.write(json.dumps(index, ensure_ascii=False))
 
 
+async def invalidate_after(session_id: int, message_number: int) -> None:
+    """Remove range-aware chunks that extend past a rollback boundary."""
+    if type(message_number) is not int or message_number < 0:
+        raise ValueError("message_number must be a nonnegative integer")
+
+    index = await load_index(session_id)
+    retained_chunks: list[Any] = []
+    retained_embeddings: list[Any] = []
+    for chunk, embedding in zip(
+        index.get("chunks", []),
+        index.get("embeddings", []),
+    ):
+        end_message = chunk.get("end_message", 0) if isinstance(chunk, dict) else 0
+        if (
+            type(end_message) is int
+            and end_message != 0
+            and end_message > message_number
+        ):
+            continue
+        retained_chunks.append(chunk)
+        retained_embeddings.append(embedding)
+
+    index["chunks"] = retained_chunks
+    index["embeddings"] = retained_embeddings
+    index["indexed_messages"] = min(
+        index.get("indexed_messages", 0),
+        message_number,
+    )
+    await save_index(session_id, index)
+
+
 async def build_index(
     session_id: int,
     *,
@@ -189,11 +242,8 @@ async def build_index(
         logger.warning(f"No chat.md for session {session_id}")
         return {"chunks": [], "embeddings": [], "indexed_messages": 0}
 
-    async with aiofiles.open(chat_path, "r", encoding="utf-8") as f:
-        chat_text = await f.read()
-
-    messages = parse_chat_md(chat_text)
-    total_messages = len(messages)
+    records = await MarkdownMemoryStore(MEMORY_BASE).load_chat(session_id)
+    total_messages = len(records)
 
     if force_rebuild:
         index = {"chunks": [], "embeddings": [], "indexed_messages": 0}
@@ -206,8 +256,8 @@ async def build_index(
         return index
 
     # Only process new messages
-    new_messages = messages[already_indexed:]
-    new_chunks = chunk_messages(new_messages)
+    new_records = records[already_indexed:]
+    new_chunks = _chunk_records(new_records)
 
     if not new_chunks:
         return index
@@ -218,7 +268,7 @@ async def build_index(
     for i in range(0, len(new_chunks), batch_size):
         batch = new_chunks[i:i + batch_size]
         embs = await get_embeddings(
-            batch,
+            [chunk["text"] for chunk in batch],
             base_url=embedding_base_url,
             api_key=embedding_api_key,
             model=embedding_model,
@@ -268,7 +318,8 @@ async def search(
     results = []
     for i, (chunk, emb) in enumerate(zip(index["chunks"], index["embeddings"])):
         score = cosine_similarity(query_emb, emb)
-        results.append({"text": chunk, "score": score, "index": i})
+        chunk_text = chunk.get("text", "") if isinstance(chunk, dict) else chunk
+        results.append({"text": chunk_text, "score": score, "index": i})
 
     # Sort by score descending
     results.sort(key=lambda x: x["score"], reverse=True)

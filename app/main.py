@@ -11,9 +11,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
-from app.database import engine
-from app.models.tables import Base
+from app.database import async_session, engine
+from app.models.tables import Base, Session
 from app.routers import backends, characters, feishu, personas, sessions, stats, worldbooks
+from app.services import memory
+from app.services.memory_pipeline import MemoryPipeline
+from app.services.memory_tasks import MemoryTaskManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +25,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+memory_pipeline: MemoryPipeline | None = None
+memory_task_manager: MemoryTaskManager | None = None
 
 
 async def _column_missing(conn, table: str, column: str) -> bool:
@@ -32,8 +37,20 @@ async def _column_missing(conn, table: str, column: str) -> bool:
     return column not in columns
 
 
+async def _resolve_memory_backend(session_id: int) -> dict:
+    async with async_session() as db:
+        session = await db.get(Session, session_id)
+        backend = await sessions._resolve_backend(
+            session.backend_id if session is not None else None,
+            db,
+        )
+        return await sessions._resolve_bg_backend(backend, db)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global memory_pipeline, memory_task_manager
+
     # Create tables on startup
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -54,17 +71,39 @@ async def lifespan(app: FastAPI):
 
     logger.info("Database tables ready")
 
-    # Start Feishu WebSocket client
-    from app.database import async_session
-    from app.services.feishu_ws import set_session_factory, start_ws_client
-    set_session_factory(async_session)
-    start_ws_client()
+    stop_ws_client = None
+    ws_start_attempted = False
+    try:
+        if settings.memory_v2_enabled:
+            memory_pipeline = MemoryPipeline(memory.md_store)
+            memory_task_manager = MemoryTaskManager(
+                memory_pipeline,
+                _resolve_memory_backend,
+            )
+            await memory_task_manager.start()
+            await memory_task_manager.scan_pending_sessions()
+        else:
+            memory_pipeline = None
+            memory_task_manager = None
 
-    yield
+        from app.services.feishu_ws import set_session_factory, start_ws_client
+        from app.services.feishu_ws import stop_ws_client as stop_client
 
-    # Cleanup
-    from app.services.feishu_ws import stop_ws_client
-    stop_ws_client()
+        stop_ws_client = stop_client
+        set_session_factory(async_session)
+        ws_start_attempted = True
+        start_ws_client()
+        yield
+    finally:
+        try:
+            if memory_task_manager is not None:
+                await memory_task_manager.stop()
+        finally:
+            try:
+                if ws_start_attempted and stop_ws_client is not None:
+                    stop_ws_client()
+            finally:
+                await engine.dispose()
 
 
 app = FastAPI(

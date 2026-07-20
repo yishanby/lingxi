@@ -7,13 +7,15 @@ import datetime
 import logging
 import os
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import aiofiles
 
 from app.services.llm import chat_completion
-from app.services.md_store import MarkdownMemoryStore
+from app.config import settings
+from app.services.md_store import MarkdownMemoryStore, MemoryState
 
 logger = logging.getLogger(__name__)
 
@@ -427,7 +429,7 @@ async def extract_memory_and_characters(
 
         conversation_text = "\n".join(
             f"{m.get('role', 'user')}: {m.get('content', '')}"
-            for m in recent_messages[-20:]
+            for m in recent_messages
         )
 
         user_prompt = (
@@ -492,24 +494,9 @@ async def extract_memory_and_characters(
         else:
             logger.info(f"No character changes for session {session_id}")
 
-        # Auto-build RAG index after extraction
-        try:
-            from app.config import settings as app_settings
-            if app_settings.rag_auto_index:
-                from app.services.rag import build_index
-                emb_url = app_settings.rag_embedding_base_url  # empty = local model
-                emb_key = app_settings.rag_embedding_api_key
-                await build_index(
-                    session_id,
-                    embedding_base_url=emb_url,
-                    embedding_api_key=emb_key,
-                    embedding_model=app_settings.rag_embedding_model,
-                )
-        except Exception as rag_exc:
-            logger.warning(f"RAG auto-index failed for session {session_id}: {rag_exc}")
-
     except Exception as exc:
         logger.error(f"Unified memory+character extraction failed for session {session_id}: {exc}")
+        raise
 
 
 # ── 7a. Asset Tracking ─────────────────────────────────────────────────────
@@ -596,7 +583,7 @@ async def update_assets(
 
         conversation_text = "\n".join(
             f"{m.get('role', 'user')}: {m.get('content', '')}"
-            for m in recent_messages[-20:]
+            for m in recent_messages
         )
 
         user_prompt = (
@@ -623,10 +610,7 @@ async def update_assets(
             logger.info(f"No asset changes for session {session_id}")
             return False
 
-        # Save updated assets
-        await save_assets(session_id, result.strip())
-
-        # Regenerate summary
+        # Prepare the summary before replacing either persisted asset view.
         summary_messages = [
             {"role": "system", "content": ASSET_SUMMARY_PROMPT},
             {"role": "user", "content": result.strip()},
@@ -639,13 +623,14 @@ async def update_assets(
             messages=summary_messages,
             params=backend_config.get("params", {}),
         ))["content"]
+        await save_assets(session_id, result.strip())
         await save_assets_summary(session_id, summary.strip())
         logger.info(f"Assets updated for session {session_id}")
         return True
 
     except Exception as exc:
         logger.error(f"Asset update failed for session {session_id}: {exc}")
-        return False
+        raise
 
 
 # ── 7a2. Character Profiles ─────────────────────────────────────────────────
@@ -1003,40 +988,59 @@ async def compact_memory(
 
 # ── 8. should_extract_memory ───────────────────────────────────────────────
 
-_EXTRACT_INTERVAL = 10  # trigger every N new messages
+async def migrate_legacy_extract_checkpoint(
+    store: MarkdownMemoryStore,
+    session_id: int,
+    total_messages: int,
+) -> MemoryState:
+    """Seed V2 extraction checkpoints once from the legacy counter."""
+    async with store.transaction(session_id) as transaction:
+        state_text = await transaction.read_text("memory_state.md")
+        state = await transaction.load_state()
+        if state_text.strip():
+            return state
 
-
-def _last_extract_path(session_id: int) -> Path:
-    return _session_dir(session_id) / ".last_extract_count"
-
-
-async def _read_last_extract_count(session_id: int) -> int:
-    p = _last_extract_path(session_id)
-    if p.exists():
+        legacy_text = await transaction.read_text(".last_extract_count")
+        if not legacy_text.strip():
+            return state
         try:
-            async with aiofiles.open(p, mode="r", encoding="utf-8") as f:
-                return int((await f.read()).strip())
-        except (ValueError, OSError):
-            pass
-    return 0
+            legacy_count = int(legacy_text.strip())
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid legacy extract checkpoint for session %s",
+                session_id,
+            )
+            return state
+        if legacy_count < 0:
+            logger.warning(
+                "Ignoring negative legacy extract checkpoint for session %s",
+                session_id,
+            )
+            return state
 
-
-async def _save_last_extract_count(session_id: int, count: int) -> None:
-    p = _last_extract_path(session_id)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    async with aiofiles.open(p, mode="w", encoding="utf-8") as f:
-        await f.write(str(count))
+        checkpoint = min(legacy_count, total_messages)
+        state = replace(
+            state,
+            last_memory_message=checkpoint,
+            last_character_message=checkpoint,
+        )
+        await transaction.save_state(state)
+        return state
 
 
 async def should_extract_memory(session_id: int, message_count: int) -> bool:
-    """Return True when message_count has grown by >= _EXTRACT_INTERVAL since last extract."""
+    """Compatibility predicate backed by V2 state without advancing it."""
     if message_count <= 0:
         return False
-    last = await _read_last_extract_count(session_id)
-    if message_count - last >= _EXTRACT_INTERVAL:
-        await _save_last_extract_count(session_id, message_count)
-        return True
-    return False
+    state = await migrate_legacy_extract_checkpoint(
+        md_store,
+        session_id,
+        message_count,
+    )
+    return (
+        message_count - state.last_memory_message
+        >= settings.memory_extract_interval_messages
+    )
 
 
 # ── 9. inject_memory_into_prompt ───────────────────────────────────────────

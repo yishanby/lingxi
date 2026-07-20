@@ -43,11 +43,22 @@ class Settings(BaseSettings):
     rag_embedding_base_url: str = ""  # empty = use local model; set for API
     rag_embedding_api_key: str = ""   # only needed if using API
     rag_chunk_size: int = 5            # messages per chunk
-    rag_auto_index: bool = True        # auto-build index on memory extract
+    rag_auto_index: bool = True        # legacy compatibility; V2 owns indexing
 
     # Background tasks backend (summary, memory extraction, assets)
     # If set, background LLM tasks use this backend instead of the session's backend
     background_backend_id: int | None = None
+
+    # Checkpointed Markdown memory pipeline
+    memory_v2_enabled: bool = True
+    story_state_interval_messages: int = 2
+    memory_extract_interval_messages: int = 10
+    episode_size_messages: int = 20
+    rag_index_interval_messages: int = 10
+    assets_interval_messages: int = 10
+    memory_backup_count: int = 3
+    output_retry_count: int = 1
+    stream_guard_chars: int = 512
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
