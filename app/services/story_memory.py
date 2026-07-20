@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from html.parser import HTMLParser
 
 from markdown_it import MarkdownIt
+from markdown_it.token import Token
 
 from app.services.md_store import (
     ChatRecord,
@@ -55,11 +58,12 @@ _CANONICAL_SECTION_HEADING = re.compile(
     r"^##[ \t]+(?P<name>[^\r\n]+?)[ \t]*$"
 )
 _MACHINE_MARKER = re.compile(r"\[(?:open|closed|done)\]", re.IGNORECASE)
+_EPISODE_RANGE_LABEL = re.compile(r"messages\s*:", re.IGNORECASE)
 _MARKDOWN = MarkdownIt("commonmark")
-_EPISODE_FILENAME = re.compile(r"episode-(?P<number>\d{6})\.md\Z")
+_EPISODE_FILENAME = re.compile(r"episode-(?P<number>[0-9]{6})\.md\Z")
 _EPISODE_DOCUMENT = re.compile(
-    r"\A# Episode (?P<number>\d{6})[ \t]*\r?\n\r?\n"
-    r"<!-- messages: (?P<start>[1-9]\d*)-(?P<end>[1-9]\d*) -->[ \t]*\r?\n\r?\n"
+    r"\A# Episode (?P<number>[0-9]{6})[ \t]*\r?\n\r?\n"
+    r"<!-- messages: (?P<start>[1-9][0-9]*)-(?P<end>[1-9][0-9]*) -->[ \t]*\r?\n\r?\n"
     r"(?P<body>[\s\S]*?)\r?\n\Z"
 )
 
@@ -80,6 +84,26 @@ class _Episode:
     start: int
     end: int
     text: str
+
+
+class _MeaningfulHtmlTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.found = False
+
+    def handle_data(self, data: str) -> None:
+        if _has_meaningful_text(data):
+            self.found = True
+
+
+class _EpisodeRangeCommentParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.count = 0
+
+    def handle_comment(self, data: str) -> None:
+        if _EPISODE_RANGE_LABEL.search(data):
+            self.count += 1
 
 
 def render_records(records: list[ChatRecord]) -> str:
@@ -107,7 +131,7 @@ def _validate_sections(
         raise ValueError(f"{label} has an invalid or incomplete preamble")
     for index, heading in enumerate(sections):
         end = sections[index + 1].start if index + 1 < len(sections) else len(text)
-        if not text[heading.end : end].strip():
+        if not _has_meaningful_markdown_content(text[heading.end : end]):
             raise ValueError(f"{label} contains an empty section")
 
 
@@ -115,6 +139,48 @@ def _completion_text(value: object, *, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} completion returned empty or invalid output")
     return value.strip()
+
+
+def _has_meaningful_text(text: str) -> bool:
+    return any(
+        unicodedata.category(character)[0] in {"L", "N", "S"}
+        for character in text
+    )
+
+
+def _html_has_meaningful_text(source: str) -> bool:
+    parser = _MeaningfulHtmlTextParser()
+    parser.feed(source)
+    parser.close()
+    return parser.found
+
+
+def _inline_has_meaningful_content(tokens: list[Token]) -> bool:
+    for token in tokens:
+        if token.type == "code_inline" and token.content.strip():
+            return True
+        if token.type in {"text", "text_special"} and _has_meaningful_text(
+            token.content
+        ):
+            return True
+        if token.type == "image" and _inline_has_meaningful_content(token.children or []):
+            return True
+        if token.type == "html_inline" and _html_has_meaningful_text(token.content):
+            return True
+    return False
+
+
+def _has_meaningful_markdown_content(text: str) -> bool:
+    for token in _MARKDOWN.parse(text):
+        if token.type in {"fence", "code_block"} and token.content.strip():
+            return True
+        if token.type == "html_block" and _html_has_meaningful_text(token.content):
+            return True
+        if token.type != "inline":
+            continue
+        if _inline_has_meaningful_content(token.children or []):
+            return True
+    return False
 
 
 def _markdown_headings(text: str) -> list[_MarkdownHeading]:
@@ -165,6 +231,37 @@ def _reject_machine_markers(text: str, *, label: str) -> None:
         raise ValueError(f"{label} must not contain plot-state markers")
 
 
+def _html_inline_sources(tokens: list[Token]) -> list[str]:
+    sources: list[str] = []
+    for token in tokens:
+        if token.type == "html_inline":
+            sources.append(token.content)
+        if token.children:
+            sources.extend(_html_inline_sources(token.children))
+    return sources
+
+
+def _episode_range_comment_count(text: str) -> int:
+    count = 0
+    for token in _MARKDOWN.parse(text):
+        sources: list[str] = []
+        if token.type == "html_block":
+            sources.append(token.content)
+        elif token.type == "inline":
+            sources.extend(_html_inline_sources(token.children or []))
+        for source in sources:
+            parser = _EpisodeRangeCommentParser()
+            parser.feed(source)
+            parser.close()
+            count += parser.count
+    return count
+
+
+def _reject_episode_range_metadata(text: str) -> None:
+    if _episode_range_comment_count(text):
+        raise ValueError("episode body must not contain range metadata")
+
+
 def _validate_story_state(updated: str) -> None:
     _validate_sections(
         updated,
@@ -200,6 +297,8 @@ def _parse_episode(text: str, filename: str) -> _Episode:
     document_match = _EPISODE_DOCUMENT.fullmatch(text)
     if filename_match is None or document_match is None:
         raise ValueError(f"episode has an invalid document structure: {filename}")
+    if _episode_range_comment_count(text) != 1:
+        raise ValueError(f"episode has ambiguous range metadata: {filename}")
 
     filename_number = int(filename_match.group("number"))
     document_number = int(document_match.group("number"))
@@ -208,13 +307,13 @@ def _parse_episode(text: str, filename: str) -> _Episode:
     if filename_number <= 0 or document_number != filename_number or start > end:
         raise ValueError(f"episode has inconsistent metadata: {filename}")
 
-    body = document_match.group("body")
-    _validate_sections(body, _EPISODE_HEADINGS, label="episode", prefix="")
+    _completion_text(document_match.group("body"), label="existing episode")
     return _Episode(filename_number, start, end, text)
 
 
 def _validate_episode_body(body: str) -> str:
     cleaned = _completion_text(body, label="episode")
+    _reject_episode_range_metadata(cleaned)
     _validate_sections(cleaned, _EPISODE_HEADINGS, label="episode", prefix="")
     _validate_generated_headings(
         cleaned,
@@ -328,6 +427,10 @@ async def create_due_episodes(
             episode_size=episode_size,
             checkpoint=last_episode_message,
         )
+        if existing_episodes and max(
+            episode.end for episode in existing_episodes.values()
+        ) > records[-1].number:
+            raise ValueError("existing episode chain exceeds available records")
         while records[-1].number - checkpoint >= episode_size:
             start = checkpoint + 1
             end = checkpoint + episode_size

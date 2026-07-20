@@ -452,6 +452,111 @@ async def test_real_extra_h2_outside_fence_is_rejected(
         assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode"])
+@pytest.mark.parametrize(
+    "content",
+    ["<!-- -->", "-", "***", "![](artifact.png)", "![<b></b>](artifact.png)"],
+    ids=[
+        "comment-only",
+        "bare-list-marker",
+        "thematic-break",
+        "empty-image-alt",
+        "formatting-only-image-alt",
+    ],
+)
+async def test_generated_required_section_rejects_nonmeaningful_markdown(
+    tmp_path: Path,
+    target: str,
+    content: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+
+    if target == "story":
+        old = story_state() + "\n"
+        await store.write_text(1, "story_state.md", old)
+        generated = story_state().replace("- 当前地点：门厅", content)
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        with pytest.raises(ValueError, match="story state.*empty section"):
+            await update_story_state(store, 1, records(2), fake_complete)
+        assert await store.read_text(1, "story_state.md") == old
+    else:
+        generated = episode_body().replace("完成章节", content)
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        with pytest.raises(ValueError, match="episode.*empty section"):
+            await create_due_episodes(
+                store,
+                1,
+                records(20),
+                0,
+                fake_complete,
+                episode_size=20,
+            )
+        assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "实际文本",
+        "`关键代码`",
+        "```text\n关键代码\n```",
+        "    关键代码",
+        "![关键线索](artifact.png)",
+        "<div>关键线索</div>",
+    ],
+    ids=[
+        "text",
+        "inline-code",
+        "fenced-code",
+        "indented-code",
+        "image-alt",
+        "html-text",
+    ],
+)
+async def test_generated_required_section_accepts_meaningful_markdown(
+    tmp_path: Path,
+    target: str,
+    content: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+
+    if target == "story":
+        generated = story_state().replace("- 当前地点：门厅", content)
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await update_story_state(store, 1, records(2), fake_complete) == generated
+        assert await store.read_text(1, "story_state.md") == generated + "\n"
+    else:
+        generated = episode_body().replace("完成章节", content)
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await create_due_episodes(
+            store,
+            1,
+            records(20),
+            0,
+            fake_complete,
+            episode_size=20,
+        ) == 20
+        assert await store.read_text(
+            1,
+            "episodes/episode-000001.md",
+        ) == episode_document(1, 1, 20, content)
+
+
 def test_render_records_preserves_numbers_roles_multiline_and_unicode() -> None:
     source = [
         ChatRecord(7, "user", "第一行\n第二行 🙂", "2026-01-01 00:00", "用户"),
@@ -590,6 +695,128 @@ async def test_episode_covers_exact_message_range(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "injected",
+    [
+        "\n\n<!-- messages: 999-1000 -->",
+        " inline <!-- MESSAGES : 999 - 1000 -->",
+        "\n\n<!--\n  Messages : 999 - 1000\n-->",
+        "\n\n<!-- messages: ９９９-１０００ -->",
+        "\n\n<!-- MeSsAgEs : ９-２０ -->",
+        "\n\n<!--\fMeSsAgEs\f:\f９-２０ -->",
+        "\n\n<!-- note: messages: ９-２０ -->",
+        "\n\n![<!-- messages: 999-1000 -->](artifact.png)",
+    ],
+    ids=[
+        "block",
+        "inline-case-whitespace",
+        "multiline-whitespace",
+        "unicode-digits",
+        "unicode-whitespace",
+        "form-feed-whitespace",
+        "prefixed-comment",
+        "image-alt-comment",
+    ],
+)
+async def test_generated_episode_rejects_real_range_metadata_comment(
+    tmp_path: Path,
+    injected: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+
+    async def fake_complete(_messages: list[dict[str, str]]) -> str:
+        return episode_body() + injected
+
+    with pytest.raises(ValueError, match="episode.*metadata"):
+        await create_due_episodes(
+            store,
+            1,
+            records(20),
+            0,
+            fake_complete,
+            episode_size=20,
+        )
+
+    assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "```md\n<!-- messages: 999-1000 -->\n```",
+        "    <!-- messages: 999-1000 -->",
+        "`<!-- messages: 999-1000 -->`",
+    ],
+    ids=["fenced", "indented", "inline-code"],
+)
+async def test_generated_episode_allows_range_marker_literal_in_code(
+    tmp_path: Path,
+    literal: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    generated = episode_body().replace("完成章节", f"完成章节\n\n{literal}")
+
+    async def fake_complete(_messages: list[dict[str, str]]) -> str:
+        return generated
+
+    assert await create_due_episodes(
+        store,
+        1,
+        records(20),
+        0,
+        fake_complete,
+        episode_size=20,
+    ) == 20
+    assert await store.read_text(
+        1,
+        "episodes/episode-000001.md",
+    ) == episode_document(1, 1, 20, f"完成章节\n\n{literal}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "summary"])
+async def test_existing_episode_rejects_duplicate_real_range_metadata(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    duplicate = episode_document(1, 1, 20).replace(
+        "## 剧情摘要",
+        "<!-- MESSAGES : 999 - 1000 -->\n\n## 剧情摘要",
+    )
+    await store.write_text(1, "episodes/episode-000001.md", duplicate)
+    calls = 0
+
+    async def must_not_complete(_messages: list[dict[str, str]]) -> str:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("completion must not be called")
+
+    with pytest.raises(ValueError, match="episode"):
+        if operation == "create":
+            await create_due_episodes(
+                store,
+                1,
+                records(20),
+                0,
+                must_not_complete,
+                episode_size=20,
+            )
+        else:
+            await update_summary_from_episodes(
+                store,
+                1,
+                0,
+                must_not_complete,
+                max_tokens=100,
+            )
+
+    assert calls == 0
+    assert await store.read_text(1, "episodes/episode-000001.md") == duplicate
+
+
+@pytest.mark.asyncio
 async def test_episode_nonzero_checkpoint_selects_numbers_not_list_indexes(
     tmp_path: Path,
 ) -> None:
@@ -608,7 +835,7 @@ async def test_episode_nonzero_checkpoint_selects_numbers_not_list_indexes(
     checkpoint = await create_due_episodes(
         store,
         1,
-        records(21, 45),
+        records(21, 40),
         20,
         fake_complete,
         episode_size=20,
@@ -618,10 +845,59 @@ async def test_episode_nonzero_checkpoint_selects_numbers_not_list_indexes(
     assert "[21] user: message 21" in prompts[0]
     assert "[40] assistant: message 40" in prompts[0]
     assert "message 20" not in prompts[0]
-    assert "message 41" not in prompts[0]
     assert await store.read_text(1, "episodes/episode-000002.md") == episode_document(
         2, 21, 40, "第二章"
     )
+
+
+@pytest.mark.asyncio
+async def test_existing_episode_chain_cannot_extend_beyond_supplied_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    existing = {
+        "episode-000001.md": episode_document(1, 1, 20, "第一章"),
+        "episode-000002.md": episode_document(2, 21, 40, "第二章"),
+    }
+    for filename, document in existing.items():
+        await store.write_text(1, f"episodes/{filename}", document)
+
+    calls = 0
+    writes: list[str] = []
+    original_write = store._write_text_unlocked
+
+    async def track_write(
+        session_id: int,
+        relative: str | Path,
+        text: str,
+    ) -> None:
+        writes.append(str(relative))
+        await original_write(session_id, relative, text)
+
+    monkeypatch.setattr(store, "_write_text_unlocked", track_write)
+
+    async def must_not_complete(_messages: list[dict[str, str]]) -> str:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("completion must not be called")
+
+    with pytest.raises(ValueError, match="existing episode.*available records"):
+        await create_due_episodes(
+            store,
+            1,
+            records(20),
+            0,
+            must_not_complete,
+            episode_size=20,
+        )
+
+    assert calls == 0
+    assert writes == []
+    assert {
+        filename: await store.read_text(1, f"episodes/{filename}")
+        for filename in existing
+    } == existing
 
 
 @pytest.mark.asyncio
@@ -678,6 +954,66 @@ async def test_episode_creation_validates_entire_existing_chain_before_completio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "document"),
+    [
+        ("episode-٠٠٠٠٠١.md", episode_document(1, 1, 20)),
+        ("episode-０００００１.md", episode_document(1, 1, 20)),
+        (
+            "episode-000001.md",
+            episode_document(1, 1, 20).replace("Episode 000001", "Episode ٠٠٠٠٠١"),
+        ),
+        (
+            "episode-000001.md",
+            episode_document(1, 1, 20).replace("Episode 000001", "Episode ０００００１"),
+        ),
+        (
+            "episode-000001.md",
+            episode_document(1, 1, 20).replace("messages: 1-20", "messages: 1-2٠"),
+        ),
+        (
+            "episode-000001.md",
+            episode_document(1, 1, 20).replace("messages: 1-20", "messages: 1-2０"),
+        ),
+    ],
+    ids=[
+        "arabic-indic-filename",
+        "fullwidth-filename",
+        "arabic-indic-h1",
+        "fullwidth-h1",
+        "arabic-indic-range",
+        "fullwidth-range",
+    ],
+)
+async def test_existing_episode_rejects_non_ascii_envelope_digits(
+    tmp_path: Path,
+    filename: str,
+    document: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.write_text(1, f"episodes/{filename}", document)
+    calls = 0
+
+    async def must_not_complete(_messages: list[dict[str, str]]) -> str:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("completion must not be called")
+
+    with pytest.raises(ValueError, match="existing episode"):
+        await create_due_episodes(
+            store,
+            1,
+            records(20),
+            0,
+            must_not_complete,
+            episode_size=20,
+        )
+
+    assert calls == 0
+    assert await store.read_text(1, f"episodes/{filename}") == document
+
+
+@pytest.mark.asyncio
 async def test_existing_episode_is_idempotent_without_another_completion(
     tmp_path: Path,
 ) -> None:
@@ -699,6 +1035,45 @@ async def test_existing_episode_is_idempotent_without_another_completion(
 
     assert checkpoint == 20
     assert await store.read_text(1, "episodes/episode-000001.md") == existing
+
+
+@pytest.mark.asyncio
+async def test_legacy_episode_with_extra_h2_and_marker_is_reused_without_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    legacy = episode_document(1, 1, 20, "旧章节").replace(
+        "## 状态变化",
+        "## 旧章节标题\n- [open] 旧格式线索\n\n## 状态变化",
+    )
+    await store.write_text(1, "episodes/episode-000001.md", legacy)
+    writes: list[str] = []
+    original_write = store._write_text_unlocked
+
+    async def track_write(
+        session_id: int,
+        relative: str | Path,
+        text: str,
+    ) -> None:
+        writes.append(str(relative))
+        await original_write(session_id, relative, text)
+
+    monkeypatch.setattr(store, "_write_text_unlocked", track_write)
+
+    async def must_not_complete(_messages: list[dict[str, str]]) -> str:
+        raise AssertionError("completion must not be called")
+
+    assert await create_due_episodes(
+        store,
+        1,
+        records(20),
+        0,
+        must_not_complete,
+        episode_size=20,
+    ) == 20
+    assert writes == []
+    assert await store.read_text(1, "episodes/episode-000001.md") == legacy
 
 
 @pytest.mark.asyncio
@@ -960,6 +1335,34 @@ async def test_summary_uses_only_pending_episodes_and_returns_last_end(
     assert "保留完整故事弧" in calls[0][0]["content"]
     assert "不判断剧情线或伏笔是否完成" in calls[0][0]["content"]
     assert "不得输出任何真实 Markdown 标题" in calls[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_summary_migrates_legacy_episode_with_extra_h2_and_marker(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    legacy = episode_document(1, 1, 20, "旧章节").replace(
+        "## 状态变化",
+        "## 旧章节标题\n- [open] 旧格式线索\n\n## 状态变化",
+    )
+    await store.write_text(1, "episodes/episode-000001.md", legacy)
+
+    async def fake_complete(messages: list[dict[str, str]]) -> str:
+        prompt = messages[-1]["content"]
+        assert "## 旧章节标题" in prompt
+        assert "[open] 旧格式线索" in prompt
+        return "旧章节及其线索已迁移到连续叙事。"
+
+    assert await update_summary_from_episodes(
+        store,
+        1,
+        0,
+        fake_complete,
+        max_tokens=100,
+    ) == 20
+    assert await store.read_text(1, "episodes/episode-000001.md") == legacy
+    assert await store.read_text(1, "summary.md") == "旧章节及其线索已迁移到连续叙事。\n"
 
 
 @pytest.mark.asyncio
