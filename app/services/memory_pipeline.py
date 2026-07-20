@@ -56,6 +56,25 @@ class MemoryPipeline:
         async with self.store.transaction(session_id) as transaction:
             return await transaction.load_state()
 
+    async def _recover_invalidation(
+        self,
+        session_id: int,
+        total: int,
+        state: MemoryState,
+    ) -> MemoryState:
+        """Resume cleanup or normalize checkpoints after a committed rollback."""
+        if not state.cleanup_required and not state.checkpoint_exceeds(total):
+            return state
+        async with self.store.transaction(session_id) as transaction:
+            current = await transaction.load_state()
+            plan = await transaction.plan_invalidation(total)
+            if current.checkpoint_exceeds(total):
+                await transaction.start_invalidation(plan)
+                current = await transaction.load_state()
+            if current.cleanup_required:
+                await transaction.finish_invalidation_cleanup(plan)
+            return await transaction.load_state()
+
     @staticmethod
     def _pending_records(
         records: list[ChatRecord],
@@ -84,13 +103,20 @@ class MemoryPipeline:
             records = await transaction.load_chat()
 
         total = records[-1].number if records else 0
-        state = await memory.migrate_legacy_extract_checkpoint(
-            self.store,
-            session_id,
-            total,
-        )
         try:
+            state = await self._load_state(session_id)
+            state = await self._recover_invalidation(
+                session_id,
+                total,
+                state,
+            )
+            state = await memory.migrate_legacy_extract_checkpoint(
+                self.store,
+                session_id,
+                total,
+            )
             if (
+                state.rebuild_story_required or
                 total - state.last_story_state_message
                 >= settings.story_state_interval_messages
             ):
@@ -102,11 +128,13 @@ class MemoryPipeline:
                 await self._save_changes(
                     session_id,
                     last_story_state_message=total,
+                    rebuild_story_required=False,
                     last_error="",
                 )
 
             state = await self._load_state(session_id)
             if (
+                state.rebuild_memory_required or
                 total - state.last_memory_message
                 >= settings.memory_extract_interval_messages
             ):
@@ -120,42 +148,52 @@ class MemoryPipeline:
                     session_id,
                     last_memory_message=total,
                     last_character_message=total,
+                    rebuild_memory_required=False,
                     last_error="",
                 )
 
             state = await self._load_state(session_id)
-            episode_checkpoint = await story_memory.create_due_episodes(
-                self.store,
-                session_id,
-                records,
-                state.last_episode_message,
-                self._complete_text(backend),
-                episode_size=settings.episode_size_messages,
-            )
-            if episode_checkpoint != state.last_episode_message:
+            force_episode = state.rebuild_episode_required
+            if (
+                force_episode
+                or total - state.last_episode_message
+                >= settings.episode_size_messages
+            ):
+                episode_checkpoint = await story_memory.create_due_episodes(
+                    self.store,
+                    session_id,
+                    records,
+                    state.last_episode_message,
+                    self._complete_text(backend),
+                    episode_size=settings.episode_size_messages,
+                )
                 await self._save_changes(
                     session_id,
                     last_episode_message=episode_checkpoint,
+                    rebuild_episode_required=False,
                     last_error="",
                 )
 
             state = await self._load_state(session_id)
-            summary_checkpoint = await story_memory.update_summary_from_episodes(
-                self.store,
-                session_id,
-                state.last_summary_message,
-                self._complete_text(backend),
-                max_tokens=settings.summary_max_tokens,
-            )
-            if summary_checkpoint != state.last_summary_message:
+            force_summary = state.rebuild_summary_required
+            if force_summary or state.last_episode_message > state.last_summary_message:
+                summary_checkpoint = await story_memory.update_summary_from_episodes(
+                    self.store,
+                    session_id,
+                    state.last_summary_message,
+                    self._complete_text(backend),
+                    max_tokens=settings.summary_max_tokens,
+                )
                 await self._save_changes(
                     session_id,
                     last_summary_message=summary_checkpoint,
+                    rebuild_summary_required=False,
                     last_error="",
                 )
 
             state = await self._load_state(session_id)
             if (
+                state.rebuild_rag_required or
                 total - state.last_rag_message
                 >= settings.rag_index_interval_messages
             ):
@@ -168,11 +206,13 @@ class MemoryPipeline:
                 await self._save_changes(
                     session_id,
                     last_rag_message=total,
+                    rebuild_rag_required=False,
                     last_error="",
                 )
 
             state = await self._load_state(session_id)
             if (
+                state.rebuild_assets_required or
                 total - state.last_assets_message
                 >= settings.assets_interval_messages
             ):
@@ -185,6 +225,7 @@ class MemoryPipeline:
                 await self._save_changes(
                     session_id,
                     last_assets_message=total,
+                    rebuild_assets_required=False,
                     last_error="",
                 )
         except Exception as exc:

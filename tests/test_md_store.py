@@ -9,6 +9,7 @@ import weakref
 
 import pytest
 
+from app.config import settings
 from app.services import rag
 from app.services.md_store import (
     ChatRecord,
@@ -401,6 +402,13 @@ async def test_memory_state_round_trips_every_field_as_markdown(tmp_path: Path) 
         last_rag_message=18,
         last_character_message=20,
         last_assets_message=22,
+        cleanup_required=True,
+        rebuild_story_required=True,
+        rebuild_memory_required=True,
+        rebuild_episode_required=True,
+        rebuild_summary_required=True,
+        rebuild_rag_required=True,
+        rebuild_assets_required=True,
         last_error="stage failed\nretry pending",
     )
 
@@ -410,6 +418,29 @@ async def test_memory_state_round_trips_every_field_as_markdown(tmp_path: Path) 
     assert (tmp_path / "3" / "memory_state.md").read_text(
         encoding="utf-8"
     ).startswith("# Memory State")
+    assert expected.rebuild_required
+
+
+def test_memory_state_parses_pre_rebuild_marker_v2_as_not_pending() -> None:
+    legacy = (
+        "# Memory State\n\n"
+        "<!-- schema-version: 2 -->\n"
+        "<!-- last-memory-message: 8 -->\n"
+        "<!-- last-story-state-message: 8 -->\n"
+        "<!-- last-summary-message: 0 -->\n"
+        "<!-- last-episode-message: 0 -->\n"
+        "<!-- last-rag-message: 8 -->\n"
+        "<!-- last-character-message: 8 -->\n"
+        "<!-- last-assets-message: 8 -->\n\n"
+        "## Last Error\n\n"
+        "<!-- last-error-length: 0 -->\n"
+        "(none)\n"
+    )
+
+    state = parse_memory_state(legacy)
+
+    assert not state.rebuild_required
+    assert render_memory_state(state) != legacy
 
 
 @pytest.mark.asyncio
@@ -987,7 +1018,21 @@ async def test_truncate_chat_invalidates_every_derived_checkpoint_and_keeps_memo
     assert retained == await store.load_chat(1)
     assert len(retained) == 18
     assert retained[-1].content == "assistant-9"
-    assert await store.load_state(1) == MemoryState()
+    state = await store.load_state(1)
+    assert state.rebuild_required
+    assert not state.cleanup_required
+    assert all(
+        getattr(state, field_name) == 0
+        for field_name in (
+            "last_memory_message",
+            "last_story_state_message",
+            "last_summary_message",
+            "last_episode_message",
+            "last_rag_message",
+            "last_character_message",
+            "last_assets_message",
+        )
+    )
     assert await store.read_text(1, "memory.md") == "long-term memory must survive"
     assert await store.read_text(1, "story_state.md") == ""
     assert await store.read_text(1, "summary.md") == ""
@@ -1098,7 +1143,173 @@ async def test_truncate_chat_validates_episode_metadata_before_chat_commit(
 
 
 @pytest.mark.asyncio
-async def test_truncate_failure_after_pending_state_keeps_chat_and_is_retryable(
+async def test_chat_replace_failure_preserves_every_authoritative_and_derived_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    monkeypatch.setattr(settings, "episode_size_messages", 2)
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 3):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    await store.write_text(1, "memory.md", "old memory")
+    await store.write_text(1, "story_state.md", "old story")
+    await store.write_text(1, "summary.md", "old summary")
+    await store.write_text(1, "episodes/episode-000001.md", _episode_document(1, 1, 2))
+    await store.write_text(1, "episodes/episode-000002.md", _episode_document(2, 3, 4))
+    await store.write_text(
+        1,
+        "rag/index.json",
+        '{"chunks": [{"text": "old", "start_message": 1, "end_message": 4}], '
+        '"embeddings": [[1]], "indexed_messages": 4}',
+    )
+    await store.save_state(
+        1,
+        MemoryState(
+            last_memory_message=4,
+            last_story_state_message=4,
+            last_summary_message=4,
+            last_episode_message=4,
+            last_rag_message=4,
+            last_character_message=4,
+            last_assets_message=4,
+        ),
+    )
+    session = tmp_path / "1"
+    relative_files = (
+        "chat.md",
+        "memory_state.md",
+        "memory.md",
+        "story_state.md",
+        "summary.md",
+        "episodes/episode-000001.md",
+        "episodes/episode-000002.md",
+        "rag/index.json",
+    )
+    before = {relative: (session / relative).read_bytes() for relative in relative_files}
+    real_replace = md_store_module.os.replace
+
+    def fail_chat(source: Path, target: Path) -> None:
+        if target.name == "chat.md":
+            raise OSError("chat replacement failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_chat)
+
+    with pytest.raises(OSError, match="chat replacement failed"):
+        await store.truncate_chat(1, remove_count=2)
+
+    assert {
+        relative: (session / relative).read_bytes() for relative in relative_files
+    } == before
+
+
+@pytest.mark.asyncio
+async def test_noncanonical_episode_size_fails_before_any_mutation(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 11):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    await store.write_text(1, "story_state.md", "old story")
+    await store.write_text(1, "episodes/episode-000001.md", _episode_document(1, 1, 10))
+    await store.save_state(1, MemoryState(last_episode_message=10))
+    before_chat = await store.read_text(1, "chat.md")
+    before_state = await store.read_text(1, "memory_state.md")
+    before_story = await store.read_text(1, "story_state.md")
+
+    with pytest.raises(ValueError, match="episode"):
+        await store.truncate_chat(1, remove_count=2)
+
+    assert await store.read_text(1, "chat.md") == before_chat
+    assert await store.read_text(1, "memory_state.md") == before_state
+    assert await store.read_text(1, "story_state.md") == before_story
+
+
+@pytest.mark.parametrize(
+    ("failed_name", "attempted", "remaining"),
+    [
+        ("episode-000003.md", ["episode-000003.md"], [1, 2, 3]),
+        ("episode-000002.md", ["episode-000003.md", "episode-000002.md"], [1, 2]),
+        (
+            "episode-000001.md",
+            ["episode-000003.md", "episode-000002.md", "episode-000001.md"],
+            [1],
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_episode_cleanup_deletes_in_reverse_and_pipeline_retry_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_name: str,
+    attempted: list[str],
+    remaining: list[int],
+) -> None:
+    from app.services.memory_pipeline import MemoryPipeline
+
+    monkeypatch.setattr(settings, "episode_size_messages", 2)
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 4):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    for number, start in enumerate((1, 3, 5), start=1):
+        await store.write_text(
+            1,
+            f"episodes/episode-{number:06d}.md",
+            _episode_document(number, start, start + 1),
+        )
+    await store.save_state(1, MemoryState(last_episode_message=6))
+    real_unlink = Path.unlink
+    deletions: list[str] = []
+
+    def fail_one(path: Path, missing_ok: bool = False) -> None:
+        if path.parent.name == "episodes" and path.name.startswith("episode-"):
+            deletions.append(path.name)
+            if path.name == failed_name:
+                raise OSError("episode deletion failed")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_one)
+
+    with pytest.raises(OSError, match="episode deletion failed"):
+        await store.truncate_chat(1, remove_count=6)
+
+    assert await store.load_chat(1) == []
+    assert deletions == attempted
+    assert sorted(
+        int(path.stem.removeprefix("episode-"))
+        for path in (tmp_path / "1" / "episodes").glob("episode-*.md")
+    ) == remaining
+    assert (await store.load_state(1)).cleanup_required
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    await MemoryPipeline(store).run(1, {})
+
+    assert not list((tmp_path / "1" / "episodes").glob("episode-*.md"))
+    assert not (await store.load_state(1)).rebuild_required
+
+
+@pytest.mark.asyncio
+async def test_truncate_cleanup_failure_commits_chat_and_pipeline_recovers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1123,7 +1334,6 @@ async def test_truncate_failure_after_pending_state_keeps_chat_and_is_retryable(
             last_assets_message=2,
         ),
     )
-    original_chat = await store.read_text(1, "chat.md")
     real_replace = md_store_module.os.replace
 
     def fail_story_once(source: Path, target: Path) -> None:
@@ -1136,12 +1346,14 @@ async def test_truncate_failure_after_pending_state_keeps_chat_and_is_retryable(
     with pytest.raises(OSError, match="story replacement failed"):
         await store.truncate_chat(1, remove_count=2)
 
-    assert await store.read_text(1, "chat.md") == original_chat
-    assert await store.load_state(1) == MemoryState()
+    assert await store.load_chat(1) == []
+    assert (await store.load_state(1)).cleanup_required
 
     monkeypatch.setattr(md_store_module.os, "replace", real_replace)
-    assert await store.truncate_chat(1, remove_count=2) == []
-    assert await store.load_chat(1) == []
+    from app.services.memory_pipeline import MemoryPipeline
+
+    await MemoryPipeline(store).run(1, {})
+    assert not (await store.load_state(1)).rebuild_required
 
 
 @pytest.mark.asyncio

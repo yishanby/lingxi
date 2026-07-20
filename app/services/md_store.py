@@ -37,7 +37,42 @@ class MemoryState:
     last_rag_message: int = 0
     last_character_message: int = 0
     last_assets_message: int = 0
+    cleanup_required: bool = False
+    rebuild_story_required: bool = False
+    rebuild_memory_required: bool = False
+    rebuild_episode_required: bool = False
+    rebuild_summary_required: bool = False
+    rebuild_rag_required: bool = False
+    rebuild_assets_required: bool = False
     last_error: str = ""
+
+    @property
+    def rebuild_required(self) -> bool:
+        return self.cleanup_required or any(
+            (
+                self.rebuild_story_required,
+                self.rebuild_memory_required,
+                self.rebuild_episode_required,
+                self.rebuild_summary_required,
+                self.rebuild_rag_required,
+                self.rebuild_assets_required,
+            )
+        )
+
+    def checkpoint_exceeds(self, total: int) -> bool:
+        if type(total) is not int or total < 0:
+            raise ValueError("total must be a nonnegative integer")
+        return any(
+            getattr(self, field_name) > total
+            for field_name in _CHECKPOINT_FIELDS.values()
+        )
+
+
+@dataclass(frozen=True)
+class _InvalidationPlan:
+    message_number: int
+    surviving_episode_end: int
+    episode_files_to_delete: tuple[str, ...]
 
 
 _TIMESTAMP_PATTERN = r"(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}|unknown)"
@@ -61,7 +96,17 @@ _CHECKPOINT_FIELDS = {
     "last-character-message": "last_character_message",
     "last-assets-message": "last_assets_message",
 }
+_REBUILD_FIELDS = {
+    "cleanup-required": "cleanup_required",
+    "rebuild-story-required": "rebuild_story_required",
+    "rebuild-memory-required": "rebuild_memory_required",
+    "rebuild-episode-required": "rebuild_episode_required",
+    "rebuild-summary-required": "rebuild_summary_required",
+    "rebuild-rag-required": "rebuild_rag_required",
+    "rebuild-assets-required": "rebuild_assets_required",
+}
 _STATE_NUMBER = r"(?:0|[1-9]\d*)"
+_STATE_BOOLEAN = r"(?:true|false)"
 _MEMORY_STATE_PREFIX = re.compile(
     r"\A# Memory State\n\n"
     rf"<!-- schema-version: (?P<schema_version>{_STATE_NUMBER}) -->\n"
@@ -71,7 +116,16 @@ _MEMORY_STATE_PREFIX = re.compile(
     rf"<!-- last-episode-message: (?P<last_episode_message>{_STATE_NUMBER}) -->\n"
     rf"<!-- last-rag-message: (?P<last_rag_message>{_STATE_NUMBER}) -->\n"
     rf"<!-- last-character-message: (?P<last_character_message>{_STATE_NUMBER}) -->\n"
-    rf"<!-- last-assets-message: (?P<last_assets_message>{_STATE_NUMBER}) -->\n\n"
+    rf"<!-- last-assets-message: (?P<last_assets_message>{_STATE_NUMBER}) -->\n"
+    r"(?:"
+    rf"<!-- cleanup-required: (?P<cleanup_required>{_STATE_BOOLEAN}) -->\n"
+    rf"<!-- rebuild-story-required: (?P<rebuild_story_required>{_STATE_BOOLEAN}) -->\n"
+    rf"<!-- rebuild-memory-required: (?P<rebuild_memory_required>{_STATE_BOOLEAN}) -->\n"
+    rf"<!-- rebuild-episode-required: (?P<rebuild_episode_required>{_STATE_BOOLEAN}) -->\n"
+    rf"<!-- rebuild-summary-required: (?P<rebuild_summary_required>{_STATE_BOOLEAN}) -->\n"
+    rf"<!-- rebuild-rag-required: (?P<rebuild_rag_required>{_STATE_BOOLEAN}) -->\n"
+    rf"<!-- rebuild-assets-required: (?P<rebuild_assets_required>{_STATE_BOOLEAN}) -->\n"
+    r")?\n"
     r"## Last Error\n\n"
     rf"<!-- last-error-length: (?P<last_error_length>{_STATE_NUMBER}) -->\n"
 )
@@ -176,6 +230,9 @@ def _validate_memory_state(state: MemoryState) -> None:
         value = getattr(state, field_name)
         if type(value) is not int or value < 0:
             raise ValueError("invalid memory state checkpoint")
+    for field_name in _REBUILD_FIELDS.values():
+        if type(getattr(state, field_name)) is not bool:
+            raise ValueError("invalid memory state rebuild marker")
     if not isinstance(state.last_error, str):
         raise ValueError("invalid memory state error")
 
@@ -434,10 +491,13 @@ class MarkdownMemoryStore:
         *,
         remove_count: int,
     ) -> list[ChatRecord]:
-        """Atomically replace authoritative chat after invalidating derived state.
+        """Commit authoritative chat, then make derived cleanup recoverable.
 
         Lock order is pipeline then transaction. ChatService already owns the
         turn lock before entering here, so concurrent turns cannot interleave.
+        A failure after the chat replacement means the truncation committed;
+        callers must reload instead of repeating it while startup recovery
+        finishes any marker-backed cleanup.
         """
         if type(remove_count) is not int or remove_count < 1:
             raise ValueError("remove_count must be a positive integer")
@@ -448,8 +508,10 @@ class MarkdownMemoryStore:
                 if remove_count > len(records):
                     raise ValueError("remove_count exceeds available chat records")
                 retained = records[:-remove_count]
-                await transaction.invalidate_after(len(retained))
+                plan = await transaction.plan_invalidation(len(retained))
                 await transaction.write_text("chat.md", render_chat_records(retained))
+                await transaction.start_invalidation(plan)
+                await transaction.finish_invalidation_cleanup(plan)
                 return retained
 
     async def invalidate_after(
@@ -471,7 +533,9 @@ class MarkdownMemoryStore:
                     raise ValueError(
                         "message_number must be within authoritative chat history"
                     )
-                await transaction.invalidate_after(message_number)
+                plan = await transaction.plan_invalidation(message_number)
+                await transaction.start_invalidation(plan)
+                await transaction.finish_invalidation_cleanup(plan)
 
     async def replace_final_pair(
         self,
@@ -502,8 +566,10 @@ class MarkdownMemoryStore:
                     content=assistant_content,
                 )
                 updated = [*prefix, expected_user, replacement]
-                await transaction.invalidate_after(len(prefix))
+                plan = await transaction.plan_invalidation(len(prefix))
                 await transaction.write_text("chat.md", render_chat_records(updated))
+                await transaction.start_invalidation(plan)
+                await transaction.finish_invalidation_cleanup(plan)
                 return updated
 
 
@@ -566,60 +632,89 @@ class MarkdownMemoryTransaction:
             render_memory_state(state),
         )
 
-    async def invalidate_after(self, message_number: int) -> None:
-        """Invalidate derived state while the caller owns the session transaction."""
-        from app.services import rag, story_memory
+    async def plan_invalidation(self, message_number: int) -> _InvalidationPlan:
+        """Validate every cleanup input and return a read-only mutation plan."""
+        from app.config import settings
+        from app.services import story_memory
 
-        episode_directory = self._store.session_dir(self.session_id) / "episodes"
-        paths = (
-            sorted(path for path in episode_directory.iterdir() if path.is_file())
-            if episode_directory.exists()
-            else []
+        if type(message_number) is not int or message_number < 0:
+            raise ValueError("message_number must be a nonnegative integer")
+        for relative in (
+            "chat.md",
+            "memory_state.md",
+            "story_state.md",
+            "summary.md",
+            "rag/index.json",
+        ):
+            self._store.file_path(self.session_id, relative)
+        episodes = await story_memory._load_existing_episode_chain(
+            self._store,
+            self,
+            episode_size=settings.episode_size_messages,
+            checkpoint=0,
         )
-        episodes = []
-        previous_end = 0
-        for expected_number, path in enumerate(paths, start=1):
-            text = await self.read_text(f"episodes/{path.name}")
-            try:
-                episode = story_memory._parse_episode(text, path.name)
-            except ValueError as exc:
-                raise ValueError(f"existing episode is invalid: {path.name}") from exc
-            if (
-                episode.number != expected_number
-                or episode.start != previous_end + 1
-            ):
-                raise ValueError(
-                    "existing episode chain has conflicting, out-of-order, or "
-                    f"gapped metadata: {path.name}"
-                )
-            episodes.append((path, episode))
-            previous_end = episode.end
-
         surviving_episode_end = max(
             (
                 episode.end
-                for _path, episode in episodes
+                for episode in episodes.values()
                 if episode.end <= message_number
             ),
             default=0,
         )
-        # Persist pending work first. If a later disposable-artifact write fails,
-        # startup scanning can safely resume against the still-authoritative chat.
-        await self.save_state(
-            MemoryState(last_episode_message=surviving_episode_end)
+        files_to_delete = tuple(
+            f"episodes/episode-{episode.number:06d}.md"
+            for episode in sorted(
+                episodes.values(),
+                key=lambda episode: episode.number,
+                reverse=True,
+            )
+            if episode.end > message_number
         )
+        for relative in files_to_delete:
+            self._store.file_path(self.session_id, relative)
+        return _InvalidationPlan(
+            message_number=message_number,
+            surviving_episode_end=surviving_episode_end,
+            episode_files_to_delete=files_to_delete,
+        )
+
+    async def start_invalidation(self, plan: _InvalidationPlan) -> None:
+        """Persist recovery markers after authoritative chat has committed."""
+        force = plan.message_number > 0
+        await self.save_state(
+            MemoryState(
+                last_episode_message=plan.surviving_episode_end,
+                cleanup_required=True,
+                rebuild_story_required=force,
+                rebuild_memory_required=force,
+                rebuild_episode_required=force,
+                rebuild_summary_required=force,
+                rebuild_rag_required=force,
+                rebuild_assets_required=force,
+            )
+        )
+
+    async def finish_invalidation_cleanup(self, plan: _InvalidationPlan) -> None:
+        """Idempotently clean disposable derivations, then clear cleanup pending."""
+        from app.services import rag
 
         await rag.invalidate_after(
             self.session_id,
-            message_number,
+            plan.message_number,
             transaction=self,
         )
         await self.write_text("story_state.md", "")
         await self.write_text("summary.md", "")
+        for relative in plan.episode_files_to_delete:
+            self._store.file_path(self.session_id, relative).unlink(missing_ok=True)
+        state = await self.load_state()
+        await self.save_state(replace(state, cleanup_required=False))
 
-        for path, episode in episodes:
-            if episode.end > message_number:
-                path.unlink(missing_ok=True)
+    async def invalidate_after(self, message_number: int) -> None:
+        """Invalidate derivations when authoritative chat is already committed."""
+        plan = await self.plan_invalidation(message_number)
+        await self.start_invalidation(plan)
+        await self.finish_invalidation_cleanup(plan)
 
 
 def _content_start(text: str, header_end: int) -> int:
@@ -725,11 +820,15 @@ def parse_memory_state(text: str) -> MemoryState:
             raise ValueError("invalid memory state error frame")
         error = text[error_start:error_end]
 
-    values: dict[str, int | str] = {
+    values: dict[str, bool | int | str] = {
         "schema_version": int(match.group("schema_version")),
         **{
             field_name: int(match.group(field_name))
             for field_name in _CHECKPOINT_FIELDS.values()
+        },
+        **{
+            field_name: match.group(field_name) == "true"
+            for field_name in _REBUILD_FIELDS.values()
         },
         "last_error": error,
     }
@@ -751,7 +850,14 @@ def render_memory_state(state: MemoryState) -> str:
         f"<!-- last-episode-message: {state.last_episode_message} -->\n"
         f"<!-- last-rag-message: {state.last_rag_message} -->\n"
         f"<!-- last-character-message: {state.last_character_message} -->\n"
-        f"<!-- last-assets-message: {state.last_assets_message} -->\n\n"
+        f"<!-- last-assets-message: {state.last_assets_message} -->\n"
+        f"<!-- cleanup-required: {str(state.cleanup_required).lower()} -->\n"
+        f"<!-- rebuild-story-required: {str(state.rebuild_story_required).lower()} -->\n"
+        f"<!-- rebuild-memory-required: {str(state.rebuild_memory_required).lower()} -->\n"
+        f"<!-- rebuild-episode-required: {str(state.rebuild_episode_required).lower()} -->\n"
+        f"<!-- rebuild-summary-required: {str(state.rebuild_summary_required).lower()} -->\n"
+        f"<!-- rebuild-rag-required: {str(state.rebuild_rag_required).lower()} -->\n"
+        f"<!-- rebuild-assets-required: {str(state.rebuild_assets_required).lower()} -->\n\n"
         "## Last Error\n\n"
         f"<!-- last-error-length: {len(state.last_error)} -->\n"
         f"{displayed_error}\n"

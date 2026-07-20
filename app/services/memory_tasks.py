@@ -59,6 +59,8 @@ class MemoryTaskManager:
 
     @staticmethod
     def _has_pending(total: int, state: MemoryState) -> bool:
+        if state.rebuild_required or state.checkpoint_exceeds(total):
+            return True
         return any(
             (
                 total - state.last_story_state_message

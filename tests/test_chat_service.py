@@ -1241,7 +1241,7 @@ async def test_retry_replaces_exactly_one_final_pair_from_logically_retained_his
     assert sources.rag == []
     assert sources.assets == ""
     assert sources.character_profiles == []
-    assert await store.load_state(1) == MemoryState()
+    assert (await store.load_state(1)).rebuild_required
     assert await store.read_text(1, "story_state.md") == ""
     assert await store.read_text(1, "summary.md") == ""
     assert manager.submitted == [1]
@@ -1392,7 +1392,7 @@ async def test_undo_removes_one_complete_pair_invalidates_and_submits(tmp_path) 
         "prefix assistant",
     ]
     assert retained == await store.load_chat(1)
-    assert await store.load_state(1) == MemoryState()
+    assert (await store.load_state(1)).rebuild_required
     assert manager.submitted == [1]
 
 

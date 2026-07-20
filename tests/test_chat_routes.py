@@ -581,6 +581,7 @@ async def test_feishu_ordinary_chat_uses_markdown_and_preserves_token_footer(
 
 @pytest.mark.asyncio
 async def test_feishu_reset_clears_markdown_chat(route_env, monkeypatch) -> None:
+    monkeypatch.setattr("app.config.settings.episode_size_messages", 2)
     session, character = entities()
     session.feishu_chat_id = "chat-1"
     db = DB(session, character)
@@ -623,6 +624,7 @@ async def test_feishu_reset_clears_markdown_chat(route_env, monkeypatch) -> None
         route_env.store.session_dir(1) / "episodes" / "episode-000001.md"
     ).exists()
     assert "stale rag" not in await route_env.store.read_text(1, "rag/index.json")
+    assert not (await route_env.store.load_state(1)).rebuild_required
     assert sent
 
 
