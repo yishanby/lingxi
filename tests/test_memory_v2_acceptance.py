@@ -15,7 +15,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.tables import Character, Session
 from app.routers import feishu, sessions
-from app.services import memory, story_memory
+from app.services import llm, memory, rag, story_memory
 from app.services.chat_service import ChatService, DomainContext, TurnRequest
 from app.services.context_builder import ContextBuilder, ContextSources
 from app.services.md_store import MarkdownMemoryStore
@@ -45,11 +45,186 @@ BACKEND = {
 @pytest.mark.asyncio
 async def test_two_hundred_messages_preserve_story_continuity(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(settings, "story_state_interval_messages", 20)
+    monkeypatch.setattr(settings, "memory_extract_interval_messages", 20)
+    monkeypatch.setattr(settings, "episode_size_messages", 20)
+    monkeypatch.setattr(settings, "rag_index_interval_messages", 20)
+    monkeypatch.setattr(settings, "assets_interval_messages", 1_000)
     store = MarkdownMemoryStore(tmp_path)
+
+    completion_calls: list[dict[str, Any]] = []
+    embedding_calls: list[dict[str, Any]] = []
+
+    def generated_text(messages: list[dict[str, str]]) -> tuple[str, str]:
+        system = messages[0]["content"]
+        prompt = "\n".join(message["content"] for message in messages)
+        has_key = "银钥匙" in prompt
+        has_cave = "山洞" in prompt
+
+        if "当前场景快照维护器" in system:
+            if has_cave:
+                return "story", (
+                    "# Story State\n\n"
+                    "## 时间与地点\n"
+                    "- 夜晚，山洞地下河畔\n\n"
+                    "## 在场角色\n"
+                    "- 用户与角色共同在场\n\n"
+                    "## 当前场景\n"
+                    "- 彼此信任的两人正在山洞地下河畔追踪线索\n\n"
+                    "## 最近变化\n"
+                    "- 两人刚越过石门，并发现石门后的新鲜足迹"
+                )
+            return "story", (
+                "# Story State\n\n"
+                "## 时间与地点\n"
+                "- 白天，前往下一处遗迹的路上\n\n"
+                "## 在场角色\n"
+                "- 用户与角色共同在场\n\n"
+                "## 当前场景\n"
+                "- 两人正在沿途调查遗迹线索\n\n"
+                "## 最近变化\n"
+                "- 双方新增了一批调查记录"
+            )
+
+        if "章节压缩器" in system:
+            if has_cave:
+                return "episode", (
+                    "## 剧情摘要\n"
+                    "- 两人抵达山洞地下河畔，越过石门并发现新鲜足迹。\n\n"
+                    "## 状态变化\n"
+                    "- 调查地点从沿途遗迹转移到山洞深处。\n\n"
+                    "## 承诺与伏笔\n"
+                    "- 银钥匙与洞内石壁纹路产生呼应。"
+                )
+            if has_key:
+                return "episode", (
+                    "## 剧情摘要\n"
+                    "- 最初，用户与角色立下共同寻找银钥匙的约定。\n\n"
+                    "## 状态变化\n"
+                    "- 两人因这项约定成为共同调查的同伴。\n\n"
+                    "## 承诺与伏笔\n"
+                    "- 双方明确约定共同寻找银钥匙。"
+                )
+            return "episode", (
+                "## 剧情摘要\n"
+                "- 两人继续调查沿途遗迹并记录线索。\n\n"
+                "## 状态变化\n"
+                "- 调查记录增加，双方保持协同行动。\n\n"
+                "## 承诺与伏笔\n"
+                "- 双方决定继续按既定方向调查。"
+            )
+
+        if "整体剧情回顾" in system:
+            if has_cave:
+                return "summary", (
+                    "故事从用户与角色立下共同寻找银钥匙的约定开始，"
+                    "这项早期约定让两人成为彼此信任的同伴。"
+                    "经过多处遗迹的连续调查，他们抵达山洞地下河畔，"
+                    "刚越过石门并发现新鲜足迹；银钥匙仍是串联这些事件的关键。"
+                )
+            return "summary", (
+                "故事从用户与角色立下共同寻找银钥匙的约定开始，"
+                "两人由此成为彼此信任的同伴，并持续调查沿途遗迹线索。"
+            )
+
+        if "memory extraction system" in system:
+            key_event = (
+                "- 早期事件是用户与角色立下共同寻找银钥匙的约定。"
+                if has_key
+                else "- 两人持续调查沿途遗迹线索。"
+            )
+            cave_event = (
+                "\n- 最近抵达山洞地下河畔并发现石门后的新鲜足迹。"
+                if has_cave
+                else ""
+            )
+            return "memory", (
+                "## Relationships\n"
+                "- 用户与角色因银钥匙约定成为彼此信任的同伴。\n\n"
+                "## Key Events\n"
+                f"{key_event}{cave_event}\n\n"
+                "## Decisions\n"
+                "- 双方决定共同寻找银钥匙并持续协同行动。\n\n"
+                "## User Preferences\n"
+                "- 用户希望故事保持前后连续。\n"
+                "===CHARACTERS===\n"
+                "NO_CHANGE"
+            )
+
+        raise AssertionError("unexpected deterministic completion prompt")
+
+    async def fake_completion(**kwargs):
+        assert kwargs["provider"] == BACKEND["provider"]
+        assert kwargs["base_url"] == BACKEND["base_url"]
+        stage, content = generated_text(kwargs["messages"])
+        completion_calls.append(
+            {
+                "stage": stage,
+                "provider": kwargs["provider"],
+                "base_url": kwargs["base_url"],
+            }
+        )
+        return {
+            "content": content,
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
+
+    async def fake_embeddings(texts: list[str], **kwargs):
+        embedding_calls.append(
+            {"texts": tuple(texts), "base_url": kwargs.get("base_url")}
+        )
+        return [
+            [float((sum(map(ord, text)) % 97) + 1), float(len(text) + 1), 1.0]
+            for text in texts
+        ]
+
+    def reject_live_http(*args, **kwargs):
+        raise AssertionError("live HTTP client must not be constructed")
+
+    monkeypatch.setattr(llm, "chat_completion", fake_completion)
+    monkeypatch.setattr(memory, "chat_completion", fake_completion)
+    monkeypatch.setattr(rag, "get_embeddings", fake_embeddings)
+    monkeypatch.setattr(httpx, "AsyncClient", reject_live_http)
+
+    final_pairs = {
+        95: (
+            "两人抵达山洞入口，准备沿银钥匙线索深入",
+            "彼此信任的两人进入山洞",
+        ),
+        96: (
+            "我们在地下河边短暂休整",
+            "角色确认当前场景是山洞地下河畔",
+        ),
+        97: (
+            "石壁纹路似乎能与银钥匙呼应",
+            "两人用银钥匙辨认出石门方向",
+        ),
+        98: (
+            "我们越过石门继续追踪",
+            "两人发现石门后的新鲜足迹",
+        ),
+        99: (
+            "继续沿足迹前进并记住刚才的发现",
+            "最近事件是越过石门并发现新鲜足迹",
+        ),
+    }
+    pipeline = MemoryPipeline(store)
+
     for index in range(100):
-        user = "第1章约定寻找银钥匙" if index == 0 else f"行动 {index}"
-        assistant = "记住银钥匙约定" if index == 0 else f"结果 {index}"
+        if index == 0:
+            user = "第一章里，我们约定共同寻找银钥匙"
+            assistant = "角色接受约定，两人因而成为共同调查的同伴"
+        elif index in final_pairs:
+            user, assistant = final_pairs[index]
+        else:
+            user = f"两人调查第 {index} 处沿途遗迹"
+            assistant = f"角色记录线索 {index}，双方继续协同行动"
         await store.append_pair(
             1,
             user,
@@ -57,41 +232,76 @@ async def test_two_hundred_messages_preserve_story_continuity(
             char_name="角色",
             user_name="用户",
         )
+        if (index + 1) % 10 == 0:
+            await pipeline.run(1, BACKEND)
 
-    await store.write_text(
-        1,
-        "story_state.md",
-        "## 当前场景\n- 角色正在山洞入口休整",
-    )
-    await store.write_text(
-        1,
-        "memory.md",
-        "## Relationships\n- 用户与角色互相信任",
-    )
-    await store.write_text(
-        1,
-        "summary.md",
-        "最初约定寻找银钥匙，随后一路调查至山洞。",
-    )
-    await store.write_text(
-        1,
-        "episodes/episode-000001.md",
-        "## 剧情摘要\n最初约定寻找银钥匙",
-    )
     records = await store.load_chat(1)
+    episode_directory = store.session_dir(1) / "episodes"
+    episode_paths = sorted(episode_directory.glob("episode-*.md"))
+    assert [path.name for path in episode_paths] == [
+        f"episode-{number:06d}.md" for number in range(1, 11)
+    ]
+    episode_texts = [
+        await store.read_text(1, f"episodes/{path.name}")
+        for path in episode_paths
+    ]
+    for number, text in enumerate(episode_texts, start=1):
+        start = (number - 1) * 20 + 1
+        end = number * 20
+        assert f"<!-- messages: {start}-{end} -->" in text
+
+    state = await store.load_state(1)
+    assert state.last_story_state_message == 200
+    assert state.last_memory_message == 200
+    assert state.last_character_message == 200
+    assert state.last_episode_message == 200
+    assert state.last_summary_message == 200
+
+    memory_document = await store.read_text(1, "memory.md")
+    for heading in (
+        "## Relationships",
+        "## Key Events",
+        "## Decisions",
+        "## User Preferences",
+    ):
+        assert heading in memory_document
+    assert "彼此信任的同伴" in memory_document
+
+    summary = await store.read_text(1, "summary.md")
+    assert summary.startswith("故事从用户与角色立下共同寻找银钥匙的约定开始")
+    assert "山洞地下河畔" in summary
+    assert "完成" not in summary
+    assert all(
+        marker not in summary.casefold()
+        for marker in ("[open]", "[closed]", "[done]")
+    )
+
+    completion_count = len(completion_calls)
+    embedding_count = len(embedding_calls)
+    immutable_episodes = dict(zip((path.name for path in episode_paths), episode_texts))
+    restarted_store = MarkdownMemoryStore(tmp_path)
+    await MemoryPipeline(restarted_store).run(1, BACKEND)
+    assert await restarted_store.load_state(1) == state
+    assert len(completion_calls) == completion_count
+    assert len(embedding_calls) == embedding_count
+    assert {
+        path.name: await restarted_store.read_text(1, f"episodes/{path.name}")
+        for path in sorted(
+            (restarted_store.session_dir(1) / "episodes").glob("episode-*.md")
+        )
+    } == immutable_episodes
 
     result = ContextBuilder(
-        total_budget=40_000,
-        min_recent_messages=4,
+        total_budget=settings.total_token_budget,
+        min_recent_messages=settings.min_recent_messages,
+        reply_token_reserve=settings.reply_token_reserve,
     ).build(
         ContextSources(
             character={"name": "角色"},
-            story_state=await store.read_text(1, "story_state.md"),
-            memory=await store.read_text(1, "memory.md"),
-            summary=await store.read_text(1, "summary.md"),
-            episodes=[
-                await store.read_text(1, "episodes/episode-000001.md")
-            ],
+            story_state=await restarted_store.read_text(1, "story_state.md"),
+            memory=memory_document,
+            summary=summary,
+            episodes=episode_texts,
             recent=[
                 {"role": record.role, "content": record.content}
                 for record in records[-10:]
@@ -102,10 +312,21 @@ async def test_two_hundred_messages_preserve_story_continuity(
 
     text = "\n".join(message["content"] for message in result.messages)
     assert REQUIRED_OPENING in text
+    assert "山洞地下河畔" in text
+    assert "彼此信任的同伴" in text
+    assert "发现石门后的新鲜足迹" in text
     assert "银钥匙" in text
-    assert "互相信任" in text
-    assert "行动 99" in text
-    assert estimate_messages_tokens(result.messages) <= 40_000
+    assert episode_texts[0] in text
+    assert estimate_messages_tokens(result.messages) == result.total_tokens
+    assert (
+        result.total_tokens + settings.reply_token_reserve
+        <= settings.total_token_budget
+    )
+    assert [call["stage"] for call in completion_calls].count("story") == 10
+    assert [call["stage"] for call in completion_calls].count("memory") == 10
+    assert [call["stage"] for call in completion_calls].count("episode") == 10
+    assert [call["stage"] for call in completion_calls].count("summary") == 10
+    assert len(embedding_calls) == 10
 
 
 @pytest.mark.asyncio
