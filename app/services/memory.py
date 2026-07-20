@@ -207,9 +207,7 @@ async def save_memory(session_id: int, memory_text: str) -> None:
     if _contains_refusal(memory_text):
         logger.warning(f"Session {session_id}: refusing to save memory.md — refusal content detected.")
         return
-    d = _ensure_dir(session_id)
-    async with aiofiles.open(d / "memory.md", mode="w", encoding="utf-8") as f:
-        await f.write(memory_text)
+    await md_store.write_text(session_id, "memory.md", memory_text)
 
 
 # ── 4. load_memory ──────────────────────────────────────────────────────────
@@ -324,9 +322,7 @@ async def load_memory_relevant(
 
 async def save_context_snapshot(session_id: int, snapshot: str) -> None:
     """Write context.md."""
-    d = _ensure_dir(session_id)
-    async with aiofiles.open(d / "context.md", mode="w", encoding="utf-8") as f:
-        await f.write(snapshot)
+    await md_store.write_text(session_id, "context.md", snapshot)
 
 
 # ── 6. load_context_snapshot ────────────────────────────────────────────────
@@ -550,9 +546,7 @@ async def load_assets(session_id: int) -> str:
 
 async def save_assets(session_id: int, content: str) -> None:
     """Save full asset record to assets.md."""
-    d = _ensure_dir(session_id)
-    async with aiofiles.open(d / "assets.md", mode="w", encoding="utf-8") as f:
-        await f.write(content)
+    await md_store.write_text(session_id, "assets.md", content)
 
 
 async def load_assets_summary(session_id: int) -> str:
@@ -566,9 +560,7 @@ async def load_assets_summary(session_id: int) -> str:
 
 async def save_assets_summary(session_id: int, summary: str) -> None:
     """Save one-line asset summary."""
-    d = _ensure_dir(session_id)
-    async with aiofiles.open(d / "assets_summary.txt", mode="w", encoding="utf-8") as f:
-        await f.write(summary.strip())
+    await md_store.write_text(session_id, "assets_summary.txt", summary.strip())
 
 
 async def update_assets(
@@ -684,9 +676,8 @@ async def load_character_profile(session_id: int, name: str) -> str:
 
 async def save_character_profile(session_id: int, name: str, content: str) -> None:
     """Save a single character's profile."""
-    d = _characters_dir(session_id)
-    async with aiofiles.open(d / f"{name}.md", mode="w", encoding="utf-8") as f:
-        await f.write(content)
+    md_store.character_path(session_id, name)
+    await md_store.write_text(session_id, f"characters/{name}.md", content)
 
 
 def find_mentioned_characters(
@@ -923,9 +914,11 @@ async def extract_memory_rebuild(
         logger.info(f"Memory rebuild chunk {i+1}/{len(chunks)} done, memory size: {len(accumulated_memory)}")
 
         # Persist after each chunk so progress is not lost
-        preview_path = _session_dir(session_id) / "memory_rebuild_preview.md"
-        async with aiofiles.open(preview_path, mode="w", encoding="utf-8") as f:
-            await f.write(accumulated_memory)
+        await md_store.write_text(
+            session_id,
+            "memory_rebuild_preview.md",
+            accumulated_memory,
+        )
 
     logger.info(f"Memory rebuild complete for session {session_id}, saved to preview")
     return accumulated_memory
@@ -951,17 +944,15 @@ async def compact_memory(
     backend_config: dict[str, Any],
 ) -> str:
     """压缩memory.md，备份旧文件后用LLM精练。"""
-    import shutil
-
     memory = await load_memory(session_id)
     if not memory or not memory.strip():
         raise ValueError("记忆为空，无需压缩")
 
     # Backup with timestamp
-    d = _ensure_dir(session_id)
     now = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    backup_path = d / f"memory_backup_{now}.md"
-    shutil.copy2(d / "memory.md", backup_path)
+    backup_name = f"memory_backup_{now}.md"
+    await md_store.write_text(session_id, backup_name, memory)
+    backup_path = md_store.file_path(session_id, backup_name)
     logger.info(f"Memory backed up to {backup_path}")
 
     llm_messages = [
@@ -979,9 +970,7 @@ async def compact_memory(
     ))["content"]
 
     # Save to preview file, not overwriting memory.md
-    preview_path = d / "memory_compact_preview.md"
-    async with aiofiles.open(preview_path, mode="w", encoding="utf-8") as f:
-        await f.write(compacted)
+    await md_store.write_text(session_id, "memory_compact_preview.md", compacted)
     logger.info(f"Memory compacted for session {session_id}: {len(memory)} -> {len(compacted)} chars (preview)")
     return compacted, len(memory), len(compacted), backup_path.name
 
@@ -1056,27 +1045,23 @@ async def inject_memory_into_prompt(session_id: int, system_parts: list[str]) ->
 
 async def remove_last_chat_md_entries(session_id: int, count: int = 2) -> None:
     """Remove the last `count` entries from chat.md."""
-    path = _session_dir(session_id) / "chat.md"
-    if not path.exists():
-        return
+    async with md_store.transaction(session_id) as transaction:
+        text = await transaction.read_text("chat.md")
+        if not text:
+            return
 
-    async with aiofiles.open(path, mode="r", encoding="utf-8") as f:
-        text = await f.read()
+        # Split on message headers
+        pattern = re.compile(r"(?=\n## \[)")
+        parts = pattern.split(text)
 
-    # Split on message headers
-    pattern = re.compile(r"(?=\n## \[)")
-    parts = pattern.split(text)
+        if len(parts) <= count:
+            # Remove everything
+            await transaction.write_text("chat.md", "")
+            return
 
-    if len(parts) <= count:
-        # Remove everything
-        async with aiofiles.open(path, mode="w", encoding="utf-8") as f:
-            await f.write("")
-        return
-
-    # Keep all but the last `count` parts
-    trimmed = "".join(parts[:-count])
-    async with aiofiles.open(path, mode="w", encoding="utf-8") as f:
-        await f.write(trimmed)
+        # Keep all but the last `count` parts
+        trimmed = "".join(parts[:-count])
+        await transaction.write_text("chat.md", trimmed)
 
 
 # ── Rolling Summary ────────────────────────────────────────────────────────
@@ -1104,9 +1089,7 @@ async def load_summary(session_id: int) -> str:
 
 async def save_summary(session_id: int, text: str) -> None:
     """Write summary.md (overwrite)."""
-    d = _ensure_dir(session_id)
-    async with aiofiles.open(d / "summary.md", mode="w", encoding="utf-8") as f:
-        await f.write(text)
+    await md_store.write_text(session_id, "summary.md", text)
 
 
 def should_update_summary(
@@ -1185,16 +1168,14 @@ async def update_rolling_summary(
 
 async def append_manual_memory(session_id: int, text: str) -> None:
     """Append a manual memory entry to memory.md."""
-    d = _ensure_dir(session_id)
-    path = d / "memory.md"
-
+    path = md_store.file_path(session_id, "memory.md")
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     entry = f"\n\n### Manual Note [{now}]\n- {text}\n"
 
-    if not path.exists():
-        content = MEMORY_TEMPLATE + entry
-        async with aiofiles.open(path, mode="w", encoding="utf-8") as f:
-            await f.write(content)
-    else:
-        async with aiofiles.open(path, mode="a", encoding="utf-8") as f:
-            await f.write(entry)
+    async with md_store.transaction(session_id) as transaction:
+        existing = await transaction.read_text("memory.md")
+        if not path.exists():
+            updated = MEMORY_TEMPLATE + entry
+        else:
+            updated = existing + entry
+        await transaction.write_text("memory.md", updated)

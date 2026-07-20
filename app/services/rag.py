@@ -189,9 +189,11 @@ async def load_index(session_id: int) -> dict[str, Any]:
 
 async def save_index(session_id: int, index: dict[str, Any]) -> None:
     """Save the RAG index."""
-    path = _index_dir(session_id) / "index.json"
-    async with aiofiles.open(path, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(index, ensure_ascii=False))
+    await MarkdownMemoryStore(MEMORY_BASE).write_text(
+        session_id,
+        "rag/index.json",
+        json.dumps(index, ensure_ascii=False),
+    )
 
 
 async def invalidate_after(session_id: int, message_number: int) -> None:

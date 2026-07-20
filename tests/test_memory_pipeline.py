@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import ast
+import inspect
+import json
 from pathlib import Path
 
 import pytest
@@ -946,3 +949,107 @@ async def test_app_lifespan_cleans_up_when_startup_scan_fails(
         "stop",
         "dispose",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("artifact", "relative"),
+    [
+        ("memory", "memory.md"),
+        ("assets", "assets.md"),
+        ("assets_summary", "assets_summary.txt"),
+        ("character", "characters/Alice.md"),
+    ],
+)
+async def test_derived_artifact_overwrite_failure_preserves_existing_file(
+    artifact: str,
+    relative: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    monkeypatch.setattr(memory, "MEMORY_BASE", tmp_path)
+    monkeypatch.setattr(memory, "md_store", store)
+    await store.write_text(1, relative, "old content")
+
+    def fail_replace(source: Path, target: Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("app.services.md_store.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        if artifact == "memory":
+            await memory.save_memory(1, "new content")
+        elif artifact == "assets":
+            await memory.save_assets(1, "new content")
+        elif artifact == "assets_summary":
+            await memory.save_assets_summary(1, "new content")
+        else:
+            await memory.save_character_profile(1, "Alice", "new content")
+
+    assert await store.read_text(1, relative) == "old content"
+
+
+@pytest.mark.asyncio
+async def test_rag_index_overwrite_failure_preserves_existing_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    monkeypatch.setattr(rag, "MEMORY_BASE", tmp_path)
+    old_index = {
+        "chunks": ["old chunk"],
+        "embeddings": [[1.0]],
+        "indexed_messages": 1,
+    }
+    await store.write_text(
+        1,
+        "rag/index.json",
+        json.dumps(old_index, ensure_ascii=False),
+    )
+
+    def fail_replace(source: Path, target: Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("app.services.md_store.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        await rag.save_index(
+            1,
+            {"chunks": ["new chunk"], "embeddings": [[2.0]], "indexed_messages": 2},
+        )
+
+    assert await rag.load_index(1) == old_index
+
+
+@pytest.mark.parametrize("module", [memory, rag])
+def test_memory_services_have_no_direct_artifact_writer_bypasses(module) -> None:
+    tree = ast.parse(inspect.getsource(module))
+    offenders: list[int] = []
+    for node in ast.walk(tree):
+        is_aiofiles_open = (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "open"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "aiofiles"
+        )
+        if is_aiofiles_open:
+            mode = None
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                mode = node.args[1].value
+            for keyword in node.keywords:
+                if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant):
+                    mode = keyword.value.value
+            if isinstance(mode, str) and any(flag in mode for flag in "wax+"):
+                offenders.append(node.lineno)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"copy", "copy2", "copyfile"}
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "shutil"
+        ):
+            offenders.append(node.lineno)
+
+    assert offenders == []
