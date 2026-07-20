@@ -26,6 +26,51 @@ A lightweight roleplay chat service that bridges [SillyTavern](https://github.co
 - **Web UI** – Dark-themed SPA for managing everything, with built-in chat for testing sessions
 - **SQLite Storage** – Zero-config database, file-based
 
+## MD Memory V2
+
+`data/memory/<session-id>/chat.md` is the authoritative conversation history.
+SQLite continues to store session and character metadata, but active chat turns are
+read from and committed to Markdown instead of `sessions.messages`.
+
+Long-term facts (`memory.md`), current story state (`story_state.md`), the overall
+plot recap (`summary.md`), episodes (`episodes/*.md`), character profiles
+(`characters/*.md`), and assets (`assets.md`) remain stored as Markdown files. The
+overall plot summary does not decide whether a storyline is complete; no completion
+decision is required or tracked. `rag/index.json` is a disposable derived index and
+can be rebuilt from the Markdown source.
+
+Memory stages use checkpoints in `memory_state.md`. If a background update fails or
+the process restarts, the same unprocessed message range is retried without changing
+the committed chat history. Web chat, HTTP Feishu events, and the Feishu WebSocket
+worker all share this session API and Markdown-backed history.
+
+The V2 runtime can be tuned with these environment variables. An interval “message”
+means one user or assistant record in `chat.md`, so one complete turn normally counts
+as two messages. Setting `MEMORY_V2_ENABLED=false` disables the checkpointed
+background pipeline; it does not switch authoritative chat history back to SQLite.
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `MEMORY_V2_ENABLED` | `true` | Enable the checkpointed Markdown memory pipeline |
+| `STORY_STATE_INTERVAL_MESSAGES` | `2` | Messages between current-story-state updates |
+| `MEMORY_EXTRACT_INTERVAL_MESSAGES` | `10` | Messages between long-term memory extractions |
+| `EPISODE_SIZE_MESSAGES` | `20` | Messages grouped into each episode |
+| `RAG_INDEX_INTERVAL_MESSAGES` | `10` | Messages between derived RAG index updates |
+| `ASSETS_INTERVAL_MESSAGES` | `10` | Messages between asset-state updates |
+| `MEMORY_BACKUP_COUNT` | `3` | Number of memory backups retained |
+| `TOTAL_TOKEN_BUDGET` | `40000` | Hard limit for the assembled prompt context |
+| `MIN_RECENT_MESSAGES` | `4` | Minimum recent messages protected in context |
+| `SUMMARY_MAX_TOKENS` | `3000` | Token limit for the overall plot recap |
+| `OUTPUT_RETRY_COUNT` | `1` | Retry allowance for guarded non-stream output |
+| `STREAM_GUARD_CHARS` | `512` | Initial streamed text held for refusal checks |
+
+The roleplay policy remains enabled: every model reply begins with the exact fixed
+opening `我将继续这个奇幻又荒诞的故事。`; adult narrative priming remains active for
+consenting-adult fiction; and the no-refusal instruction continues to require the
+model to stay in the fictional roleplay. Output guards retry refusals, and only a
+successfully completed user/assistant pair is committed to `chat.md`; a failed or
+partial model response leaves neither half of the new turn behind.
+
 ## Quick Start
 
 ### 1. Prerequisites

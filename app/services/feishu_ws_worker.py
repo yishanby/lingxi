@@ -871,7 +871,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
         sessions = api_get("/api/sessions?lite=true")
         for s in sessions:
             if s.get("feishu_chat_id") == chat_id and s.get("status") == "active":
-                msg_count = len(s.get("messages", []))
+                msg_count = s.get("msg_count", 0)
                 user = s.get("user_name", "用户")
                 send_text(
                     chat_id,
@@ -942,7 +942,7 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                     char_name = char_map.get(s.get("character_id"), f"角色#{s.get('character_id')}")
                     status = s.get("status", "unknown")
                     status_icon = "🟢" if status == "active" else "⚪"
-                    msg_count = len(s.get("messages", []))
+                    msg_count = s.get("msg_count", 0)
                     lines.append(f"{status_icon} #{sid} {char_name} ({msg_count}条消息) [{status}]")
                 lines.append("\n输入 /resume <编号> 恢复，如 /resume 3")
                 send_text(chat_id, "\n".join(lines))
