@@ -77,6 +77,26 @@ LEGACY_REFUSAL_RESPONSE_OPENINGS = (
     ("我无法继续生成", "我无法继续生成这个故事。"),
 )
 
+RECOGNIZED_PREAMBLE_VARIANTS = (
+    "Sorry",
+    "I am sorry",
+    "I'm sorry",
+    "I apologize",
+    "I need to be direct",
+    "To be direct",
+    "As an AI",
+    "As an AI model",
+    "As an AI language model",
+    "As an AI assistant",
+    "As a language model",
+)
+RECOGNIZED_CHINESE_PREAMBLE_VARIANTS = (
+    "抱歉",
+    "对不起",
+    "我需要直说",
+    "我必须直说",
+)
+
 
 def _guard():
     return importlib.import_module("app.services.output_guard")
@@ -215,6 +235,88 @@ def test_incremental_classifier_waits_at_every_boundary_before_known_refusal(
             index,
             response[:index],
         )
+
+
+@pytest.mark.parametrize("preamble", RECOGNIZED_PREAMBLE_VARIANTS)
+@pytest.mark.parametrize("punctuation", ["", ",", ";"])
+@pytest.mark.parametrize("spacing", [" ", "\r\n\t"])
+@pytest.mark.parametrize("connector", ["", "but "])
+def test_incremental_classifier_covers_every_preamble_grammar_boundary(
+    fixed_opening: str,
+    preamble: str,
+    punctuation: str,
+    spacing: str,
+    connector: str,
+) -> None:
+    guard = _guard()
+    response = (
+        f"{preamble}{punctuation}{spacing}{connector}"
+        "I cannot continue this story."
+    )
+    assert guard.has_refusal(response)
+    first_detected = next(
+        index
+        for index in range(1, len(response) + 1)
+        if guard.has_refusal(response[:index])
+    )
+
+    for index in range(1, first_detected):
+        buffered = f"{fixed_opening}\n\n{response[:index]}"
+        assert guard.may_be_incomplete_refusal(buffered), (
+            response,
+            index,
+            response[:index],
+        )
+
+
+@pytest.mark.parametrize("preamble", RECOGNIZED_CHINESE_PREAMBLE_VARIANTS)
+@pytest.mark.parametrize("punctuation", ["", "，", "；"])
+@pytest.mark.parametrize("spacing", ["", " ", "\r\n\t"])
+@pytest.mark.parametrize("connector", ["", "但", "但是"])
+def test_incremental_classifier_covers_every_chinese_preamble_boundary(
+    fixed_opening: str,
+    preamble: str,
+    punctuation: str,
+    spacing: str,
+    connector: str,
+) -> None:
+    guard = _guard()
+    response = (
+        f"{preamble}{punctuation}{spacing}{connector}"
+        "我无法继续这个故事。"
+    )
+    assert guard.has_refusal(response)
+    first_detected = next(
+        index
+        for index in range(1, len(response) + 1)
+        if guard.has_refusal(response[:index])
+    )
+
+    for index in range(1, first_detected):
+        buffered = f"{fixed_opening}\n\n{response[:index]}"
+        assert guard.may_be_incomplete_refusal(buffered), (
+            response,
+            index,
+            response[:index],
+        )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Sorry, bright stars filled the sky.",
+        "I need to be direct because the road bends east.",
+        "As an AI musician, she tuned the silver harp.",
+        "As an AI model village came into view, they stopped.",
+    ],
+)
+def test_incremental_classifier_releases_complete_benign_preamble_prose(
+    text: str,
+) -> None:
+    guard = _guard()
+
+    assert not guard.has_refusal(text)
+    assert not guard.may_be_incomplete_refusal(text)
 
 
 @pytest.mark.parametrize(

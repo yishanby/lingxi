@@ -16,10 +16,10 @@ from app.services.context_builder import ContextBuilder, ContextSources
 from app.services.md_store import ChatRecord, MarkdownMemoryStore
 from app.services.output_guard import (
     _RETRY_CORRECTION,
+    RefusalOpeningState,
+    classify_refusal_opening,
     complete_with_guard,
-    has_refusal,
     has_substantive_output,
-    may_be_incomplete_refusal,
     normalize_opening,
 )
 from app.services.prompt import _legacy_character_context, _match_worldbook_entries
@@ -186,7 +186,16 @@ class ChatService:
                     call_messages.append(
                         {"role": "user", "content": _RETRY_CORRECTION}
                     )
-                upstream = self._stream_completion(call_messages)
+                try:
+                    upstream = self._stream_completion(call_messages)
+                except Exception as exc:
+                    logger.warning(
+                        "Streaming provider failed for session %s (%s)",
+                        request.session_id,
+                        type(exc).__name__,
+                    )
+                    yield StreamEvent(error=SAFE_STREAM_ERROR)
+                    return
                 buffer = ""
                 accepted = ""
                 usage: dict[str, Any] = {}
@@ -194,6 +203,8 @@ class ChatService:
                 refused = False
                 invalid = False
                 ended_normally = False
+                provider_failed = False
+                closed_cleanly = False
                 try:
                     async for item in upstream:
                         if isinstance(item, dict):
@@ -208,10 +219,14 @@ class ChatService:
                                 continue
                             if not has_substantive_output(buffer):
                                 continue
-                            if has_refusal(buffer):
+                            classification = classify_refusal_opening(buffer)
+                            if classification is RefusalOpeningState.REFUSAL:
                                 refused = True
                                 break
-                            if may_be_incomplete_refusal(buffer):
+                            if (
+                                classification
+                                is RefusalOpeningState.POSSIBLE_REFUSAL_PREFIX
+                            ):
                                 continue
                             normalized = normalize_opening(buffer)
                             accepted = normalized
@@ -230,19 +245,31 @@ class ChatService:
                         request.session_id,
                         type(exc).__name__,
                     )
+                    provider_failed = True
+                finally:
+                    closed_cleanly = await self._close_upstream(
+                        upstream,
+                        request.session_id,
+                    )
+
+                if provider_failed:
                     yield StreamEvent(error=SAFE_STREAM_ERROR)
                     return
-                finally:
-                    close = getattr(upstream, "aclose", None)
-                    if close is not None:
-                        await close()
+
+                if not closed_cleanly:
+                    yield StreamEvent(error=SAFE_STREAM_ERROR)
+                    return
 
                 if ended_normally and not validated:
-                    if has_refusal(buffer):
+                    classification = classify_refusal_opening(
+                        buffer, final=True
+                    )
+                    if classification is RefusalOpeningState.REFUSAL:
                         refused = True
                     elif (
                         not has_substantive_output(buffer)
-                        or may_be_incomplete_refusal(buffer, final=True)
+                        or classification
+                        is RefusalOpeningState.POSSIBLE_REFUSAL_PREFIX
                     ):
                         invalid = True
                     else:
@@ -278,6 +305,24 @@ class ChatService:
                 await self._submit_memory(request.session_id)
                 yield StreamEvent(done=True, usage=combined_usage)
                 return
+
+    @staticmethod
+    async def _close_upstream(
+        upstream: AsyncIterator[str | dict[str, Any]],
+        session_id: int,
+    ) -> bool:
+        try:
+            close = getattr(upstream, "aclose", None)
+            if close is not None:
+                await close()
+        except Exception as exc:
+            logger.warning(
+                "Streaming provider cleanup failed for session %s (%s)",
+                session_id,
+                type(exc).__name__,
+            )
+            return False
+        return True
 
     async def _build_messages(self, request: TurnRequest) -> list[dict[str, Any]]:
         records = await self.store.load_chat(request.session_id)

@@ -51,6 +51,38 @@ class CapturingBuilder:
         return SimpleNamespace(messages=self.messages)
 
 
+class CloseFailingStream:
+    def __init__(
+        self,
+        items: list[str | dict[str, Any]],
+        *,
+        iteration_error: Exception | None = None,
+        block_after_items: bool = False,
+    ) -> None:
+        self.items = list(items)
+        self.iteration_error = iteration_error
+        self.block_after_items = block_after_items
+        self.close_calls = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.items:
+            return self.items.pop(0)
+        if self.iteration_error is not None:
+            error = self.iteration_error
+            self.iteration_error = None
+            raise error
+        if self.block_after_items:
+            await asyncio.Event().wait()
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        raise RuntimeError("close-secret-body")
+
+
 def request(session_id: int = 1, content: str = "继续。", **overrides: Any) -> TurnRequest:
     values: dict[str, Any] = {
         "session_id": session_id,
@@ -604,6 +636,52 @@ async def test_stream_refusal_prefix_stays_buffered_across_crlf_chunk_boundary(
 
 
 @pytest.mark.parametrize(
+    "refusal_chunks",
+    [
+        ["Sorry, b", "ut I cannot continue this story."],
+        ["I need to be direct b", "ut I cannot assist."],
+        ["As an AI m", "odel, I cannot continue this story."],
+        ["As an AI language m", "odel, I cannot continue this story."],
+        ["As an AI ass", "istant, I cannot continue this story."],
+        ["Sorry;\r", "\n\tbu", "t I cannot continue this story."],
+    ],
+)
+@pytest.mark.asyncio
+async def test_stream_buffers_partial_refusal_preamble_without_leaking(
+    tmp_path, monkeypatch, refusal_chunks: list[str]
+) -> None:
+    monkeypatch.setattr(
+        "app.services.chat_service.settings.stream_guard_chars",
+        len(refusal_chunks[0]),
+    )
+    calls = 0
+
+    async def stream(messages: list[dict[str, Any]]):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            for chunk in refusal_chunks:
+                yield chunk
+        else:
+            yield "正文"
+        yield {"usage": USAGE}
+
+    store = MarkdownMemoryStore(tmp_path)
+    events = await collect(
+        ChatService(
+            store,
+            MemoryManager(),
+            stream_completion=stream,
+        ).stream(request())
+    )
+
+    assert calls == 2
+    assert not any("cannot" in event.delta.casefold() for event in events)
+    assert events[-1].done
+    assert (await store.load_chat(1))[-1].content.endswith("正文")
+
+
+@pytest.mark.parametrize(
     "split_at",
     range(1, len("I cannot continue this story.")),
 )
@@ -780,6 +858,197 @@ async def test_stream_provider_failure_never_persists_partial_pair(
     assert "api-key=secret" not in caplog.text
     assert "RuntimeError" in caplog.text
     assert not events[-1].done
+    assert await store.load_chat(1) == []
+    assert manager.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_stream_factory_failure_is_sanitized_without_side_effects(
+    tmp_path, caplog
+) -> None:
+    def stream(messages):
+        raise RuntimeError("factory-secret-body")
+
+    store = MarkdownMemoryStore(tmp_path)
+    manager = MemoryManager()
+    events = await collect(
+        ChatService(store, manager, stream_completion=stream).stream(request())
+    )
+
+    assert events[-1].error
+    assert not any(event.done for event in events)
+    assert "factory-secret-body" not in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert await store.load_chat(1) == []
+    assert manager.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_stream_refusal_close_failure_aborts_without_retry_or_side_effects(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
+    calls = 0
+    candidate = CloseFailingStream(["I cannot continue this story."])
+
+    def stream(messages):
+        nonlocal calls
+        calls += 1
+        return candidate
+
+    store = MarkdownMemoryStore(tmp_path)
+    manager = MemoryManager()
+    events = await collect(
+        ChatService(store, manager, stream_completion=stream).stream(request())
+    )
+
+    assert calls == 1
+    assert candidate.close_calls == 1
+    assert events[-1].error
+    assert not any(event.done or event.delta for event in events)
+    assert "close-secret-body" not in caplog.text
+    assert "session 1" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert await store.load_chat(1) == []
+    assert manager.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_stream_normal_completion_close_failure_has_no_side_effects(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
+    candidate = CloseFailingStream(["正文", {"usage": USAGE}])
+
+    def stream(messages):
+        return candidate
+
+    store = MarkdownMemoryStore(tmp_path)
+    manager = MemoryManager()
+    events = await collect(
+        ChatService(store, manager, stream_completion=stream).stream(request())
+    )
+
+    assert candidate.close_calls == 1
+    assert any(event.delta for event in events)
+    assert events[-1].error
+    assert not any(event.done for event in events)
+    assert "close-secret-body" not in caplog.text
+    assert await store.load_chat(1) == []
+    assert manager.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_stream_iteration_and_close_failures_preserve_safe_original_outcome(
+    tmp_path, caplog
+) -> None:
+    candidate = CloseFailingStream(
+        [], iteration_error=RuntimeError("iteration-secret-body")
+    )
+
+    def stream(messages):
+        return candidate
+
+    store = MarkdownMemoryStore(tmp_path)
+    manager = MemoryManager()
+    events = await collect(
+        ChatService(store, manager, stream_completion=stream).stream(request())
+    )
+
+    assert candidate.close_calls == 1
+    assert events[-1].error
+    assert not any(event.done for event in events)
+    assert "iteration-secret-body" not in caplog.text
+    assert "close-secret-body" not in caplog.text
+    assert await store.load_chat(1) == []
+    assert manager.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_stream_provider_error_closes_before_emitting_terminal_error(
+    tmp_path,
+) -> None:
+    candidate = CloseFailingStream(
+        [], iteration_error=RuntimeError("iteration-secret-body")
+    )
+
+    def stream(messages):
+        return candidate
+
+    response = ChatService(
+        MarkdownMemoryStore(tmp_path),
+        MemoryManager(),
+        stream_completion=stream,
+    ).stream(request())
+    try:
+        assert (await anext(response)).error
+        assert candidate.close_calls == 1
+    finally:
+        await response.aclose()
+
+    assert candidate.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_consumer_close_ignores_close_error_and_releases_turn_lock(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
+    store = MarkdownMemoryStore(tmp_path)
+    manager = MemoryManager()
+    candidate = CloseFailingStream(["正文"], block_after_items=True)
+
+    def stream(messages):
+        return candidate
+
+    response = ChatService(
+        store, manager, stream_completion=stream
+    ).stream(request())
+    assert (await anext(response)).delta
+
+    await response.aclose()
+
+    assert candidate.close_calls == 1
+    assert "close-secret-body" not in caplog.text
+    assert await store.load_chat(1) == []
+    assert manager.submitted == []
+
+    async def complete(messages):
+        return {"content": "解锁", "usage": {}}
+
+    await asyncio.wait_for(
+        ChatService(store, manager, completion=complete).send(
+            request(content="下一问")
+        ),
+        timeout=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_cancellation_preserves_cancelled_error_when_close_fails(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
+    store = MarkdownMemoryStore(tmp_path)
+    manager = MemoryManager()
+    candidate = CloseFailingStream(["正文"], block_after_items=True)
+
+    def stream(messages):
+        return candidate
+
+    response = ChatService(
+        store, manager, stream_completion=stream
+    ).stream(request())
+    assert (await anext(response)).delta
+    pending = asyncio.create_task(anext(response))
+    await asyncio.sleep(0)
+    pending.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert candidate.close_calls == 1
+    assert "close-secret-body" not in caplog.text
     assert await store.load_chat(1) == []
     assert manager.submitted == []
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import re
 from collections.abc import Awaitable, Callable
+from enum import Enum, auto
 from typing import Any
 
 from app.services.prompt_policy import REQUIRED_OPENING
@@ -25,16 +26,40 @@ class OutputGuardError(RuntimeError):
         self.retry_count = retry_count
 
 
+_ENGLISH_REFUSAL_PREAMBLES = (
+    "sorry",
+    "i am sorry",
+    "i'm sorry",
+    "i apologize",
+    "i need to be direct",
+    "to be direct",
+    "as an ai",
+    "as an ai model",
+    "as an ai language model",
+    "as an ai assistant",
+    "as a language model",
+)
+_CHINESE_REFUSAL_PREAMBLES = (
+    "抱歉",
+    "对不起",
+    "我需要直说",
+    "我必须直说",
+)
+_ENGLISH_PREAMBLE_PATTERN = "|".join(
+    re.escape(value).replace("'", "['\u2019]")
+    for value in sorted(_ENGLISH_REFUSAL_PREAMBLES, key=len, reverse=True)
+)
+_CHINESE_PREAMBLE_PATTERN = "|".join(
+    re.escape(value)
+    for value in sorted(_CHINESE_REFUSAL_PREAMBLES, key=len, reverse=True)
+)
 _ENGLISH_REFUSAL_PREAMBLE = re.compile(
-    r"^(?:(?:sorry|i am sorry|i(?:'|\u2019)m sorry|i apologize|"
-    r"i need to be direct|"
-    r"to be direct|as (?:an ai(?: model| language model| assistant)?|"
-    r"a language model))"
+    rf"^(?:(?:{_ENGLISH_PREAMBLE_PATTERN})"
     r"[,!.?:;]?\s*(?:but\s+)?)+",
     re.IGNORECASE,
 )
 _CHINESE_REFUSAL_PREAMBLE = re.compile(
-    r"^(?:(?:抱歉|对不起|我需要直说|我必须直说)"
+    rf"^(?:(?:{_CHINESE_PREAMBLE_PATTERN})"
     r"[，,。.!！？?：:；;\s]*(?:但(?:是)?\s*)?)+"
 )
 
@@ -111,25 +136,6 @@ _CHINESE_REFUSAL_OPENING_VARIANTS = (
     "我无法参与",
     "不能参与",
 )
-_ENGLISH_REFUSAL_PREAMBLE_PREFIXES = (
-    "sorry",
-    "i am sorry",
-    "i'm sorry",
-    "i apologize",
-    "i need to be direct",
-    "to be direct",
-    "as an ai",
-    "as an ai model",
-    "as an ai language model",
-    "as an ai assistant",
-    "as a language model",
-)
-_CHINESE_REFUSAL_PREAMBLE_PREFIXES = (
-    "抱歉",
-    "对不起",
-    "我需要直说",
-    "我必须直说",
-)
 _ENGLISH_FIRST_PERSON_REFUSAL_CONTEXT = re.compile(
     r"\bi\s+(?:(?:cannot|can't|will not|won't|am not able to)\s+"
     r"(?:provide|create|assist|continue|produce|support|help|depict)\b|"
@@ -190,47 +196,154 @@ def has_substantive_output(text: str) -> bool:
     return bool(_strip_leading_openings(text))
 
 
-def may_be_incomplete_refusal(text: str, *, final: bool = False) -> bool:
-    """Return whether more bytes could turn the guarded opening into a refusal."""
-    raw_body = _strip_leading_openings(text)
-    if not raw_body:
-        return False
-    if REQUIRED_OPENING.startswith(raw_body.strip()):
-        return True
+class RefusalOpeningState(Enum):
+    REFUSAL = auto()
+    POSSIBLE_REFUSAL_PREFIX = auto()
+    SAFE = auto()
 
-    body = _strip_recognized_refusal_preambles(raw_body)
-    if not body:
-        return True
-    folded = body.casefold().replace("\u2019", "'")
-    english_clear_candidates = (
-        _LEGACY_ENGLISH_REFUSAL_OPENINGS
-        + _ENGLISH_REFUSAL_OPENING_VARIANTS
-        + _ENGLISH_REFUSAL_PREAMBLE_PREFIXES
-    )
-    if any(
-        candidate.startswith(folded) for candidate in english_clear_candidates
-    ):
-        return True
-    chinese_clear_candidates = (
-        _LEGACY_CHINESE_REFUSAL_OPENINGS
-        + _CHINESE_REFUSAL_OPENING_VARIANTS
-        + _CHINESE_REFUSAL_PREAMBLE_PREFIXES
-    )
-    if any(candidate.startswith(body) for candidate in chinese_clear_candidates):
-        return True
 
-    paragraph_complete = re.search(r"\r?\n\s*\r?\n", body) is not None
+def _english_body_may_be_refusal(text: str, *, final: bool) -> bool:
+    clear = _LEGACY_ENGLISH_REFUSAL_OPENINGS + _ENGLISH_REFUSAL_OPENING_VARIANTS
+    if any(candidate.startswith(text) for candidate in clear):
+        return True
+    paragraph_complete = re.search(r"\r?\n\s*\r?\n", text) is not None
     for candidate in _AMBIGUOUS_ENGLISH_TOPIC_OPENINGS:
-        if candidate.startswith(folded):
-            return not (final and candidate == folded)
-        if folded.startswith(candidate):
-            return not final and not paragraph_complete
-    for candidate in _AMBIGUOUS_CHINESE_TOPIC_OPENINGS:
-        if candidate.startswith(body):
-            return not (final and candidate == body)
-        if body.startswith(candidate):
+        if candidate.startswith(text):
+            return not (final and candidate == text)
+        if text.startswith(candidate):
             return not final and not paragraph_complete
     return False
+
+
+def _english_opening_may_be_refusal(
+    text: str,
+    *,
+    final: bool,
+    seen: set[str] | None = None,
+) -> bool:
+    if not text:
+        return True
+    if _english_body_may_be_refusal(text, final=final):
+        return True
+    seen = set() if seen is None else seen
+    if text in seen:
+        return False
+    seen.add(text)
+
+    for preamble in _ENGLISH_REFUSAL_PREAMBLES:
+        if preamble.startswith(text) and len(text) < len(preamble):
+            return True
+        if not text.startswith(preamble):
+            continue
+        tail = text[len(preamble):]
+        if tail[:1] in ",!.?:;":
+            tail = tail[1:]
+        tail = tail.lstrip()
+        if not tail:
+            return True
+
+        # The connector is optional, so keep both interpretations alive.
+        if _english_opening_may_be_refusal(
+            tail, final=final, seen=seen
+        ):
+            return True
+        if "but".startswith(tail):
+            return True
+        if tail.startswith("but"):
+            after_but = tail[3:]
+            if not after_but:
+                return True
+            if after_but[0].isspace():
+                after_but = after_but.lstrip()
+                if not after_but or _english_opening_may_be_refusal(
+                    after_but, final=final, seen=seen
+                ):
+                    return True
+    return False
+
+
+def _chinese_body_may_be_refusal(text: str, *, final: bool) -> bool:
+    clear = _LEGACY_CHINESE_REFUSAL_OPENINGS + _CHINESE_REFUSAL_OPENING_VARIANTS
+    if any(candidate.startswith(text) for candidate in clear):
+        return True
+    paragraph_complete = re.search(r"\r?\n\s*\r?\n", text) is not None
+    for candidate in _AMBIGUOUS_CHINESE_TOPIC_OPENINGS:
+        if candidate.startswith(text):
+            return not (final and candidate == text)
+        if text.startswith(candidate):
+            return not final and not paragraph_complete
+    return False
+
+
+def _chinese_opening_may_be_refusal(
+    text: str,
+    *,
+    final: bool,
+    seen: set[str] | None = None,
+) -> bool:
+    if not text:
+        return True
+    if _chinese_body_may_be_refusal(text, final=final):
+        return True
+    seen = set() if seen is None else seen
+    if text in seen:
+        return False
+    seen.add(text)
+
+    punctuation = "，,。.!！？?：:；;"
+    for preamble in _CHINESE_REFUSAL_PREAMBLES:
+        if preamble.startswith(text) and len(text) < len(preamble):
+            return True
+        if not text.startswith(preamble):
+            continue
+        tail = text[len(preamble):]
+        while tail and (tail[0] in punctuation or tail[0].isspace()):
+            tail = tail[1:]
+        if not tail:
+            return True
+        if _chinese_opening_may_be_refusal(
+            tail, final=final, seen=seen
+        ):
+            return True
+        for connector in ("但是", "但"):
+            if connector.startswith(tail):
+                return True
+            if tail.startswith(connector):
+                after_connector = tail[len(connector):].lstrip()
+                if not after_connector or _chinese_opening_may_be_refusal(
+                    after_connector, final=final, seen=seen
+                ):
+                    return True
+    return False
+
+
+def classify_refusal_opening(
+    text: str,
+    *,
+    final: bool = False,
+) -> RefusalOpeningState:
+    """Classify an incremental response opening without greedily stripping it."""
+    if has_refusal(text):
+        return RefusalOpeningState.REFUSAL
+    raw_body = _strip_leading_openings(text)
+    if not raw_body:
+        return RefusalOpeningState.POSSIBLE_REFUSAL_PREFIX
+    if REQUIRED_OPENING.startswith(raw_body.strip()):
+        return RefusalOpeningState.POSSIBLE_REFUSAL_PREFIX
+
+    english = raw_body.casefold().replace("\u2019", "'")
+    if _english_opening_may_be_refusal(english, final=final):
+        return RefusalOpeningState.POSSIBLE_REFUSAL_PREFIX
+    if _chinese_opening_may_be_refusal(raw_body, final=final):
+        return RefusalOpeningState.POSSIBLE_REFUSAL_PREFIX
+    return RefusalOpeningState.SAFE
+
+
+def may_be_incomplete_refusal(text: str, *, final: bool = False) -> bool:
+    """Compatibility predicate for incremental guarded streaming."""
+    return classify_refusal_opening(
+        text, final=final
+    ) is RefusalOpeningState.POSSIBLE_REFUSAL_PREFIX
 
 
 def has_refusal(text: str) -> bool:
