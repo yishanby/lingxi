@@ -141,6 +141,7 @@ class ChatService:
             raise RuntimeError("non-stream completion is not configured")
         turn_lock = await self.store.turn_lock_for(request.session_id)
         async with turn_lock:
+            await self.store.recover_invalidation(request.session_id)
             messages = await self._build_messages(request)
             result = await complete_with_guard(self._completion, messages)
             content = str(result["content"])
@@ -164,6 +165,7 @@ class ChatService:
         """Remove one complete final pair and enqueue regeneration once."""
         turn_lock = await self.store.turn_lock_for(session_id)
         async with turn_lock:
+            await self.store.recover_invalidation(session_id)
             records = await self.store.load_chat(session_id)
             self._final_pair(records)
             retained = await self.store.truncate_chat(
@@ -179,6 +181,7 @@ class ChatService:
             raise RuntimeError("non-stream completion is not configured")
         turn_lock = await self.store.turn_lock_for(request.session_id)
         async with turn_lock:
+            await self.store.recover_invalidation(request.session_id)
             records = await self.store.load_chat(request.session_id)
             original_user, original_assistant = self._final_pair(records)
             retry_request = replace(
@@ -214,6 +217,7 @@ class ChatService:
         turn_lock = await self.store.turn_lock_for(request.session_id)
         async with turn_lock:
             try:
+                await self.store.recover_invalidation(request.session_id)
                 messages = await self._build_messages(request)
             except ContextBudgetExceeded:
                 yield StreamEvent(error=SAFE_CONTEXT_ERROR)

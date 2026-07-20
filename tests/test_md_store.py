@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import gc
+import hashlib
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 import weakref
@@ -40,6 +41,97 @@ def test_record_and_state_models_are_frozen_with_v2_defaults() -> None:
     )
     with pytest.raises(FrozenInstanceError):
         state.last_error = "changed"  # type: ignore[misc]
+
+
+def test_memory_state_round_trip_persists_exact_rebuild_boundary() -> None:
+    state = MemoryState(
+        cleanup_required=True,
+        rebuild_story_required=True,
+        rebuild_from_message=2,
+    )
+
+    rendered = render_memory_state(state)
+
+    assert "<!-- rebuild-from-message: 2 -->" in rendered
+    assert parse_memory_state(rendered) == state
+
+
+def test_invalidation_intent_round_trips_canonical_chat_identities_without_content() -> None:
+    from app.services.md_store import (
+        build_invalidation_intent,
+        parse_invalidation_intent,
+        render_invalidation_intent,
+    )
+
+    old = [
+        ChatRecord(1, "user", "prefix user", "2026-07-19 01:00", "User"),
+        ChatRecord(2, "assistant", "prefix assistant", "2026-07-19 01:01", "Character"),
+        ChatRecord(3, "user", "secret retry user", "2026-07-19 01:02", "User"),
+        ChatRecord(4, "assistant", "old secret answer", "2026-07-19 01:03", "Character"),
+    ]
+    target = [*old[:-1], ChatRecord(4, "assistant", "new secret answer", "2026-07-19 01:03", "Character")]
+
+    intent = build_invalidation_intent(
+        "replace-final-pair",
+        boundary=2,
+        old_records=old,
+        target_records=target,
+    )
+    rendered = render_invalidation_intent(intent)
+
+    assert intent.old_chat_sha256 == hashlib.sha256(
+        render_chat_records(old).encode("utf-8")
+    ).hexdigest()
+    assert intent.target_chat_sha256 == hashlib.sha256(
+        render_chat_records(target).encode("utf-8")
+    ).hexdigest()
+    assert intent.old_chat_count == intent.target_chat_count == 4
+    assert "old secret answer" not in rendered
+    assert "new secret answer" not in rendered
+    assert parse_invalidation_intent(rendered) == intent
+
+
+def test_invalidation_intent_rejects_boolean_schema_version() -> None:
+    from app.services.md_store import InvalidationIntent, render_invalidation_intent
+
+    intent = InvalidationIntent(
+        schema_version=True,
+        operation_kind="replace-final-pair",
+        boundary=2,
+        old_chat_count=4,
+        old_chat_sha256="a" * 64,
+        target_chat_count=4,
+        target_chat_sha256="b" * 64,
+    )
+
+    with pytest.raises(ValueError, match="invalid invalidation intent"):
+        render_invalidation_intent(intent)
+
+
+def test_invalidation_intent_sanitizes_oversized_numeric_parse_errors() -> None:
+    from app.services.md_store import (
+        build_invalidation_intent,
+        parse_invalidation_intent,
+        render_invalidation_intent,
+    )
+
+    records = [
+        ChatRecord(1, "user", "user", "2026-07-19 01:00", "User"),
+        ChatRecord(2, "assistant", "assistant", "2026-07-19 01:01", "Character"),
+    ]
+    text = render_invalidation_intent(
+        build_invalidation_intent(
+            "replace-final-pair",
+            boundary=0,
+            old_records=records,
+            target_records=records,
+        )
+    ).replace("boundary-message: 0", f"boundary-message: {'9' * 5000}")
+
+    with pytest.raises(ValueError) as captured:
+        parse_invalidation_intent(text)
+
+    assert str(captured.value) == "invalid invalidation intent"
 
 
 def test_parse_empty_chat_returns_no_records() -> None:
@@ -441,6 +533,22 @@ def test_memory_state_parses_pre_rebuild_marker_v2_as_not_pending() -> None:
 
     assert not state.rebuild_required
     assert render_memory_state(state) != legacy
+
+
+def test_memory_state_parses_rebuild_flags_without_legacy_boundary_as_none() -> None:
+    legacy = render_memory_state(
+        MemoryState(
+            cleanup_required=True,
+            rebuild_story_required=True,
+            rebuild_from_message=2,
+        )
+    ).replace("<!-- rebuild-from-message: 2 -->\n", "")
+
+    state = parse_memory_state(legacy)
+
+    assert state.cleanup_required
+    assert state.rebuild_story_required
+    assert state.rebuild_from_message is None
 
 
 @pytest.mark.asyncio
@@ -1195,9 +1303,16 @@ async def test_chat_replace_failure_preserves_every_authoritative_and_derived_fi
     )
     before = {relative: (session / relative).read_bytes() for relative in relative_files}
     real_replace = md_store_module.os.replace
+    seen_intents = []
 
     def fail_chat(source: Path, target: Path) -> None:
         if target.name == "chat.md":
+            intent_text = (target.parent / "invalidation_intent.md").read_text(
+                encoding="utf-8"
+            )
+            seen_intents.append(
+                md_store_module.parse_invalidation_intent(intent_text)
+            )
             raise OSError("chat replacement failed")
         real_replace(source, target)
 
@@ -1209,6 +1324,310 @@ async def test_chat_replace_failure_preserves_every_authoritative_and_derived_fi
     assert {
         relative: (session / relative).read_bytes() for relative in relative_files
     } == before
+    assert len(seen_intents) == 1
+    assert seen_intents[0].operation_kind == "truncate"
+    assert seen_intents[0].boundary == 2
+    assert not (session / "invalidation_intent.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_recovery_discards_crash_before_chat_replace_without_invalidation(
+    tmp_path: Path,
+) -> None:
+    from app.services.md_store import build_invalidation_intent
+
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 3):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    records = await store.load_chat(1)
+    target = [
+        *records[:-1],
+        ChatRecord(
+            4,
+            "assistant",
+            "replacement assistant",
+            records[-1].timestamp,
+            records[-1].name,
+        ),
+    ]
+    await store.write_text(1, "story_state.md", "unchanged story")
+    await store.write_text(1, "summary.md", "unchanged summary")
+    await store.save_state(1, MemoryState(last_story_state_message=4))
+    intent = build_invalidation_intent(
+        "replace-final-pair",
+        boundary=2,
+        old_records=records,
+        target_records=target,
+    )
+    async with store.transaction(1) as transaction:
+        await transaction.save_invalidation_intent(intent)
+    session = tmp_path / "1"
+    before = {
+        relative: (session / relative).read_bytes()
+        for relative in ("chat.md", "memory_state.md", "story_state.md", "summary.md")
+    }
+
+    restarted = MarkdownMemoryStore(tmp_path)
+    await restarted.recover_invalidation(1)
+
+    assert {
+        relative: (session / relative).read_bytes()
+        for relative in ("chat.md", "memory_state.md", "story_state.md", "summary.md")
+    } == before
+    assert not (session / "invalidation_intent.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_reset_truncate_refuses_malformed_intent_without_mutation(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "old user",
+        "old assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "story_state.md", "unchanged story")
+    malformed = "# Invalidation Intent\n\n<!-- boundary-message: 0 -->\n"
+    await store.write_text(1, "invalidation_intent.md", malformed)
+    before_chat = await store.read_text(1, "chat.md")
+
+    with pytest.raises(ValueError, match="invalid invalidation intent"):
+        await store.truncate_chat(1, remove_count=2)
+
+    assert await store.read_text(1, "chat.md") == before_chat
+    assert await store.read_text(1, "story_state.md") == "unchanged story"
+    assert await store.read_text(1, "invalidation_intent.md") == malformed
+
+
+@pytest.mark.asyncio
+async def test_reset_truncate_refuses_boundaryless_cleanup_without_mutation(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "old user",
+        "old assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "story_state.md", "unchanged story")
+    await store.save_state(
+        1,
+        MemoryState(
+            last_story_state_message=2,
+            cleanup_required=True,
+            rebuild_story_required=True,
+        ),
+    )
+    before_chat = await store.read_text(1, "chat.md")
+    before_state = await store.read_text(1, "memory_state.md")
+
+    with pytest.raises(ValueError, match="no persisted rebuild boundary"):
+        await store.truncate_chat(1, remove_count=2)
+
+    assert await store.read_text(1, "chat.md") == before_chat
+    assert await store.read_text(1, "memory_state.md") == before_state
+    assert await store.read_text(1, "story_state.md") == "unchanged story"
+
+
+@pytest.mark.asyncio
+async def test_empty_reset_invalidation_refuses_malformed_intent_without_mutation(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.write_text(1, "story_state.md", "unchanged story")
+    malformed = "# Invalidation Intent\n\n<!-- boundary-message: 0 -->\n"
+    await store.write_text(1, "invalidation_intent.md", malformed)
+
+    with pytest.raises(ValueError, match="invalid invalidation intent"):
+        await store.invalidate_after(1, 0)
+
+    assert await store.read_text(1, "story_state.md") == "unchanged story"
+    assert await store.read_text(1, "memory_state.md") == ""
+    assert await store.read_text(1, "invalidation_intent.md") == malformed
+
+
+@pytest.mark.asyncio
+async def test_direct_retry_replace_refuses_malformed_intent_without_mutation(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "old user",
+        "old assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    records = await store.load_chat(1)
+    malformed = "# Invalidation Intent\n\n<!-- boundary-message: 0 -->\n"
+    await store.write_text(1, "invalidation_intent.md", malformed)
+    before_chat = await store.read_text(1, "chat.md")
+
+    with pytest.raises(ValueError, match="invalid invalidation intent"):
+        await store.replace_final_pair(
+            1,
+            expected_user=records[-2],
+            expected_assistant=records[-1],
+            assistant_content="replacement",
+        )
+
+    assert await store.read_text(1, "chat.md") == before_chat
+    assert await store.read_text(1, "invalidation_intent.md") == malformed
+
+
+@pytest.mark.asyncio
+async def test_leftover_intent_after_cleanup_is_idempotently_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 3):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    records = await store.load_chat(1)
+    await store.write_text(1, "story_state.md", "stale story")
+    await store.write_text(1, "summary.md", "stale summary")
+    await store.save_state(1, MemoryState(last_story_state_message=4))
+    real_unlink = Path.unlink
+
+    def fail_intent_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path.name == "invalidation_intent.md":
+            raise OSError("intent unlink failed")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_intent_unlink)
+
+    with pytest.raises(OSError, match="intent unlink failed"):
+        await store.replace_final_pair(
+            1,
+            expected_user=records[-2],
+            expected_assistant=records[-1],
+            assistant_content="replacement",
+        )
+
+    state = await store.load_state(1)
+    assert not state.cleanup_required
+    assert state.rebuild_from_message == 2
+    assert (tmp_path / "1" / "invalidation_intent.md").exists()
+    session = tmp_path / "1"
+    relatives = (
+        "chat.md",
+        "memory_state.md",
+        "story_state.md",
+        "summary.md",
+        "rag/index.json",
+    )
+    before = {relative: (session / relative).read_bytes() for relative in relatives}
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    await MarkdownMemoryStore(tmp_path).recover_invalidation(1)
+
+    assert {
+        relative: (session / relative).read_bytes() for relative in relatives
+    } == before
+    assert not (session / "invalidation_intent.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_equal_old_and_target_identity_prefers_uncommitted_classification(
+    tmp_path: Path,
+) -> None:
+    from app.services.md_store import build_invalidation_intent
+
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "same user",
+        "same assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    records = await store.load_chat(1)
+    await store.write_text(1, "story_state.md", "must remain unchanged")
+    await store.save_state(1, MemoryState(last_story_state_message=2))
+    intent = build_invalidation_intent(
+        "replace-final-pair",
+        boundary=0,
+        old_records=records,
+        target_records=records,
+    )
+    async with store.transaction(1) as transaction:
+        await transaction.save_invalidation_intent(intent)
+    before_state = await store.read_text(1, "memory_state.md")
+
+    await MarkdownMemoryStore(tmp_path).recover_invalidation(1)
+
+    assert await store.read_text(1, "story_state.md") == "must remain unchanged"
+    assert await store.read_text(1, "memory_state.md") == before_state
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_target_intent_rearms_cleanup_when_prior_boundary_is_identical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 3):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    records = await store.load_chat(1)
+    await store.write_text(1, "story_state.md", "stale second retry story")
+    await store.save_state(
+        1,
+        MemoryState(
+            last_story_state_message=4,
+            rebuild_from_message=2,
+        ),
+    )
+    real_replace = md_store_module.os.replace
+
+    def fail_state(source: Path, target: Path) -> None:
+        if target.name == "memory_state.md":
+            raise OSError("new state marker failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_state)
+
+    with pytest.raises(OSError, match="new state marker failed"):
+        await store.replace_final_pair(
+            1,
+            expected_user=records[-2],
+            expected_assistant=records[-1],
+            assistant_content="second replacement",
+        )
+
+    monkeypatch.setattr(md_store_module.os, "replace", real_replace)
+    await MarkdownMemoryStore(tmp_path).recover_invalidation(1)
+
+    state = await store.load_state(1)
+    assert await store.read_text(1, "story_state.md") == ""
+    assert state.rebuild_story_required
+    assert state.rebuild_from_message == 2
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
 
 
 @pytest.mark.asyncio

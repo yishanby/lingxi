@@ -10,7 +10,12 @@ import pytest
 
 from app.config import settings
 from app.services import memory, rag, story_memory
-from app.services.md_store import MarkdownMemoryStore, MemoryState, render_chat_records
+from app.services.md_store import (
+    ChatRecord,
+    MarkdownMemoryStore,
+    MemoryState,
+    render_chat_records,
+)
 from app.services.memory_pipeline import MemoryPipeline
 from app.services.memory_tasks import MemoryTaskManager
 
@@ -22,6 +27,56 @@ BACKEND = {
     "base_url": "https://example.invalid/v1",
     "params": {},
 }
+
+
+def _episode_document(number: int, start: int, end: int) -> str:
+    return (
+        f"# Episode {number:06d}\n\n"
+        f"<!-- messages: {start}-{end} -->\n\n"
+        "## 剧情摘要\n- 已发生的事件\n\n"
+        "## 状态变化\n- 状态已变化\n\n"
+        "## 承诺与伏笔\n- 保留的事实\n"
+    )
+
+
+async def _seed_stale_retry_artifacts(
+    store: MarkdownMemoryStore,
+) -> list[ChatRecord]:
+    for pair in range(1, 3):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    records = await store.load_chat(1)
+    await store.write_text(1, "memory.md", "stale memory through four")
+    await store.write_text(1, "story_state.md", "stale story through four")
+    await store.write_text(1, "summary.md", "stale summary through four")
+    await store.write_text(1, "episodes/episode-000001.md", _episode_document(1, 1, 2))
+    await store.write_text(1, "episodes/episode-000002.md", _episode_document(2, 3, 4))
+    await store.write_text(
+        1,
+        "rag/index.json",
+        '{"chunks": ['
+        '{"text": "one", "start_message": 1, "end_message": 2},'
+        '{"text": "stale", "start_message": 3, "end_message": 4}'
+        '], "embeddings": [[1], [2]], "indexed_messages": 4}',
+    )
+    await store.save_state(
+        1,
+        MemoryState(
+            last_memory_message=4,
+            last_story_state_message=4,
+            last_summary_message=4,
+            last_episode_message=4,
+            last_rag_message=4,
+            last_character_message=4,
+            last_assets_message=4,
+        ),
+    )
+    return records
 
 
 def isolate_story_stage(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1059,6 +1114,392 @@ async def test_cleanup_completion_state_failure_retries_without_llm(
     await MemoryPipeline(store).run(1, {})
 
     assert not (await store.load_state(1)).rebuild_required
+
+
+@pytest.mark.asyncio
+async def test_retry_state_write_failure_recovers_exact_boundary_from_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    monkeypatch.setattr(settings, "story_state_interval_messages", 100)
+    monkeypatch.setattr(settings, "memory_extract_interval_messages", 100)
+    monkeypatch.setattr(settings, "episode_size_messages", 2)
+    monkeypatch.setattr(settings, "rag_index_interval_messages", 100)
+    monkeypatch.setattr(settings, "assets_interval_messages", 100)
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 3):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    records = await store.load_chat(1)
+    await store.write_text(1, "memory.md", "stale memory through four")
+    await store.write_text(1, "story_state.md", "stale story through four")
+    await store.write_text(1, "summary.md", "stale summary through four")
+    await store.write_text(1, "episodes/episode-000001.md", _episode_document(1, 1, 2))
+    await store.write_text(1, "episodes/episode-000002.md", _episode_document(2, 3, 4))
+    await store.write_text(
+        1,
+        "rag/index.json",
+        '{"chunks": ['
+        '{"text": "one", "start_message": 1, "end_message": 2},'
+        '{"text": "stale", "start_message": 3, "end_message": 4}'
+        '], "embeddings": [[1], [2]], "indexed_messages": 4}',
+    )
+    await store.save_state(
+        1,
+        MemoryState(
+            last_memory_message=4,
+            last_story_state_message=4,
+            last_summary_message=4,
+            last_episode_message=4,
+            last_rag_message=4,
+            last_character_message=4,
+            last_assets_message=4,
+        ),
+    )
+    real_replace = md_store_module.os.replace
+
+    def fail_state(source: Path, target: Path) -> None:
+        if target.name == "memory_state.md":
+            raise OSError("state marker failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_state)
+
+    with pytest.raises(OSError, match="state marker failed"):
+        await store.replace_final_pair(
+            1,
+            expected_user=records[-2],
+            expected_assistant=records[-1],
+            assistant_content="replacement assistant",
+        )
+
+    assert (await store.load_chat(1))[-1].content == "replacement assistant"
+    assert (tmp_path / "1" / "invalidation_intent.md").exists()
+    old_state = await store.load_state(1)
+    assert old_state.last_rag_message == 4
+    assert MemoryTaskManager._has_pending(
+        4,
+        old_state,
+        has_invalidation_intent=True,
+    )
+
+    async def resolve(session_id):
+        return BACKEND
+
+    restarted = MarkdownMemoryStore(tmp_path)
+    manager = MemoryTaskManager(MemoryPipeline(restarted), resolve)
+    await manager.scan_pending_sessions()
+    assert manager.pending == {1}
+
+    monkeypatch.setattr(md_store_module.os, "replace", real_replace)
+    calls: list[str] = []
+
+    async def story(*args, **kwargs):
+        calls.append("story")
+        return "rebuilt story"
+
+    async def extract(*args, **kwargs):
+        calls.append("memory")
+        assert await restarted.read_text(1, "memory.md") == "stale memory through four"
+        assert await restarted.read_text(1, "story_state.md") == ""
+        assert await restarted.read_text(1, "summary.md") == ""
+        assert not (tmp_path / "1" / "episodes" / "episode-000002.md").exists()
+        index = json.loads(await restarted.read_text(1, "rag/index.json"))
+        assert [chunk["end_message"] for chunk in index["chunks"]] == [2]
+        await restarted.write_text(1, "memory.md", "rebuilt memory")
+
+    async def episodes(*args, **kwargs):
+        calls.append("episode")
+        assert args[3] == 2
+        return 2
+
+    async def summary(*args, **kwargs):
+        calls.append("summary")
+        return 2
+
+    async def build_rag(*args, **kwargs):
+        calls.append("rag")
+        return {}
+
+    async def assets(*args, **kwargs):
+        calls.append("assets")
+        return False
+
+    monkeypatch.setattr(story_memory, "update_story_state", story)
+    monkeypatch.setattr(memory, "extract_memory_and_characters", extract)
+    monkeypatch.setattr(story_memory, "create_due_episodes", episodes)
+    monkeypatch.setattr(story_memory, "update_summary_from_episodes", summary)
+    monkeypatch.setattr(rag, "build_index", build_rag)
+    monkeypatch.setattr(memory, "update_assets", assets)
+
+    await MemoryPipeline(restarted).run(1, BACKEND)
+
+    assert calls == ["story", "memory", "episode", "summary", "rag", "assets"]
+    assert await restarted.read_text(1, "memory.md") == "rebuilt memory"
+    assert not (await restarted.load_state(1)).rebuild_required
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_retry_rag_cleanup_failure_restarts_at_persisted_boundary_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    monkeypatch.setattr(settings, "story_state_interval_messages", 100)
+    monkeypatch.setattr(settings, "memory_extract_interval_messages", 100)
+    monkeypatch.setattr(settings, "episode_size_messages", 2)
+    monkeypatch.setattr(settings, "rag_index_interval_messages", 100)
+    monkeypatch.setattr(settings, "assets_interval_messages", 100)
+    store = MarkdownMemoryStore(tmp_path)
+    records = await _seed_stale_retry_artifacts(store)
+    real_replace = md_store_module.os.replace
+
+    def fail_rag(source: Path, target: Path) -> None:
+        if target.name == "index.json":
+            raise OSError("rag cleanup failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_rag)
+
+    with pytest.raises(OSError, match="rag cleanup failed"):
+        await store.replace_final_pair(
+            1,
+            expected_user=records[-2],
+            expected_assistant=records[-1],
+            assistant_content="replacement assistant",
+        )
+
+    pending = await store.load_state(1)
+    assert pending.cleanup_required
+    assert pending.rebuild_from_message == 2
+    assert (tmp_path / "1" / "invalidation_intent.md").exists()
+
+    monkeypatch.setattr(md_store_module.os, "replace", real_replace)
+
+    async def story(*args, **kwargs):
+        return "story"
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def episodes(*args, **kwargs):
+        return 2
+
+    async def summary(*args, **kwargs):
+        return 2
+
+    async def build_rag(*args, **kwargs):
+        index = json.loads(await store.read_text(1, "rag/index.json"))
+        assert [chunk["end_message"] for chunk in index["chunks"]] == [2]
+        assert all(chunk["text"] != "stale" for chunk in index["chunks"])
+        return {}
+
+    async def assets(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(story_memory, "update_story_state", story)
+    monkeypatch.setattr(memory, "extract_memory_and_characters", noop)
+    monkeypatch.setattr(story_memory, "create_due_episodes", episodes)
+    monkeypatch.setattr(story_memory, "update_summary_from_episodes", summary)
+    monkeypatch.setattr(rag, "build_index", build_rag)
+    monkeypatch.setattr(memory, "update_assets", assets)
+
+    await MemoryPipeline(MarkdownMemoryStore(tmp_path)).run(1, BACKEND)
+
+    assert not (await store.load_state(1)).rebuild_required
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_retry_episode_delete_failure_reuses_prefix_and_regenerates_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "story_state_interval_messages", 100)
+    monkeypatch.setattr(settings, "memory_extract_interval_messages", 100)
+    monkeypatch.setattr(settings, "episode_size_messages", 2)
+    monkeypatch.setattr(settings, "rag_index_interval_messages", 100)
+    monkeypatch.setattr(settings, "assets_interval_messages", 100)
+    store = MarkdownMemoryStore(tmp_path)
+    records = await _seed_stale_retry_artifacts(store)
+    first_episode = await store.read_text(1, "episodes/episode-000001.md")
+    real_unlink = Path.unlink
+
+    def fail_episode_two(path: Path, missing_ok: bool = False) -> None:
+        if path.name == "episode-000002.md":
+            raise OSError("episode two deletion failed")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_episode_two)
+
+    with pytest.raises(OSError, match="episode two deletion failed"):
+        await store.replace_final_pair(
+            1,
+            expected_user=records[-2],
+            expected_assistant=records[-1],
+            assistant_content="replacement assistant",
+        )
+
+    pending = await store.load_state(1)
+    assert pending.cleanup_required
+    assert pending.rebuild_from_message == 2
+    assert (tmp_path / "1" / "episodes" / "episode-000002.md").exists()
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    episode_completions = 0
+
+    async def complete(messages):
+        nonlocal episode_completions
+        episode_completions += 1
+        return (
+            "## 剧情摘要\n- replacement events\n\n"
+            "## 状态变化\n- replacement state\n\n"
+            "## 承诺与伏笔\n- replacement facts"
+        )
+
+    monkeypatch.setattr(MemoryPipeline, "_complete_text", lambda self, backend: complete)
+
+    async def story(*args, **kwargs):
+        return "story"
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def summary(*args, **kwargs):
+        return 4
+
+    async def assets(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(story_memory, "update_story_state", story)
+    monkeypatch.setattr(memory, "extract_memory_and_characters", noop)
+    monkeypatch.setattr(story_memory, "update_summary_from_episodes", summary)
+    monkeypatch.setattr(rag, "build_index", noop)
+    monkeypatch.setattr(memory, "update_assets", assets)
+
+    await MemoryPipeline(MarkdownMemoryStore(tmp_path)).run(1, BACKEND)
+
+    assert await store.read_text(1, "episodes/episode-000001.md") == first_episode
+    regenerated = await store.read_text(1, "episodes/episode-000002.md")
+    assert "<!-- messages: 3-4 -->" in regenerated
+    assert "replacement events" in regenerated
+    assert episode_completions == 1
+    assert not (await store.load_state(1)).rebuild_required
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
+
+
+@pytest.mark.parametrize("intent_kind", ["malformed", "neither"])
+@pytest.mark.asyncio
+async def test_untrusted_intent_fails_without_any_derived_write(
+    tmp_path: Path,
+    intent_kind: str,
+) -> None:
+    from app.services.md_store import build_invalidation_intent
+
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "authoritative user",
+        "authoritative assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "story_state.md", "unchanged story")
+    await store.write_text(1, "summary.md", "unchanged summary")
+    await store.save_state(1, MemoryState(last_story_state_message=2))
+    if intent_kind == "malformed":
+        await store.write_text(
+            1,
+            "invalidation_intent.md",
+            "# Invalidation Intent\n\n<!-- boundary-message: 0 -->\n",
+        )
+        expected_error = "invalid invalidation intent"
+    else:
+        other = MarkdownMemoryStore(tmp_path / "other")
+        for pair in range(1, 3):
+            await other.append_pair(
+                1,
+                f"other-user-{pair}",
+                f"other-assistant-{pair}",
+                char_name="Character",
+                user_name="User",
+            )
+        old = await other.load_chat(1)
+        target = [
+            *old[:-1],
+            type(old[-1])(
+                4,
+                "assistant",
+                "other replacement",
+                old[-1].timestamp,
+                old[-1].name,
+            ),
+        ]
+        intent = build_invalidation_intent(
+            "replace-final-pair",
+            boundary=2,
+            old_records=old,
+            target_records=target,
+        )
+        async with store.transaction(1) as transaction:
+            await transaction.save_invalidation_intent(intent)
+        expected_error = "does not match authoritative chat"
+    session = tmp_path / "1"
+    relatives = (
+        "chat.md",
+        "memory_state.md",
+        "story_state.md",
+        "summary.md",
+        "invalidation_intent.md",
+    )
+    before = {relative: (session / relative).read_bytes() for relative in relatives}
+
+    with pytest.raises(ValueError, match=expected_error):
+        await MemoryPipeline(MarkdownMemoryStore(tmp_path)).run(1, BACKEND)
+
+    assert {
+        relative: (session / relative).read_bytes() for relative in relatives
+    } == before
+
+
+@pytest.mark.asyncio
+async def test_retry_flags_without_boundary_fail_instead_of_guessing_current_total(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 3):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    await store.write_text(1, "story_state.md", "must remain unchanged")
+    await store.save_state(
+        1,
+        MemoryState(
+            last_story_state_message=4,
+            cleanup_required=True,
+            rebuild_story_required=True,
+        ),
+    )
+    before_state = await store.read_text(1, "memory_state.md")
+
+    with pytest.raises(ValueError, match="no persisted rebuild boundary"):
+        await MemoryPipeline(store).run(1, BACKEND)
+
+    assert await store.read_text(1, "story_state.md") == "must remain unchanged"
+    assert await store.read_text(1, "memory_state.md") == before_state
 
 
 @pytest.mark.asyncio

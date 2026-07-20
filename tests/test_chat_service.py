@@ -136,6 +136,129 @@ async def test_send_provider_failure_leaves_markdown_unchanged(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_send_recovers_unresolved_intent_before_context_and_releases_pipeline_lock(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 3):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    records = await store.load_chat(1)
+    await store.write_text(1, "story_state.md", "stale story")
+    await store.save_state(1, MemoryState(last_story_state_message=4))
+    real_replace = md_store_module.os.replace
+
+    def fail_state(source, target) -> None:
+        if target.name == "memory_state.md":
+            raise OSError("state marker failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_state)
+    with pytest.raises(OSError, match="state marker failed"):
+        await store.replace_final_pair(
+            1,
+            expected_user=records[-2],
+            expected_assistant=records[-1],
+            assistant_content="replacement assistant",
+        )
+    monkeypatch.setattr(md_store_module.os, "replace", real_replace)
+
+    async def complete(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        assert await store.read_text(1, "story_state.md") == ""
+        pipeline_lock = await store.pipeline_lock_for(1)
+        assert not pipeline_lock.locked()
+        return {"content": "正文", "usage": USAGE}
+
+    await ChatService(store, None, completion=complete).send(request(content="next"))
+
+    assert len(await store.load_chat(1)) == 6
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
+
+
+@pytest.mark.parametrize("operation", ["undo", "retry"])
+@pytest.mark.asyncio
+async def test_mutating_commands_fail_before_touching_malformed_intent(
+    tmp_path,
+    operation: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "old user",
+        "old assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    malformed = "# Invalidation Intent\n\n<!-- boundary-message: 0 -->\n"
+    await store.write_text(1, "invalidation_intent.md", malformed)
+    before_chat = await store.read_text(1, "chat.md")
+    completion_calls = 0
+
+    async def complete(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal completion_calls
+        completion_calls += 1
+        return {"content": "replacement", "usage": USAGE}
+
+    service = ChatService(store, None, completion=complete)
+
+    with pytest.raises(ValueError, match="invalid invalidation intent"):
+        if operation == "undo":
+            await service.undo(1)
+        else:
+            await service.retry(request())
+
+    assert await store.read_text(1, "chat.md") == before_chat
+    assert await store.read_text(1, "invalidation_intent.md") == malformed
+    assert completion_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_send_refuses_boundaryless_legacy_retry_state_before_completion(
+    tmp_path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 3):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    await store.write_text(1, "story_state.md", "must remain unchanged")
+    await store.save_state(
+        1,
+        MemoryState(
+            last_story_state_message=4,
+            cleanup_required=True,
+            rebuild_story_required=True,
+        ),
+    )
+    before_chat = await store.read_text(1, "chat.md")
+    completion_calls = 0
+
+    async def complete(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal completion_calls
+        completion_calls += 1
+        return {"content": "正文", "usage": USAGE}
+
+    with pytest.raises(ValueError, match="no persisted rebuild boundary"):
+        await ChatService(store, None, completion=complete).send(request())
+
+    assert completion_calls == 0
+    assert await store.read_text(1, "chat.md") == before_chat
+    assert await store.read_text(1, "story_state.md") == "must remain unchanged"
+
+
+@pytest.mark.asyncio
 async def test_send_builds_context_from_authoritative_markdown_and_domain_inputs(
     tmp_path,
 ) -> None:
@@ -485,6 +608,61 @@ async def test_stream_success_normalizes_opening_persists_then_emits_done(
         f"{REQUIRED_OPENING}\n\n正文继续",
     ]
     assert manager.submitted == [1]
+
+
+@pytest.mark.asyncio
+async def test_stream_recovers_unresolved_intent_before_context_and_provider(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 3):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    records = await store.load_chat(1)
+    await store.write_text(1, "story_state.md", "stale story")
+    await store.save_state(1, MemoryState(last_story_state_message=4))
+    real_replace = md_store_module.os.replace
+
+    def fail_state(source, target) -> None:
+        if target.name == "memory_state.md":
+            raise OSError("state marker failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_state)
+    with pytest.raises(OSError, match="state marker failed"):
+        await store.replace_final_pair(
+            1,
+            expected_user=records[-2],
+            expected_assistant=records[-1],
+            assistant_content="replacement assistant",
+        )
+    monkeypatch.setattr(md_store_module.os, "replace", real_replace)
+
+    async def stream(messages: list[dict[str, Any]]):
+        assert await store.read_text(1, "story_state.md") == ""
+        pipeline_lock = await store.pipeline_lock_for(1)
+        assert not pipeline_lock.locked()
+        yield "正文"
+        yield {"usage": USAGE}
+
+    events = await collect(
+        ChatService(store, None, stream_completion=stream).stream(
+            request(content="next")
+        )
+    )
+
+    assert events[-1].done
+    assert len(await store.load_chat(1)) == 6
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
 
 
 @pytest.mark.asyncio

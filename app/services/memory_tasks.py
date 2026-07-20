@@ -58,8 +58,17 @@ class MemoryTaskManager:
         await self.queue.put(session_id)
 
     @staticmethod
-    def _has_pending(total: int, state: MemoryState) -> bool:
-        if state.rebuild_required or state.checkpoint_exceeds(total):
+    def _has_pending(
+        total: int,
+        state: MemoryState,
+        *,
+        has_invalidation_intent: bool = False,
+    ) -> bool:
+        if (
+            has_invalidation_intent
+            or state.rebuild_required
+            or state.checkpoint_exceeds(total)
+        ):
             return True
         return any(
             (
@@ -91,13 +100,18 @@ class MemoryTaskManager:
             try:
                 async with store.transaction(session_id) as transaction:
                     records = await transaction.load_chat()
+                    intent = await transaction.load_invalidation_intent()
                 total = records[-1].number if records else 0
                 state = await memory.migrate_legacy_extract_checkpoint(
                     store,
                     session_id,
                     total,
                 )
-                if self._has_pending(total, state):
+                if self._has_pending(
+                    total,
+                    state,
+                    has_invalidation_intent=intent is not None,
+                ):
                     await self.submit(session_id)
             except Exception:
                 logger.exception(

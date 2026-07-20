@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import os
 import re
 import tempfile
@@ -44,6 +45,7 @@ class MemoryState:
     rebuild_summary_required: bool = False
     rebuild_rag_required: bool = False
     rebuild_assets_required: bool = False
+    rebuild_from_message: int | None = None
     last_error: str = ""
 
     @property
@@ -73,6 +75,21 @@ class _InvalidationPlan:
     message_number: int
     surviving_episode_end: int
     episode_files_to_delete: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class InvalidationIntent:
+    schema_version: int
+    operation_kind: str
+    boundary: int
+    old_chat_count: int
+    old_chat_sha256: str
+    target_chat_count: int
+    target_chat_sha256: str
+
+
+class InvalidationIntentError(ValueError):
+    """A persisted invalidation journal cannot be trusted or resolved."""
 
 
 _TIMESTAMP_PATTERN = r"(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}|unknown)"
@@ -107,6 +124,7 @@ _REBUILD_FIELDS = {
 }
 _STATE_NUMBER = r"(?:0|[1-9]\d*)"
 _STATE_BOOLEAN = r"(?:true|false)"
+_STATE_BOUNDARY = rf"(?:none|{_STATE_NUMBER})"
 _MEMORY_STATE_PREFIX = re.compile(
     r"\A# Memory State\n\n"
     rf"<!-- schema-version: (?P<schema_version>{_STATE_NUMBER}) -->\n"
@@ -125,9 +143,21 @@ _MEMORY_STATE_PREFIX = re.compile(
     rf"<!-- rebuild-summary-required: (?P<rebuild_summary_required>{_STATE_BOOLEAN}) -->\n"
     rf"<!-- rebuild-rag-required: (?P<rebuild_rag_required>{_STATE_BOOLEAN}) -->\n"
     rf"<!-- rebuild-assets-required: (?P<rebuild_assets_required>{_STATE_BOOLEAN}) -->\n"
+    rf"(?:<!-- rebuild-from-message: (?P<rebuild_from_message>{_STATE_BOUNDARY}) -->\n)?"
     r")?\n"
     r"## Last Error\n\n"
     rf"<!-- last-error-length: (?P<last_error_length>{_STATE_NUMBER}) -->\n"
+)
+_INTENT_SHA256 = r"[0-9a-f]{64}"
+_INVALIDATION_INTENT_DOCUMENT = re.compile(
+    r"\A# Invalidation Intent\n\n"
+    r"<!-- schema-version: (?P<schema_version>1) -->\n"
+    r"<!-- operation-kind: (?P<operation_kind>truncate|replace-final-pair) -->\n"
+    rf"<!-- boundary-message: (?P<boundary>{_STATE_NUMBER}) -->\n"
+    rf"<!-- old-chat-count: (?P<old_chat_count>{_STATE_NUMBER}) -->\n"
+    rf"<!-- old-chat-sha256: (?P<old_chat_sha256>{_INTENT_SHA256}) -->\n"
+    rf"<!-- target-chat-count: (?P<target_chat_count>{_STATE_NUMBER}) -->\n"
+    rf"<!-- target-chat-sha256: (?P<target_chat_sha256>{_INTENT_SHA256}) -->\n\Z"
 )
 
 _SAFE_CHARACTER_NAME = re.compile(r"[\w\u3400-\u9fff .-]{1,120}")
@@ -233,6 +263,14 @@ def _validate_memory_state(state: MemoryState) -> None:
     for field_name in _REBUILD_FIELDS.values():
         if type(getattr(state, field_name)) is not bool:
             raise ValueError("invalid memory state rebuild marker")
+    if (
+        state.rebuild_from_message is not None
+        and (
+            type(state.rebuild_from_message) is not int
+            or state.rebuild_from_message < 0
+        )
+    ):
+        raise ValueError("invalid memory state rebuild boundary")
     if not isinstance(state.last_error, str):
         raise ValueError("invalid memory state error")
 
@@ -485,6 +523,26 @@ class MarkdownMemoryStore:
         async with self.transaction(session_id) as transaction:
             await transaction.save_state(state)
 
+    async def recover_invalidation(self, session_id: int) -> None:
+        """Resolve journaled file cleanup under the pipeline lock, without LLMs."""
+        async with self.transaction(session_id) as transaction:
+            records = await transaction.load_chat()
+            total = records[-1].number if records else 0
+            intent = await transaction.load_invalidation_intent()
+            state = await transaction.load_state()
+            if (
+                intent is None
+                and not state.cleanup_required
+                and not state.checkpoint_exceeds(total)
+            ):
+                return
+        pipeline_lock = await self.pipeline_lock_for(session_id)
+        async with pipeline_lock:
+            async with self.transaction(session_id) as transaction:
+                records = await transaction.load_chat()
+                total = records[-1].number if records else 0
+                await transaction.recover_pending_invalidation(total)
+
     async def truncate_chat(
         self,
         session_id: int,
@@ -505,13 +563,30 @@ class MarkdownMemoryStore:
         async with pipeline_lock:
             async with self.transaction(session_id) as transaction:
                 records = await transaction.load_chat()
+                total = records[-1].number if records else 0
+                await transaction.recover_pending_invalidation(total)
                 if remove_count > len(records):
                     raise ValueError("remove_count exceeds available chat records")
                 retained = records[:-remove_count]
                 plan = await transaction.plan_invalidation(len(retained))
-                await transaction.write_text("chat.md", render_chat_records(retained))
+                intent = build_invalidation_intent(
+                    "truncate",
+                    boundary=len(retained),
+                    old_records=records,
+                    target_records=retained,
+                )
+                await transaction.save_invalidation_intent(intent)
+                try:
+                    await transaction.write_text(
+                        "chat.md",
+                        render_chat_records(retained),
+                    )
+                except Exception:
+                    await transaction.clear_invalidation_intent()
+                    raise
                 await transaction.start_invalidation(plan)
                 await transaction.finish_invalidation_cleanup(plan)
+                await transaction.clear_invalidation_intent()
                 return retained
 
     async def invalidate_after(
@@ -525,6 +600,7 @@ class MarkdownMemoryStore:
             async with self.transaction(session_id) as transaction:
                 records = await transaction.load_chat()
                 total = records[-1].number if records else 0
+                await transaction.recover_pending_invalidation(total)
                 if (
                     type(message_number) is not int
                     or message_number < 0
@@ -552,6 +628,8 @@ class MarkdownMemoryStore:
         async with pipeline_lock:
             async with self.transaction(session_id) as transaction:
                 records = await transaction.load_chat()
+                total = records[-1].number if records else 0
+                await transaction.recover_pending_invalidation(total)
                 if (
                     len(records) < 2
                     or records[-2] != expected_user
@@ -567,9 +645,24 @@ class MarkdownMemoryStore:
                 )
                 updated = [*prefix, expected_user, replacement]
                 plan = await transaction.plan_invalidation(len(prefix))
-                await transaction.write_text("chat.md", render_chat_records(updated))
+                intent = build_invalidation_intent(
+                    "replace-final-pair",
+                    boundary=len(prefix),
+                    old_records=records,
+                    target_records=updated,
+                )
+                await transaction.save_invalidation_intent(intent)
+                try:
+                    await transaction.write_text(
+                        "chat.md",
+                        render_chat_records(updated),
+                    )
+                except Exception:
+                    await transaction.clear_invalidation_intent()
+                    raise
                 await transaction.start_invalidation(plan)
                 await transaction.finish_invalidation_cleanup(plan)
+                await transaction.clear_invalidation_intent()
                 return updated
 
 
@@ -632,6 +725,80 @@ class MarkdownMemoryTransaction:
             render_memory_state(state),
         )
 
+    async def load_invalidation_intent(self) -> InvalidationIntent | None:
+        text = await self.read_text("invalidation_intent.md")
+        if not text:
+            return None
+        return parse_invalidation_intent(text)
+
+    async def save_invalidation_intent(self, intent: InvalidationIntent) -> None:
+        await self.write_text(
+            "invalidation_intent.md",
+            render_invalidation_intent(intent),
+        )
+
+    async def clear_invalidation_intent(self) -> None:
+        self._store.file_path(
+            self.session_id,
+            "invalidation_intent.md",
+        ).unlink(missing_ok=True)
+
+    async def resolve_invalidation_intent(self) -> bool:
+        """Resolve one journal by canonical old/target identity, old first."""
+        intent = await self.load_invalidation_intent()
+        if intent is None:
+            return False
+        records = await self.load_chat()
+        count = len(records)
+        digest = _chat_sha256(records)
+        if (
+            count == intent.old_chat_count
+            and digest == intent.old_chat_sha256
+        ):
+            await self.clear_invalidation_intent()
+            return True
+        if not (
+            count == intent.target_chat_count
+            and digest == intent.target_chat_sha256
+        ):
+            raise InvalidationIntentError(
+                "invalidation intent does not match authoritative chat"
+            )
+
+        plan = await self.plan_invalidation(intent.boundary)
+        await self.start_invalidation(plan)
+        await self.finish_invalidation_cleanup(plan)
+        await self.clear_invalidation_intent()
+        return True
+
+    async def recover_pending_invalidation(self, total: int) -> MemoryState:
+        """Resolve journal or legacy cleanup without inferring retry boundaries."""
+        if type(total) is not int or total < 0:
+            raise ValueError("total must be a nonnegative integer")
+        await self.resolve_invalidation_intent()
+        current = await self.load_state()
+        exceeds = current.checkpoint_exceeds(total)
+        if not current.cleanup_required and not exceeds:
+            return current
+        boundary = current.rebuild_from_message
+        if boundary is None:
+            if not exceeds:
+                raise InvalidationIntentError(
+                    "pending invalidation has no persisted rebuild boundary"
+                )
+            boundary = total
+        if boundary > total:
+            raise InvalidationIntentError(
+                "persisted rebuild boundary exceeds chat history"
+            )
+        plan = await self.plan_invalidation(boundary)
+        if exceeds:
+            await self.start_invalidation(plan)
+            current = await self.load_state()
+        if current.cleanup_required:
+            await self.finish_invalidation_cleanup(plan)
+        return await self.load_state()
+
     async def plan_invalidation(self, message_number: int) -> _InvalidationPlan:
         """Validate every cleanup input and return a read-only mutation plan."""
         from app.config import settings
@@ -691,6 +858,7 @@ class MarkdownMemoryTransaction:
                 rebuild_summary_required=force,
                 rebuild_rag_required=force,
                 rebuild_assets_required=force,
+                rebuild_from_message=plan.message_number,
             )
         )
 
@@ -800,6 +968,93 @@ def render_chat_records(records: list[ChatRecord]) -> str:
     return "".join(parts)
 
 
+def _chat_sha256(records: list[ChatRecord]) -> str:
+    canonical = render_chat_records(records).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_invalidation_intent(intent: InvalidationIntent) -> None:
+    if type(intent.schema_version) is not int or intent.schema_version != 1:
+        raise InvalidationIntentError("invalid invalidation intent")
+    if intent.operation_kind not in {"truncate", "replace-final-pair"}:
+        raise InvalidationIntentError("invalid invalidation intent")
+    for value in (intent.boundary, intent.old_chat_count, intent.target_chat_count):
+        if type(value) is not int or value < 0:
+            raise InvalidationIntentError("invalid invalidation intent")
+    for digest in (intent.old_chat_sha256, intent.target_chat_sha256):
+        if not isinstance(digest, str) or not re.fullmatch(_INTENT_SHA256, digest):
+            raise InvalidationIntentError("invalid invalidation intent")
+    if intent.operation_kind == "truncate":
+        valid_shape = (
+            intent.old_chat_count > intent.target_chat_count
+            and intent.target_chat_count == intent.boundary
+        )
+    else:
+        valid_shape = (
+            intent.old_chat_count == intent.target_chat_count
+            and intent.target_chat_count == intent.boundary + 2
+        )
+    if not valid_shape:
+        raise InvalidationIntentError("invalid invalidation intent")
+
+
+def build_invalidation_intent(
+    operation_kind: str,
+    *,
+    boundary: int,
+    old_records: list[ChatRecord],
+    target_records: list[ChatRecord],
+) -> InvalidationIntent:
+    """Build a content-free intent from canonical store chat bytes."""
+    intent = InvalidationIntent(
+        schema_version=1,
+        operation_kind=operation_kind,
+        boundary=boundary,
+        old_chat_count=len(old_records),
+        old_chat_sha256=_chat_sha256(old_records),
+        target_chat_count=len(target_records),
+        target_chat_sha256=_chat_sha256(target_records),
+    )
+    _validate_invalidation_intent(intent)
+    return intent
+
+
+def parse_invalidation_intent(text: str) -> InvalidationIntent:
+    """Parse one complete strict invalidation journal document."""
+    match = _INVALIDATION_INTENT_DOCUMENT.fullmatch(text)
+    if match is None:
+        raise InvalidationIntentError("invalid invalidation intent")
+    try:
+        intent = InvalidationIntent(
+            schema_version=int(match.group("schema_version")),
+            operation_kind=match.group("operation_kind"),
+            boundary=int(match.group("boundary")),
+            old_chat_count=int(match.group("old_chat_count")),
+            old_chat_sha256=match.group("old_chat_sha256"),
+            target_chat_count=int(match.group("target_chat_count")),
+            target_chat_sha256=match.group("target_chat_sha256"),
+        )
+    except (TypeError, ValueError):
+        raise InvalidationIntentError("invalid invalidation intent") from None
+    _validate_invalidation_intent(intent)
+    return intent
+
+
+def render_invalidation_intent(intent: InvalidationIntent) -> str:
+    """Render a validated content-free invalidation journal."""
+    _validate_invalidation_intent(intent)
+    return (
+        "# Invalidation Intent\n\n"
+        f"<!-- schema-version: {intent.schema_version} -->\n"
+        f"<!-- operation-kind: {intent.operation_kind} -->\n"
+        f"<!-- boundary-message: {intent.boundary} -->\n"
+        f"<!-- old-chat-count: {intent.old_chat_count} -->\n"
+        f"<!-- old-chat-sha256: {intent.old_chat_sha256} -->\n"
+        f"<!-- target-chat-count: {intent.target_chat_count} -->\n"
+        f"<!-- target-chat-sha256: {intent.target_chat_sha256} -->\n"
+    )
+
+
 def parse_memory_state(text: str) -> MemoryState:
     """Parse a complete V2 state, defaulting only absent/empty V1 state."""
     if not text.strip():
@@ -820,7 +1075,8 @@ def parse_memory_state(text: str) -> MemoryState:
             raise ValueError("invalid memory state error frame")
         error = text[error_start:error_end]
 
-    values: dict[str, bool | int | str] = {
+    boundary = match.group("rebuild_from_message")
+    values: dict[str, bool | int | str | None] = {
         "schema_version": int(match.group("schema_version")),
         **{
             field_name: int(match.group(field_name))
@@ -830,6 +1086,9 @@ def parse_memory_state(text: str) -> MemoryState:
             field_name: match.group(field_name) == "true"
             for field_name in _REBUILD_FIELDS.values()
         },
+        "rebuild_from_message": (
+            None if boundary in (None, "none") else int(boundary)
+        ),
         "last_error": error,
     }
     state = MemoryState(**values)
@@ -857,7 +1116,8 @@ def render_memory_state(state: MemoryState) -> str:
         f"<!-- rebuild-episode-required: {str(state.rebuild_episode_required).lower()} -->\n"
         f"<!-- rebuild-summary-required: {str(state.rebuild_summary_required).lower()} -->\n"
         f"<!-- rebuild-rag-required: {str(state.rebuild_rag_required).lower()} -->\n"
-        f"<!-- rebuild-assets-required: {str(state.rebuild_assets_required).lower()} -->\n\n"
+        f"<!-- rebuild-assets-required: {str(state.rebuild_assets_required).lower()} -->\n"
+        f"<!-- rebuild-from-message: {state.rebuild_from_message if state.rebuild_from_message is not None else 'none'} -->\n\n"
         "## Last Error\n\n"
         f"<!-- last-error-length: {len(state.last_error)} -->\n"
         f"{displayed_error}\n"

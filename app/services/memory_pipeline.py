@@ -8,7 +8,12 @@ from typing import Any
 
 from app.config import settings
 from app.services import llm, memory, rag, story_memory
-from app.services.md_store import ChatRecord, MarkdownMemoryStore, MemoryState
+from app.services.md_store import (
+    ChatRecord,
+    InvalidationIntentError,
+    MarkdownMemoryStore,
+    MemoryState,
+)
 
 
 class MemoryPipeline:
@@ -60,20 +65,10 @@ class MemoryPipeline:
         self,
         session_id: int,
         total: int,
-        state: MemoryState,
     ) -> MemoryState:
         """Resume cleanup or normalize checkpoints after a committed rollback."""
-        if not state.cleanup_required and not state.checkpoint_exceeds(total):
-            return state
         async with self.store.transaction(session_id) as transaction:
-            current = await transaction.load_state()
-            plan = await transaction.plan_invalidation(total)
-            if current.checkpoint_exceeds(total):
-                await transaction.start_invalidation(plan)
-                current = await transaction.load_state()
-            if current.cleanup_required:
-                await transaction.finish_invalidation_cleanup(plan)
-            return await transaction.load_state()
+            return await transaction.recover_pending_invalidation(total)
 
     @staticmethod
     def _pending_records(
@@ -104,11 +99,9 @@ class MemoryPipeline:
 
         total = records[-1].number if records else 0
         try:
-            state = await self._load_state(session_id)
             state = await self._recover_invalidation(
                 session_id,
                 total,
-                state,
             )
             state = await memory.migrate_legacy_extract_checkpoint(
                 self.store,
@@ -228,6 +221,8 @@ class MemoryPipeline:
                     rebuild_assets_required=False,
                     last_error="",
                 )
+        except InvalidationIntentError:
+            raise
         except Exception as exc:
             await self._save_changes(
                 session_id,
