@@ -4,8 +4,10 @@ import asyncio
 import datetime as dt
 import gc
 import hashlib
+import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+import subprocess
 import weakref
 
 import pytest
@@ -22,6 +24,7 @@ from app.services.md_store import (
     render_chat_records,
     render_memory_state,
 )
+from app.services.stage_receipts import chat_source_identity
 
 
 def test_record_and_state_models_are_frozen_with_v2_defaults() -> None:
@@ -133,6 +136,138 @@ def test_invalidation_intent_sanitizes_oversized_numeric_parse_errors() -> None:
         parse_invalidation_intent(text)
 
     assert str(captured.value) == "invalid invalidation intent"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x" * 4097,
+        "界" * 1366,
+    ],
+    ids=["character-limit", "utf8-byte-limit"],
+)
+def test_invalidation_intent_rejects_oversized_documents(
+    text: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    class FailRegex:
+        def fullmatch(self, value: str):
+            raise AssertionError("oversized invalidation intent reached regex")
+
+    monkeypatch.setattr(md_store_module, "_INVALIDATION_INTENT_DOCUMENT", FailRegex())
+
+    with pytest.raises(InvalidationIntentError) as captured:
+        md_store_module.parse_invalidation_intent(text)
+
+    assert str(captured.value) == "invalid invalidation intent"
+
+
+@pytest.mark.asyncio
+async def test_invalidation_intent_bounded_read_rejects_growth_after_small_stat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "old user",
+        "old assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "story_state.md", "unchanged story")
+    await store.save_state(1, MemoryState(last_story_state_message=2))
+    intent_path = store.file_path(1, "invalidation_intent.md")
+    intent_path.write_bytes(b"x" * 8192)
+    session = tmp_path / "1"
+    relatives = (
+        "chat.md",
+        "memory_state.md",
+        "story_state.md",
+        "invalidation_intent.md",
+    )
+    before = {relative: (session / relative).read_bytes() for relative in relatives}
+    real_stat = Path.stat
+    real_open = md_store_module.aiofiles.open
+    read_sizes: list[int] = []
+
+    class SmallStat:
+        st_size = 1
+
+    def fake_stat(path: Path, *args, **kwargs):
+        if path == intent_path:
+            return SmallStat()
+        return real_stat(path, *args, **kwargs)
+
+    class ReadSpy:
+        def __init__(self, *args, **kwargs) -> None:
+            self._context = real_open(*args, **kwargs)
+            self._handle = None
+
+        async def __aenter__(self):
+            self._handle = await self._context.__aenter__()
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return await self._context.__aexit__(exc_type, exc, traceback)
+
+        async def read(self, size: int = -1):
+            read_sizes.append(size)
+            return await self._handle.read(size)
+
+    def spy_open(path, *args, **kwargs):
+        if Path(path) == intent_path:
+            return ReadSpy(path, *args, **kwargs)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(md_store_module.aiofiles, "open", spy_open)
+
+    with pytest.raises(InvalidationIntentError) as captured:
+        await store.truncate_chat(1, remove_count=2)
+
+    assert str(captured.value) == "invalid invalidation intent"
+    assert read_sizes == [4097]
+    assert {
+        relative: (session / relative).read_bytes() for relative in relatives
+    } == before
+
+
+@pytest.mark.asyncio
+async def test_invalidation_intent_strict_utf8_decode_is_sanitized_without_mutation(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "old user",
+        "old assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "story_state.md", "unchanged story")
+    await store.save_state(1, MemoryState(last_story_state_message=2))
+    session = tmp_path / "1"
+    (session / "invalidation_intent.md").write_bytes(b"\xff")
+    relatives = (
+        "chat.md",
+        "memory_state.md",
+        "story_state.md",
+        "invalidation_intent.md",
+    )
+    before = {relative: (session / relative).read_bytes() for relative in relatives}
+
+    with pytest.raises(InvalidationIntentError) as captured:
+        await store.truncate_chat(1, remove_count=2)
+
+    assert str(captured.value) == "invalid invalidation intent"
+    assert {
+        relative: (session / relative).read_bytes() for relative in relatives
+    } == before
 
 
 def test_parse_empty_chat_returns_no_records() -> None:
@@ -859,6 +994,132 @@ def test_file_path_resolves_safe_nested_paths_under_session(tmp_path: Path) -> N
 
     assert path == (tmp_path / "4" / "episodes" / "episode-000001.md").resolve()
     assert path.is_relative_to(store.session_dir(4))
+
+
+@pytest.mark.asyncio
+async def test_store_rejects_final_symlink_reads_and_writes_but_deletes_link(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_record(1, "user", "authoritative", name="User")
+    chat_path = tmp_path / "1" / "chat.md"
+    chat_before = chat_path.read_bytes()
+    alias = tmp_path / "1" / "assets.md"
+    try:
+        alias.symlink_to(chat_path)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable on this platform: {exc}")
+
+    with pytest.raises(ValueError, match="safe relative path"):
+        store.file_path(1, "assets.md")
+    with pytest.raises(ValueError, match="safe relative path"):
+        await store.read_text(1, "assets.md")
+    with pytest.raises(ValueError, match="safe relative path"):
+        await store.write_text(1, "assets.md", "replacement")
+
+    await store.delete_file(1, "assets.md")
+
+    assert chat_path.read_bytes() == chat_before
+    assert not alias.exists()
+    assert not alias.is_symlink()
+
+
+@pytest.mark.parametrize("alias_kind", ["symlink", "junction"])
+@pytest.mark.asyncio
+async def test_session_directory_alias_cannot_reach_target_session(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    if alias_kind == "junction" and os.name != "nt":
+        pytest.skip("directory junctions are Windows-only")
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        2,
+        "target user",
+        "target assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    target_state = MemoryState(last_memory_message=2)
+    await store.save_state(2, target_state)
+    target = tmp_path / "2"
+    alias = tmp_path / "1"
+    if alias_kind == "symlink":
+        try:
+            alias.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks are unavailable: {exc}")
+    else:
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if created.returncode != 0:
+            pytest.skip(f"directory junctions are unavailable: {created.stderr}")
+    chat_before = (target / "chat.md").read_bytes()
+    state_before = (target / "memory_state.md").read_bytes()
+
+    with pytest.raises(ValueError, match="session path escaped memory base"):
+        await store.read_text(1, "chat.md")
+    with pytest.raises(ValueError, match="session path escaped memory base"):
+        await store.write_text(1, "assets.md", "must not write")
+    with pytest.raises(ValueError, match="session path escaped memory base"):
+        await store.delete_file(1, "chat.md")
+    with pytest.raises(ValueError, match="session path escaped memory base"):
+        await store.load_chat(1)
+    with pytest.raises(ValueError, match="session path escaped memory base"):
+        await store.append_record(1, "user", "must not append", name="User")
+    with pytest.raises(ValueError, match="session path escaped memory base"):
+        await store.load_state(1)
+    with pytest.raises(ValueError, match="session path escaped memory base"):
+        await store.save_state(1, MemoryState())
+
+    assert (target / "chat.md").read_bytes() == chat_before
+    assert (target / "memory_state.md").read_bytes() == state_before
+    assert not (target / "assets.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_invalidation_intent_alias_rejects_recovery_and_can_be_cleared(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "authoritative user",
+        "authoritative assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    pending = MemoryState(
+        cleanup_required=True,
+        rebuild_story_required=True,
+        rebuild_from_message=0,
+    )
+    await store.save_state(1, pending)
+    chat_path = tmp_path / "1" / "chat.md"
+    chat_before = chat_path.read_bytes()
+    alias = tmp_path / "1" / "invalidation_intent.md"
+    try:
+        alias.symlink_to(chat_path)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable on this platform: {exc}")
+
+    with pytest.raises(ValueError, match="safe relative path"):
+        await store.recover_invalidation(1)
+
+    assert chat_path.read_bytes() == chat_before
+    assert await store.load_state(1) == pending
+    assert alias.is_symlink()
+
+    async with store.transaction(1) as transaction:
+        await transaction.clear_invalidation_intent()
+
+    assert chat_path.read_bytes() == chat_before
+    assert not alias.exists()
+    assert not alias.is_symlink()
 
 
 def test_character_path_accepts_safe_unicode_name_and_cannot_escape(tmp_path: Path) -> None:
@@ -1750,7 +2011,7 @@ async def test_target_intent_rearms_cleanup_when_prior_boundary_is_identical(
 
 
 @pytest.mark.asyncio
-async def test_noncanonical_episode_size_fails_before_any_mutation(
+async def test_structurally_gapped_episode_fails_before_any_mutation(
     tmp_path: Path,
 ) -> None:
     store = MarkdownMemoryStore(tmp_path)
@@ -1763,7 +2024,7 @@ async def test_noncanonical_episode_size_fails_before_any_mutation(
             user_name="User",
         )
     await store.write_text(1, "story_state.md", "old story")
-    await store.write_text(1, "episodes/episode-000001.md", _episode_document(1, 1, 10))
+    await store.write_text(1, "episodes/episode-000001.md", _episode_document(1, 2, 11))
     await store.save_state(1, MemoryState(last_episode_message=10))
     before_chat = await store.read_text(1, "chat.md")
     before_state = await store.read_text(1, "memory_state.md")
@@ -1775,6 +2036,46 @@ async def test_noncanonical_episode_size_fails_before_any_mutation(
     assert await store.read_text(1, "chat.md") == before_chat
     assert await store.read_text(1, "memory_state.md") == before_state
     assert await store.read_text(1, "story_state.md") == before_story
+
+
+@pytest.mark.parametrize(
+    ("old_size", "current_size", "pairs"),
+    [(10, 20, 10), (20, 10, 20)],
+)
+@pytest.mark.asyncio
+async def test_historical_episode_size_change_deletes_incompatible_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    old_size: int,
+    current_size: int,
+    pairs: int,
+) -> None:
+    monkeypatch.setattr(settings, "episode_size_messages", current_size)
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, pairs + 1):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    total = pairs * 2
+    for number, start in enumerate(range(1, total + 1, old_size), start=1):
+        await store.write_text(
+            1,
+            f"episodes/episode-{number:06d}.md",
+            _episode_document(number, start, start + old_size - 1),
+        )
+    await store.save_state(1, MemoryState(last_episode_message=total))
+
+    await store.truncate_chat(1, remove_count=2)
+
+    state = await store.load_state(1)
+    assert len(await store.load_chat(1)) == total - 2
+    assert state.last_episode_message == 0
+    assert state.rebuild_episode_required
+    assert not list((tmp_path / "1" / "episodes").glob("episode-*.md"))
 
 
 @pytest.mark.parametrize(
@@ -1923,8 +2224,14 @@ async def test_rag_invalidate_discards_legacy_chunks_before_ranged_rebuild(
 
     await rag.invalidate_after(1, 6, store=store)
     invalidated = await rag.load_index(1, store=store)
-    rebuilt = await rag.build_index(1)
+    source = chat_source_identity(await store.load_chat(1))
+    result = await rag.build_index(1, store=store, source=source)
+    rebuilt = await rag.load_index(1, store=store)
 
+    assert result.stage == "rag"
+    assert result.completed is True
+    assert result.source == source
+    assert result.checkpoint == 8
     assert invalidated == {"chunks": [], "embeddings": [], "indexed_messages": 0}
     assert all(isinstance(chunk, dict) for chunk in rebuilt["chunks"])
     assert [

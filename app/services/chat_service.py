@@ -13,7 +13,7 @@ from typing import Any, Protocol
 from app.config import settings
 from app.schemas.api import WorldBookEntry
 from app.services.context_builder import ContextBuilder, ContextSources
-from app.services.md_store import ChatRecord, MarkdownMemoryStore
+from app.services.md_store import ChatRecord, MarkdownMemoryStore, MemoryState
 from app.services.output_guard import (
     _RETRY_CORRECTION,
     RefusalOpeningState,
@@ -48,6 +48,10 @@ class ContextBuilderLike(Protocol):
 
 class ContextBudgetExceeded(ValueError):
     """The mandatory protected prompt content cannot fit the configured budget."""
+
+
+class NoCompletePairError(ValueError):
+    """Authoritative history does not end with a complete mutable pair."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,17 +389,15 @@ class ChatService:
     ) -> list[dict[str, Any]]:
         if records is None:
             records = await self.store.load_chat(request.session_id)
+        state_before = await self.store.load_state(request.session_id)
         domain = await self._load_domain_context(request, records)
-        if discard_invalidated_context:
-            domain = replace(
-                domain,
-                story_state="",
-                character_profiles=(),
-                assets="",
-                episodes=(),
-                rag=(),
-                overall_summary="",
-            )
+        state_after = await self.store.load_state(request.session_id)
+        domain = self._suppress_pending_context(
+            domain,
+            (state_before, state_after),
+            total=len(records),
+            suppress_all=discard_invalidated_context,
+        )
         recent = [
             {"role": record.role, "content": record.content}
             for record in records
@@ -453,6 +455,57 @@ class ChatService:
             raise ContextBudgetExceeded(SAFE_CONTEXT_ERROR) from exc
         return copy.deepcopy(result.messages)
 
+    @staticmethod
+    def _suppress_pending_context(
+        domain: DomainContext,
+        states: Sequence[MemoryState],
+        *,
+        total: int,
+        suppress_all: bool,
+    ) -> DomainContext:
+        def boundary_is_invalid(state: MemoryState) -> bool:
+            boundary = state.rebuild_from_message
+            if state.rebuild_required:
+                return boundary is None or boundary > total
+            return boundary is not None
+
+        suppress_all = suppress_all or any(
+            state.cleanup_required or boundary_is_invalid(state)
+            for state in states
+        )
+        suppress_story = suppress_all or any(
+            state.rebuild_story_required for state in states
+        )
+        suppress_memory = suppress_all or any(
+            state.rebuild_memory_required for state in states
+        )
+        suppress_episodes = suppress_all or any(
+            state.rebuild_episode_required for state in states
+        )
+        suppress_summary = suppress_all or any(
+            state.rebuild_summary_required for state in states
+        )
+        suppress_rag = suppress_all or any(
+            state.rebuild_rag_required for state in states
+        )
+        suppress_assets = suppress_all or any(
+            state.rebuild_assets_required for state in states
+        )
+        return replace(
+            domain,
+            story_state="" if suppress_story else domain.story_state,
+            memory="" if suppress_memory else domain.memory,
+            character_profiles=(
+                () if suppress_memory else domain.character_profiles
+            ),
+            assets="" if suppress_assets else domain.assets,
+            episodes=() if suppress_episodes else domain.episodes,
+            rag=() if suppress_rag else domain.rag,
+            overall_summary=(
+                "" if suppress_summary else domain.overall_summary
+            ),
+        )
+
     async def _load_domain_context(
         self,
         request: TurnRequest,
@@ -504,7 +557,9 @@ class ChatService:
             or records[-2].role != "user"
             or records[-1].role != "assistant"
         ):
-            raise ValueError("chat must end with a complete user/assistant pair")
+            raise NoCompletePairError(
+                "chat must end with a complete user/assistant pair"
+            )
         return records[-2], records[-1]
 
     @staticmethod

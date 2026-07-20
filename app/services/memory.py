@@ -11,11 +11,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-import aiofiles
-
 from app.services.llm import chat_completion
 from app.config import settings
 from app.services.md_store import MarkdownMemoryStore, MemoryState
+from app.services.stage_receipts import (
+    ChatSourceIdentity,
+    StageUpdateResult,
+    text_artifact,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,16 +79,6 @@ def normalize_character_name(name: str) -> str:
     """Remove parenthetical suffixes like （升级档案） or (upgraded) from character names."""
     name = re.sub(r'[（(][^）)]*[）)]', '', name)
     return name.strip()
-
-
-def _session_dir(session_id: int) -> Path:
-    return MEMORY_BASE / str(session_id)
-
-
-def _ensure_dir(session_id: int) -> Path:
-    d = _session_dir(session_id)
-    d.mkdir(parents=True, exist_ok=True)
-    return d
 
 
 # ── 1. append_chat_md ───────────────────────────────────────────────────────
@@ -218,11 +211,7 @@ async def save_memory(session_id: int, memory_text: str) -> None:
 
 async def load_memory(session_id: int) -> str:
     """Read memory.md, return empty string if not found."""
-    path = _session_dir(session_id) / "memory.md"
-    if not path.exists():
-        return ""
-    async with aiofiles.open(path, mode="r", encoding="utf-8") as f:
-        return await f.read()
+    return await md_store.read_text(session_id, "memory.md")
 
 
 # Keywords that mark "always include" blocks
@@ -333,11 +322,7 @@ async def save_context_snapshot(session_id: int, snapshot: str) -> None:
 
 async def load_context_snapshot(session_id: int) -> str:
     """Read context.md, return empty string if not found."""
-    path = _session_dir(session_id) / "context.md"
-    if not path.exists():
-        return ""
-    async with aiofiles.open(path, mode="r", encoding="utf-8") as f:
-        return await f.read()
+    return await md_store.read_text(session_id, "context.md")
 
 
 # ── 7. extract_memory ──────────────────────────────────────────────────────
@@ -408,7 +393,10 @@ async def extract_memory_and_characters(
     session_id: int,
     recent_messages: list[dict[str, str]],
     backend_config: dict[str, Any],
-) -> None:
+    *,
+    store: MarkdownMemoryStore | None = None,
+    source: ChatSourceIdentity,
+) -> StageUpdateResult:
     """Single LLM call that extracts both global memory and character profiles.
 
     Output format from LLM:
@@ -417,13 +405,31 @@ async def extract_memory_and_characters(
         <character profiles or NO_CHANGE>
     """
     try:
-        existing_memory = await load_memory(session_id)
+        active_store = store or md_store
+        existing_memory = (
+            await active_store.read_text(session_id, "memory.md")
+            if store is not None
+            else await load_memory(session_id)
+        )
 
         # Load existing character profiles for context
-        names = await list_character_names(session_id)
+        names = (
+            sorted(
+                path.stem
+                for path in (
+                    active_store.session_dir(session_id) / "characters"
+                ).glob("*.md")
+            )
+            if store is not None
+            else await list_character_names(session_id)
+        )
         existing_characters = ""
         for name in names:
-            p = await load_character_profile(session_id, name)
+            p = (
+                await active_store.read_text(session_id, f"characters/{name}.md")
+                if store is not None
+                else await load_character_profile(session_id, name)
+            )
             if p:
                 existing_characters += f"\n\n---\n{p}"
 
@@ -474,7 +480,10 @@ async def extract_memory_and_characters(
                 updated = _merge_memory(existing_memory, memory_part)
             else:
                 updated = MEMORY_TEMPLATE.rstrip() + "\n\n" + memory_part
-            await save_memory(session_id, updated)
+            if store is not None:
+                await active_store.write_text(session_id, "memory.md", updated)
+            else:
+                await save_memory(session_id, updated)
             logger.info(f"Memory extracted for session {session_id}")
 
         # Save character profiles
@@ -489,7 +498,15 @@ async def extract_memory_and_characters(
                 if match:
                     char_name = match.group(1).strip()
                     char_name = normalize_character_name(char_name)
-                    await save_character_profile(session_id, char_name, block)
+                    if store is not None:
+                        active_store.character_path(session_id, char_name)
+                        await active_store.write_text(
+                            session_id,
+                            f"characters/{char_name}.md",
+                            block,
+                        )
+                    else:
+                        await save_character_profile(session_id, char_name, block)
                     updated_count += 1
                     logger.info(f"Character profile updated: {char_name} (session {session_id})")
             if updated_count:
@@ -497,9 +514,122 @@ async def extract_memory_and_characters(
         else:
             logger.info(f"No character changes for session {session_id}")
 
+        artifacts = []
+        memory_path = active_store.file_path(session_id, "memory.md")
+        if memory_path.exists():
+            text = await active_store.read_text(session_id, "memory.md")
+            artifacts.append(text_artifact("memory.md", text))
+        character_directory = active_store.session_dir(session_id) / "characters"
+        if character_directory.exists():
+            for path in sorted(character_directory.glob("*.md")):
+                relative = f"characters/{path.name}"
+                text = await active_store.read_text(session_id, relative)
+                artifacts.append(text_artifact(relative, text))
+        return StageUpdateResult(
+            stage="memory",
+            completed=True,
+            source=source,
+            checkpoint=source.count,
+            artifacts=tuple(artifacts),
+        )
+
     except Exception as exc:
         logger.error(f"Unified memory+character extraction failed for session {session_id}: {exc}")
         raise
+
+
+async def rebuild_memory_and_profiles(
+    session_id: int,
+    all_messages: list[dict[str, str]],
+    backend_config: dict[str, Any],
+    *,
+    store: MarkdownMemoryStore,
+    source: ChatSourceIdentity,
+) -> StageUpdateResult:
+    """Replace memory and the complete profile set from authoritative chat only."""
+    conversation_text = "\n".join(
+        f"{message.get('role', 'user')}: {message.get('content', '')}"
+        for message in all_messages
+    )
+    prompt = (
+        f"## Full Authoritative Conversation\n{conversation_text}\n\n"
+        "Produce a complete replacement memory document, then the exact complete "
+        "character profile set after ===CHARACTERS===. Use NO_CHANGE after the "
+        "marker only when the complete profile set is empty."
+    )
+    extraction = (await chat_completion(
+        provider=backend_config["provider"],
+        api_key=backend_config["api_key"],
+        model=backend_config["model"],
+        base_url=backend_config["base_url"],
+        messages=[
+            {"role": "system", "content": EXTRACTION_FULL_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        params=backend_config.get("params", {}),
+    ))["content"]
+    if _contains_refusal(extraction):
+        raise MemoryRefusalError("memory output contained refusal content")
+    marker = "===CHARACTERS==="
+    if extraction.count(marker) != 1:
+        raise ValueError("full memory rebuild output is missing its profile boundary")
+    memory_part, profiles_part = (
+        part.strip() for part in extraction.split(marker, 1)
+    )
+    if not memory_part or not re.search(r"^#\s+", memory_part, re.MULTILINE):
+        raise ValueError("full memory rebuild output is not a complete document")
+
+    desired_profiles: dict[str, str] = {}
+    if profiles_part != "NO_CHANGE":
+        for raw_block in re.split(r"\n---\n", profiles_part):
+            block = raw_block.strip()
+            match = re.match(r"^#\s+(.+)$", block, re.MULTILINE)
+            if not block or match is None:
+                raise ValueError("full profile rebuild output is invalid")
+            name = normalize_character_name(match.group(1).strip())
+            if name in desired_profiles:
+                raise ValueError("full profile rebuild contains duplicate names")
+            store.character_path(session_id, name)
+            desired_profiles[name] = block + "\n"
+
+    try:
+        character_directory = store.file_path(
+            session_id,
+            "characters/.profile-preflight",
+        ).parent
+    except ValueError as exc:
+        raise ValueError(
+            "character profile directory escaped session directory"
+        ) from exc
+    existing_profiles = (
+        sorted(character_directory.glob("*.md"), reverse=True)
+        if character_directory.exists()
+        else []
+    )
+
+    memory_document = memory_part + "\n"
+    await store.write_text(session_id, "memory.md", memory_document)
+    for name, document in desired_profiles.items():
+        await store.write_text(session_id, f"characters/{name}.md", document)
+    for path in existing_profiles:
+        if path.stem not in desired_profiles:
+            await store.delete_file(
+                session_id,
+                f"characters/{path.name}",
+            )
+
+    artifacts = [text_artifact("memory.md", memory_document)]
+    artifacts.extend(
+        text_artifact(f"characters/{name}.md", document)
+        for name, document in sorted(desired_profiles.items())
+    )
+    return StageUpdateResult(
+        stage="memory",
+        completed=True,
+        source=source,
+        checkpoint=source.count,
+        artifacts=tuple(artifacts),
+    )
 
 
 # ── 7a. Asset Tracking ─────────────────────────────────────────────────────
@@ -544,11 +674,7 @@ def is_asset_relevant(text: str) -> bool:
 
 async def load_assets(session_id: int) -> str:
     """Load full asset record from assets.md."""
-    p = _session_dir(session_id) / "assets.md"
-    if not p.exists():
-        return ""
-    async with aiofiles.open(p, mode="r", encoding="utf-8") as f:
-        return await f.read()
+    return await md_store.read_text(session_id, "assets.md")
 
 
 async def save_assets(session_id: int, content: str) -> None:
@@ -558,11 +684,7 @@ async def save_assets(session_id: int, content: str) -> None:
 
 async def load_assets_summary(session_id: int) -> str:
     """Load one-line asset summary from assets_summary.txt."""
-    p = _session_dir(session_id) / "assets_summary.txt"
-    if not p.exists():
-        return ""
-    async with aiofiles.open(p, mode="r", encoding="utf-8") as f:
-        return (await f.read()).strip()
+    return (await md_store.read_text(session_id, "assets_summary.txt")).strip()
 
 
 async def save_assets_summary(session_id: int, summary: str) -> None:
@@ -574,11 +696,19 @@ async def update_assets(
     session_id: int,
     recent_messages: list[dict[str, str]],
     backend_config: dict[str, Any],
-) -> bool:
+    *,
+    store: MarkdownMemoryStore | None = None,
+    source: ChatSourceIdentity,
+) -> StageUpdateResult:
     """Detect asset changes from recent messages and update assets.md + summary.
     Returns True if assets were updated."""
     try:
-        existing_assets = await load_assets(session_id)
+        active_store = store or md_store
+        existing_assets = (
+            await active_store.read_text(session_id, "assets.md")
+            if store is not None
+            else await load_assets(session_id)
+        )
 
         conversation_text = "\n".join(
             f"{m.get('role', 'user')}: {m.get('content', '')}"
@@ -619,9 +749,27 @@ async def update_assets(
                     messages=summary_messages,
                     params=backend_config.get("params", {}),
                 ))["content"]
-                await save_assets_summary(session_id, summary.strip())
+                if store is not None:
+                    await active_store.write_text(
+                        session_id,
+                        "assets_summary.txt",
+                        summary.strip(),
+                    )
+                else:
+                    await save_assets_summary(session_id, summary.strip())
             logger.info(f"No asset changes for session {session_id}")
-            return False
+            artifacts = []
+            for relative in ("assets.md", "assets_summary.txt"):
+                if active_store.file_path(session_id, relative).exists():
+                    text = await active_store.read_text(session_id, relative)
+                    artifacts.append(text_artifact(relative, text))
+            return StageUpdateResult(
+                stage="assets",
+                completed=True,
+                source=source,
+                checkpoint=source.count,
+                artifacts=tuple(artifacts),
+            )
 
         # Prepare the summary before replacing either persisted asset view.
         summary_messages = [
@@ -636,14 +784,99 @@ async def update_assets(
             messages=summary_messages,
             params=backend_config.get("params", {}),
         ))["content"]
-        await save_assets(session_id, result.strip())
-        await save_assets_summary(session_id, summary.strip())
+        if store is not None:
+            await active_store.write_text(session_id, "assets.md", result.strip())
+            await active_store.write_text(
+                session_id,
+                "assets_summary.txt",
+                summary.strip(),
+            )
+        else:
+            await save_assets(session_id, result.strip())
+            await save_assets_summary(session_id, summary.strip())
         logger.info(f"Assets updated for session {session_id}")
-        return True
+        return StageUpdateResult(
+            stage="assets",
+            completed=True,
+            source=source,
+            checkpoint=source.count,
+            artifacts=(
+                text_artifact("assets.md", result.strip()),
+                text_artifact("assets_summary.txt", summary.strip()),
+            ),
+        )
 
     except Exception as exc:
         logger.error(f"Asset update failed for session {session_id}: {exc}")
         raise
+
+
+async def rebuild_assets(
+    session_id: int,
+    all_messages: list[dict[str, str]],
+    backend_config: dict[str, Any],
+    *,
+    store: MarkdownMemoryStore,
+    source: ChatSourceIdentity,
+) -> StageUpdateResult:
+    """Replace both asset views from authoritative chat without a stale baseline."""
+    conversation_text = "\n".join(
+        f"{message.get('role', 'user')}: {message.get('content', '')}"
+        for message in all_messages
+    )
+    result = (await chat_completion(
+        provider=backend_config["provider"],
+        api_key=backend_config["api_key"],
+        model=backend_config["model"],
+        base_url=backend_config["base_url"],
+        messages=[
+            {"role": "system", "content": ASSET_EXTRACTION_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"## Full Authoritative Conversation\n{conversation_text}\n\n"
+                    "Produce the complete replacement asset record from an empty baseline."
+                ),
+            },
+        ],
+        params=backend_config.get("params", {}),
+    ))["content"].strip()
+    if result == "NO_CHANGE":
+        await store.delete_file(session_id, "assets.md")
+        await store.delete_file(session_id, "assets_summary.txt")
+        return StageUpdateResult(
+            stage="assets",
+            completed=True,
+            source=source,
+            checkpoint=source.count,
+        )
+    if not result:
+        raise ValueError("full asset rebuild output was empty")
+    summary = (await chat_completion(
+        provider=backend_config["provider"],
+        api_key=backend_config["api_key"],
+        model=backend_config["model"],
+        base_url=backend_config["base_url"],
+        messages=[
+            {"role": "system", "content": ASSET_SUMMARY_PROMPT},
+            {"role": "user", "content": result},
+        ],
+        params=backend_config.get("params", {}),
+    ))["content"].strip()
+    if not summary:
+        raise ValueError("full asset rebuild summary was empty")
+    await store.write_text(session_id, "assets.md", result)
+    await store.write_text(session_id, "assets_summary.txt", summary)
+    return StageUpdateResult(
+        stage="assets",
+        completed=True,
+        source=source,
+        checkpoint=source.count,
+        artifacts=(
+            text_artifact("assets.md", result),
+            text_artifact("assets_summary.txt", summary),
+        ),
+    )
 
 
 # ── 7a2. Character Profiles ─────────────────────────────────────────────────
@@ -672,27 +905,22 @@ CHARACTER_EXTRACTION_PROMPT = (
 )
 
 
-def _characters_dir(session_id: int) -> Path:
-    d = _session_dir(session_id) / "characters"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
 async def list_character_names(session_id: int) -> list[str]:
     """Return list of known character names from .md files."""
-    d = _session_dir(session_id) / "characters"
+    d = md_store.file_path(session_id, "characters/.list-preflight").parent
     if not d.exists():
         return []
-    return [p.stem for p in d.glob("*.md")]
+    names: list[str] = []
+    for path in d.glob("*.md"):
+        md_store.file_path(session_id, f"characters/{path.name}")
+        names.append(path.stem)
+    return names
 
 
 async def load_character_profile(session_id: int, name: str) -> str:
     """Load a single character's profile."""
-    p = _session_dir(session_id) / "characters" / f"{name}.md"
-    if not p.exists():
-        return ""
-    async with aiofiles.open(p, mode="r", encoding="utf-8") as f:
-        return await f.read()
+    md_store.character_path(session_id, name)
+    return await md_store.read_text(session_id, f"characters/{name}.md")
 
 
 async def save_character_profile(session_id: int, name: str, content: str) -> None:
@@ -1101,11 +1329,7 @@ SUMMARY_SYSTEM_PROMPT = (
 
 async def load_summary(session_id: int) -> str:
     """Read summary.md, return empty string if not found."""
-    path = _session_dir(session_id) / "summary.md"
-    if not path.exists():
-        return ""
-    async with aiofiles.open(path, mode="r", encoding="utf-8") as f:
-        return await f.read()
+    return await md_store.read_text(session_id, "summary.md")
 
 
 async def save_summary(session_id: int, text: str) -> None:

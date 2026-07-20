@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from app.config import settings
 from app.services.chat_service import (
     ChatService,
     ContextBudgetExceeded,
     DomainContext,
+    NoCompletePairError,
     StreamEvent,
     TurnRequest,
 )
@@ -402,6 +405,124 @@ async def test_send_builds_context_from_authoritative_markdown_and_domain_inputs
     assert sources.summary == "SUMMARY"
     assert sources.user_message == "继续。"
     assert received == [builder.messages]
+
+
+@pytest.mark.parametrize(
+    ("flag", "suppressed_fields"),
+    [
+        ("rebuild_story_required", {"story_state"}),
+        ("rebuild_memory_required", {"memory", "character_profiles"}),
+        ("rebuild_episode_required", {"episodes"}),
+        ("rebuild_summary_required", {"summary"}),
+        ("rebuild_rag_required", {"rag"}),
+        ("rebuild_assets_required", {"assets"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_send_suppresses_each_pending_derived_context_layer(
+    tmp_path,
+    flag: str,
+    suppressed_fields: set[str],
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "authoritative recent user",
+        "authoritative recent assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.save_state(
+        1,
+        MemoryState(**{flag: True}, rebuild_from_message=2),
+    )
+    builder = CapturingBuilder()
+
+    async def complete(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        return {"content": "正文", "usage": USAGE}
+
+    await ChatService(
+        store,
+        None,
+        completion=complete,
+        context_builder=builder,
+    ).send(
+        request(
+            story_state="STALE_STORY",
+            memory="STALE_MEMORY",
+            character_profiles=["STALE_PROFILE"],
+            assets="STALE_ASSETS",
+            episodes=["STALE_EPISODE"],
+            rag=["STALE_RAG"],
+            overall_summary="STALE_SUMMARY",
+        )
+    )
+
+    sources = builder.sources[0]
+    values = {
+        "story_state": sources.story_state,
+        "memory": sources.memory,
+        "character_profiles": sources.character_profiles,
+        "assets": sources.assets,
+        "episodes": sources.episodes,
+        "rag": sources.rag,
+        "summary": sources.summary,
+    }
+    stale = {
+        "story_state": "STALE_STORY",
+        "memory": "STALE_MEMORY",
+        "character_profiles": ["STALE_PROFILE"],
+        "assets": "STALE_ASSETS",
+        "episodes": ["STALE_EPISODE"],
+        "rag": ["STALE_RAG"],
+        "summary": "STALE_SUMMARY",
+    }
+    expected = dict(stale)
+    for field in suppressed_fields:
+        expected[field] = [] if isinstance(stale[field], list) else ""
+    assert values == expected
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        MemoryState(cleanup_required=True, rebuild_from_message=0),
+        MemoryState(rebuild_story_required=True),
+    ],
+    ids=["cleanup", "missing-boundary"],
+)
+@pytest.mark.asyncio
+async def test_context_snapshot_anomalies_suppress_all_derived_layers(
+    tmp_path,
+    state: MemoryState,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.save_state(1, state)
+    builder = CapturingBuilder()
+    service = ChatService(store, None, context_builder=builder)
+    turn_lock = await store.turn_lock_for(1)
+
+    async with turn_lock:
+        await service._build_messages(
+            request(
+                story_state="STALE_STORY",
+                memory="STALE_MEMORY",
+                character_profiles=["STALE_PROFILE"],
+                assets="STALE_ASSETS",
+                episodes=["STALE_EPISODE"],
+                rag=["STALE_RAG"],
+                overall_summary="STALE_SUMMARY",
+            )
+        )
+
+    sources = builder.sources[0]
+    assert sources.story_state == ""
+    assert sources.memory == ""
+    assert sources.character_profiles == []
+    assert sources.assets == ""
+    assert sources.episodes == []
+    assert sources.rag == []
+    assert sources.summary == ""
 
 
 @pytest.mark.asyncio
@@ -1387,6 +1508,90 @@ async def test_stream_holds_same_session_turn_lock_until_normal_completion(
     assert send_started.is_set()
 
 
+@pytest.mark.parametrize(
+    "pending_case",
+    ["memory-assets", "cleanup", "missing-boundary"],
+)
+@pytest.mark.asyncio
+async def test_stream_provider_never_receives_pending_stale_derived_context(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_case: str,
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "AUTHORITATIVE_RECENT_USER",
+        "AUTHORITATIVE_RECENT_ASSISTANT",
+        char_name="Character",
+        user_name="User",
+    )
+    if pending_case == "memory-assets":
+        await store.save_state(
+            1,
+            MemoryState(
+                rebuild_memory_required=True,
+                rebuild_assets_required=True,
+                rebuild_from_message=2,
+            ),
+        )
+
+    stale = DomainContext(
+        story_state="STALE_STORY",
+        memory="STALE_MEMORY",
+        character_profiles=["STALE_PROFILE"],
+        assets="STALE_ASSETS",
+        episodes=["STALE_EPISODE"],
+        rag=["STALE_RAG"],
+        overall_summary="STALE_SUMMARY",
+    )
+
+    async def load_domain(records):
+        if pending_case == "cleanup":
+            await store.save_state(
+                1,
+                MemoryState(cleanup_required=True, rebuild_from_message=2),
+            )
+        elif pending_case == "missing-boundary":
+            await store.save_state(1, MemoryState(rebuild_story_required=True))
+        return stale
+
+    captured: list[list[dict[str, Any]]] = []
+
+    async def stream(messages: list[dict[str, Any]]):
+        captured.append(messages)
+        yield "正文"
+
+    events = await collect(
+        ChatService(
+            store,
+            None,
+            stream_completion=stream,
+            domain_context_loader=load_domain,
+        ).stream(request(content="AUTHORITATIVE_INPUT"))
+    )
+
+    assert events[-1].done
+    provider_text = "\n".join(
+        str(message.get("content", "")) for message in captured[0]
+    )
+    assert "AUTHORITATIVE_RECENT_USER" in provider_text
+    assert "AUTHORITATIVE_RECENT_ASSISTANT" in provider_text
+    assert "AUTHORITATIVE_INPUT" in provider_text
+    assert "STALE_MEMORY" not in provider_text
+    assert "STALE_PROFILE" not in provider_text
+    assert "STALE_ASSETS" not in provider_text
+    if pending_case != "memory-assets":
+        for marker in (
+            "STALE_STORY",
+            "STALE_EPISODE",
+            "STALE_RAG",
+            "STALE_SUMMARY",
+        ):
+            assert marker not in provider_text
+
+
 @pytest.mark.asyncio
 async def test_stream_context_budget_failure_emits_safe_error(tmp_path) -> None:
     class FailingBuilder:
@@ -1498,7 +1703,7 @@ async def test_retry_replaces_exactly_one_final_pair_from_logically_retained_his
         {"role": "assistant", "content": "prefix assistant"},
     ]
     assert sources.user_message == "retry this"
-    assert sources.memory == "preserved memory"
+    assert sources.memory == ""
     assert sources.story_state == ""
     assert sources.summary == ""
     assert sources.episodes == []
@@ -1644,6 +1849,106 @@ async def test_retry_submit_failure_keeps_single_committed_pair(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_retry_of_only_pair_arms_full_rebuild_from_replacement_pair(
+    tmp_path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "only user",
+        "only assistant",
+        char_name="Character",
+        user_name="User",
+    )
+
+    async def complete(messages):
+        return {"content": "replacement", "usage": USAGE}
+
+    await ChatService(store, MemoryManager(), completion=complete).retry(request())
+
+    state = await store.load_state(1)
+    assert state.rebuild_from_message == 0
+    assert state.rebuild_story_required
+    assert state.rebuild_memory_required
+    assert state.rebuild_episode_required
+    assert state.rebuild_summary_required
+    assert state.rebuild_rag_required
+    assert state.rebuild_assets_required
+
+
+@pytest.mark.asyncio
+async def test_undo_only_pair_reconciles_all_active_derivations_to_empty(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "episode_size_messages", 2)
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "only user",
+        "only assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "memory.md", "STALE_MEMORY")
+    await store.write_text(1, "characters/Old.md", "# Old\n\nSTALE_PROFILE\n")
+    await store.write_text(1, "assets.md", "STALE_ASSETS")
+    await store.write_text(1, "assets_summary.txt", "STALE_ASSET_SUMMARY")
+    await store.write_text(1, "story_state.md", "STALE_STORY")
+    await store.write_text(1, "summary.md", "STALE_SUMMARY")
+    await store.write_text(
+        1,
+        "episodes/episode-000001.md",
+        "# Episode 000001\n\n"
+        "<!-- messages: 1-2 -->\n\n"
+        "## 剧情摘要\n- stale\n\n"
+        "## 状态变化\n- stale\n\n"
+        "## 承诺与伏笔\n- stale\n",
+    )
+    await store.write_text(
+        1,
+        "rag/index.json",
+        '{"chunks": [{"text": "stale", "start_message": 1, '
+        '"end_message": 2}], "embeddings": [[1.0]], "indexed_messages": 2}',
+    )
+    await store.save_state(
+        1,
+        MemoryState(
+            last_memory_message=2,
+            last_story_state_message=2,
+            last_summary_message=2,
+            last_episode_message=2,
+            last_rag_message=2,
+            last_character_message=2,
+            last_assets_message=2,
+        ),
+    )
+
+    await ChatService(store, MemoryManager()).undo(1)
+
+    session = tmp_path / "1"
+    assert await store.load_chat(1) == []
+    assert await store.load_state(1) == MemoryState()
+    assert not (session / "memory.md").exists()
+    assert not list((session / "characters").glob("*.md"))
+    assert not (session / "assets.md").exists()
+    assert not (session / "assets_summary.txt").exists()
+    assert await store.read_text(1, "story_state.md") == ""
+    assert await store.read_text(1, "summary.md") == ""
+    assert not list((session / "episodes").glob("episode-*.md"))
+    assert json.loads(await store.read_text(1, "rag/index.json")) == {
+        "chunks": [],
+        "embeddings": [],
+        "indexed_messages": 0,
+        "source_count": 0,
+        "source_sha256": (
+            "e3b0c44298fc1c149afbf4c8996fb924"
+            "27ae41e4649b934ca495991b7852b855"
+        ),
+    }
+
+
+@pytest.mark.asyncio
 async def test_undo_removes_one_complete_pair_invalidates_and_submits(tmp_path) -> None:
     store = MarkdownMemoryStore(tmp_path)
     await _seed_retry_pair(store)
@@ -1667,11 +1972,42 @@ async def test_undo_rejects_incomplete_final_pair_without_side_effects(tmp_path)
     original = await store.read_text(1, "chat.md")
     manager = MemoryManager()
 
-    with pytest.raises(ValueError, match="complete user/assistant pair"):
+    with pytest.raises(NoCompletePairError, match="complete user/assistant pair"):
         await ChatService(store, manager).undo(1)
 
     assert await store.read_text(1, "chat.md") == original
     assert manager.submitted == []
+
+
+@pytest.mark.parametrize("history", ["empty", "incomplete"])
+@pytest.mark.parametrize("operation", ["undo", "retry"])
+@pytest.mark.asyncio
+async def test_mutating_commands_raise_narrow_error_for_no_complete_pair(
+    tmp_path,
+    history: str,
+    operation: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    if history == "incomplete":
+        await store.append_record(1, "user", "incomplete", name="User")
+    original = await store.read_text(1, "chat.md")
+    completion_calls = 0
+
+    async def complete(messages):
+        nonlocal completion_calls
+        completion_calls += 1
+        return {"content": "must not run", "usage": {}}
+
+    service = ChatService(store, MemoryManager(), completion=complete)
+
+    with pytest.raises(NoCompletePairError):
+        if operation == "undo":
+            await service.undo(1)
+        else:
+            await service.retry(request())
+
+    assert await store.read_text(1, "chat.md") == original
+    assert completion_calls == 0
 
 
 @pytest.mark.asyncio

@@ -13,11 +13,16 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import aiofiles
 import httpx
 
 from app.config import settings
 from app.services.md_store import ChatRecord, MarkdownMemoryStore
+from app.services.stage_receipts import (
+    ChatSourceIdentity,
+    StageUpdateResult,
+    chat_source_identity,
+    text_artifact,
+)
 
 if TYPE_CHECKING:
     from app.services.md_store import MarkdownMemoryTransaction
@@ -30,16 +35,6 @@ MEMORY_BASE = Path("data/memory")
 CHUNK_SIZE = 5  # messages per chunk
 EMBEDDING_DIM = 1536  # will auto-detect on first call
 TOP_K_DEFAULT = 10
-
-
-def _index_dir(session_id: int) -> Path:
-    d = MEMORY_BASE / str(session_id) / "rag"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-# ── Embedding ─────────────────────────────────────────────────────────────
-
 
 # ── Local model singleton ─────────────────────────────────────────────────
 
@@ -181,6 +176,102 @@ def parse_chat_md(chat_md_text: str) -> list[dict[str, str]]:
 # ── Index management ──────────────────────────────────────────────────────
 
 
+def empty_index() -> dict[str, Any]:
+    source = chat_source_identity([])
+    return {
+        "chunks": [],
+        "embeddings": [],
+        "indexed_messages": 0,
+        "source_count": source.count,
+        "source_sha256": source.sha256,
+    }
+
+
+def _validate_index(index: Any) -> dict[str, Any]:
+    if not isinstance(index, dict) or set(index) not in (
+        {"chunks", "embeddings", "indexed_messages"},
+        {
+            "chunks",
+            "embeddings",
+            "indexed_messages",
+            "source_count",
+            "source_sha256",
+        },
+    ):
+        raise ValueError("invalid RAG index")
+    chunks = index["chunks"]
+    embeddings = index["embeddings"]
+    indexed_messages = index["indexed_messages"]
+    if (
+        not isinstance(chunks, list)
+        or not isinstance(embeddings, list)
+        or len(chunks) != len(embeddings)
+        or type(indexed_messages) is not int
+        or indexed_messages < 0
+    ):
+        raise ValueError("invalid RAG index")
+    dimensions: set[int] = set()
+    ranged_ranges: list[tuple[int, int]] = []
+    has_legacy_chunk = False
+    for chunk, embedding in zip(chunks, embeddings):
+        if isinstance(chunk, str):
+            if not chunk:
+                raise ValueError("invalid RAG index")
+            has_legacy_chunk = True
+        elif isinstance(chunk, dict) and set(chunk) == {
+            "text",
+            "start_message",
+            "end_message",
+        }:
+            start = chunk["start_message"]
+            end = chunk["end_message"]
+            if (
+                not isinstance(chunk["text"], str)
+                or type(start) is not int
+                or type(end) is not int
+                or start <= 0
+                or end < start
+            ):
+                raise ValueError("invalid RAG index")
+            ranged_ranges.append((start, end))
+        else:
+            raise ValueError("invalid RAG index")
+        if not isinstance(embedding, list) or not embedding:
+            raise ValueError("invalid RAG index")
+        dimensions.add(len(embedding))
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in embedding
+        ):
+            raise ValueError("invalid RAG index")
+    if len(dimensions) > 1 or any(
+        end > indexed_messages for _start, end in ranged_ranges
+    ):
+        raise ValueError("invalid RAG index")
+    if "source_count" in index:
+        source_count = index["source_count"]
+        source_sha256 = index["source_sha256"]
+        if (
+            type(source_count) is not int
+            or source_count < 0
+            or not isinstance(source_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source_sha256)
+        ):
+            raise ValueError("invalid RAG index")
+        expected_start = 1
+        if source_count != indexed_messages or has_legacy_chunk:
+            raise ValueError("invalid RAG index")
+        for start, end in ranged_ranges:
+            if start != expected_start:
+                raise ValueError("invalid RAG index")
+            expected_start = end + 1
+        if expected_start != indexed_messages + 1:
+            raise ValueError("invalid RAG index")
+    return index
+
+
 async def load_index(
     session_id: int,
     *,
@@ -191,18 +282,29 @@ async def load_index(
     if transaction is not None:
         text = await transaction.read_text("rag/index.json")
         if not text:
-            return {"chunks": [], "embeddings": [], "indexed_messages": 0}
-        return json.loads(text)
+            return empty_index()
+        try:
+            return _validate_index(json.loads(text))
+        except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+            return empty_index()
     if store is not None:
         text = await store.read_text(session_id, "rag/index.json")
         if not text:
-            return {"chunks": [], "embeddings": [], "indexed_messages": 0}
-        return json.loads(text)
-    path = _index_dir(session_id) / "index.json"
-    if not path.exists():
-        return {"chunks": [], "embeddings": [], "indexed_messages": 0}
-    async with aiofiles.open(path, "r", encoding="utf-8") as f:
-        return json.loads(await f.read())
+            return empty_index()
+        try:
+            return _validate_index(json.loads(text))
+        except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+            return empty_index()
+    text = await MarkdownMemoryStore(MEMORY_BASE).read_text(
+        session_id,
+        "rag/index.json",
+    )
+    if not text:
+        return empty_index()
+    try:
+        return _validate_index(json.loads(text))
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+        return empty_index()
 
 
 async def save_index(
@@ -240,7 +342,7 @@ async def invalidate_after(
             transaction=transaction,
         )
     except (json.JSONDecodeError, TypeError, ValueError):
-        index = {"chunks": [], "embeddings": [], "indexed_messages": 0}
+        index = empty_index()
     retained_chunks: list[Any] = []
     retained_embeddings: list[Any] = []
     paired = list(
@@ -288,6 +390,11 @@ async def invalidate_after(
     index["chunks"] = retained_chunks
     index["embeddings"] = retained_embeddings
     index["indexed_messages"] = max(retained_range_ends, default=0)
+    if message_number == 0:
+        index.update(empty_index())
+    else:
+        index.pop("source_count", None)
+        index.pop("source_sha256", None)
     await save_index(
         session_id,
         index,
@@ -299,39 +406,80 @@ async def invalidate_after(
 async def build_index(
     session_id: int,
     *,
+    store: MarkdownMemoryStore,
+    source: ChatSourceIdentity,
     force_rebuild: bool = False,
     embedding_base_url: str | None = None,
     embedding_api_key: str | None = None,
     embedding_model: str = "text-embedding-3-small",
-) -> dict[str, Any]:
+) -> StageUpdateResult:
     """Build or incrementally update the RAG index from chat.md.
     
     Only embeds new chunks since last index build.
     """
-    chat_path = MEMORY_BASE / str(session_id) / "chat.md"
+    records = await store.load_chat(session_id)
+    actual_source = chat_source_identity(records)
+    if actual_source != source:
+        raise RuntimeError("RAG source does not match authoritative chat")
+
+    chat_path = store.file_path(session_id, "chat.md")
     if not chat_path.exists():
         logger.warning(f"No chat.md for session {session_id}")
-        return {"chunks": [], "embeddings": [], "indexed_messages": 0}
+        index = _validate_index(empty_index())
+        await save_index(session_id, index, store=store)
+        text = json.dumps(index, ensure_ascii=False)
+        return StageUpdateResult(
+            stage="rag",
+            completed=True,
+            source=source,
+            checkpoint=0,
+            artifacts=(text_artifact("rag/index.json", text),),
+        )
 
-    records = await MarkdownMemoryStore(MEMORY_BASE).load_chat(session_id)
     total_messages = len(records)
 
     if force_rebuild:
-        index = {"chunks": [], "embeddings": [], "indexed_messages": 0}
+        index = empty_index()
     else:
-        index = await load_index(session_id)
+        index = await load_index(session_id, store=store)
 
     already_indexed = index.get("indexed_messages", 0)
+    prefix_source = chat_source_identity(records[:already_indexed])
+    has_trusted_provenance = (
+        index.get("source_count") == already_indexed
+        and index.get("source_sha256") == prefix_source.sha256
+    )
+    if already_indexed > total_messages or not has_trusted_provenance:
+        index = empty_index()
+        already_indexed = 0
     if already_indexed >= total_messages:
         logger.info(f"RAG index up to date for session {session_id} ({total_messages} msgs)")
-        return index
+        index = _validate_index(index)
+        if total_messages == 0:
+            await save_index(session_id, index, store=store)
+        text = json.dumps(index, ensure_ascii=False)
+        return StageUpdateResult(
+            stage="rag",
+            completed=True,
+            source=source,
+            checkpoint=total_messages,
+            artifacts=(text_artifact("rag/index.json", text),),
+        )
 
     # Only process new messages
     new_records = records[already_indexed:]
     new_chunks = _chunk_records(new_records)
 
     if not new_chunks:
-        return index
+        index = _validate_index(index)
+        text = json.dumps(index, ensure_ascii=False)
+        return StageUpdateResult(
+            stage="rag",
+            completed=True,
+            source=source,
+            checkpoint=already_indexed,
+            artifacts=(text_artifact("rag/index.json", text),),
+        )
 
     # Get embeddings in batches
     batch_size = 20
@@ -347,14 +495,25 @@ async def build_index(
         new_embeddings.extend(embs)
         logger.info(f"Embedded batch {i//batch_size + 1} ({len(batch)} chunks) for session {session_id}")
 
-    # Append to index
-    index["chunks"].extend(new_chunks)
-    index["embeddings"].extend(new_embeddings)
-    index["indexed_messages"] = total_messages
+    candidate = {
+        "chunks": [*index["chunks"], *new_chunks],
+        "embeddings": [*index["embeddings"], *new_embeddings],
+        "indexed_messages": total_messages,
+        "source_count": source.count,
+        "source_sha256": source.sha256,
+    }
+    index = _validate_index(candidate)
 
-    await save_index(session_id, index)
+    await save_index(session_id, index, store=store)
     logger.info(f"RAG index updated: {already_indexed} → {total_messages} messages, {len(index['chunks'])} chunks")
-    return index
+    text = json.dumps(index, ensure_ascii=False)
+    return StageUpdateResult(
+        stage="rag",
+        completed=True,
+        source=source,
+        checkpoint=total_messages,
+        artifacts=(text_artifact("rag/index.json", text),),
+    )
 
 
 # ── Search ────────────────────────────────────────────────────────────────
@@ -474,8 +633,12 @@ async def rebuild_character_from_history(
     from app.services.memory import load_character_profile
 
     # Ensure index is built
+    store = MarkdownMemoryStore(MEMORY_BASE)
+    source = chat_source_identity(await store.load_chat(session_id))
     await build_index(
         session_id,
+        store=store,
+        source=source,
         embedding_base_url=embedding_base_url,
         embedding_api_key=embedding_api_key,
         embedding_model=embedding_model,

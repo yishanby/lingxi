@@ -1018,8 +1018,16 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                 return
 
             import asyncio
-            from app.services.rag import build_index, search_character, rebuild_character_from_history
+            from app.services.rag import (
+                MEMORY_BASE,
+                build_index,
+                load_index,
+                rebuild_character_from_history,
+                search_character,
+            )
             from app.services.memory import list_character_names, load_character_profile, save_character_profile
+            from app.services.md_store import MarkdownMemoryStore
+            from app.services.stage_receipts import chat_source_identity
             from app.config import settings as app_settings
 
             sid = session["id"]
@@ -1079,9 +1087,21 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
 
             elif sub == "index":
                 send_text(chat_id, "🔨 正在建立RAG索引...")
-                index = asyncio.run(
-                    build_index(sid, embedding_base_url=emb_url, embedding_api_key=emb_key, embedding_model=emb_model)
-                )
+
+                async def build_and_load_index():
+                    store = MarkdownMemoryStore(MEMORY_BASE)
+                    source = chat_source_identity(await store.load_chat(sid))
+                    await build_index(
+                        sid,
+                        store=store,
+                        source=source,
+                        embedding_base_url=emb_url,
+                        embedding_api_key=emb_key,
+                        embedding_model=emb_model,
+                    )
+                    return await load_index(sid, store=store)
+
+                index = asyncio.run(build_and_load_index())
                 send_text(chat_id, f"✅ 索引完成: {index['indexed_messages']} 条消息, {len(index['chunks'])} 个chunk")
 
             elif sub == "rebuild":
@@ -1139,7 +1159,6 @@ def _handle_command(text: str, chat_id: str, sender_id: str) -> None:
                         keyword = rest
                 else:
                     keyword = rest
-                from app.services.rag import load_index
                 index = asyncio.run(load_index(sid))
                 if not index.get("chunks"):
                     send_text(chat_id, "索引为空，请先 /chars index")

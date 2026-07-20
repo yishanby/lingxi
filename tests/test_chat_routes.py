@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 
 from app import main
 from app.models.tables import Character, Session
@@ -14,7 +15,11 @@ from app.routers import feishu, sessions
 from app.schemas.api import SessionCreate, SessionMessageIn
 from app.services import memory
 from app.services.chat_service import ChatService, DomainContext, TurnRequest
-from app.services.md_store import MarkdownMemoryStore
+from app.services.md_store import (
+    InvalidationIntentError,
+    MarkdownMemoryStore,
+    MemoryState,
+)
 from app.services.prompt_policy import REQUIRED_OPENING
 
 
@@ -248,6 +253,68 @@ async def test_sessions_undo_delegates_invalidation_and_pipeline_submit(
     assert response.messages == []
     assert route_env.manager.submitted == [1]
     assert await route_env.store.read_text(1, "summary.md") == ""
+
+
+@pytest.mark.parametrize(
+    ("command", "history"),
+    [
+        ("/undo", "empty"),
+        ("/undo", "incomplete"),
+        ("/retry", "empty"),
+        ("/retry", "incomplete"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_sessions_mutating_command_maps_only_missing_pair_to_400(
+    route_env,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    history: str,
+) -> None:
+    session, character = entities()
+    db = DB(session, character)
+    if history == "incomplete":
+        await route_env.store.append_record(1, "user", "incomplete", name="User")
+
+    async def fail_completion(**kwargs):
+        raise AssertionError("completion must not run without a complete pair")
+
+    monkeypatch.setattr(sessions, "chat_completion", fail_completion)
+
+    with pytest.raises(HTTPException) as captured:
+        await sessions.send_message(1, SessionMessageIn(content=command), db)
+
+    assert captured.value.status_code == 400
+    assert "No complete message pair" in captured.value.detail
+
+
+@pytest.mark.parametrize("command", ["/undo", "/retry"])
+@pytest.mark.asyncio
+async def test_sessions_malformed_journal_is_not_mislabeled_as_missing_pair(
+    route_env,
+    command: str,
+) -> None:
+    session, character = entities()
+    db = DB(session, character)
+    await route_env.store.append_pair(
+        1,
+        "old user",
+        "old assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    malformed = "# Invalidation Intent\n\n<!-- boundary-message: 0 -->\n"
+    await route_env.store.write_text(1, "invalidation_intent.md", malformed)
+
+    if command == "/undo":
+        with pytest.raises(HTTPException) as captured:
+            await sessions.send_message(1, SessionMessageIn(content=command), db)
+        assert captured.value.status_code == 500
+        assert captured.value.detail == "Undo failed"
+    else:
+        with pytest.raises(InvalidationIntentError) as captured:
+            await sessions.send_message(1, SessionMessageIn(content=command), db)
+        assert str(captured.value) == "invalid invalidation intent"
 
 
 @pytest.mark.asyncio
@@ -579,6 +646,118 @@ async def test_feishu_ordinary_chat_uses_markdown_and_preserves_token_footer(
     assert "Token" in json.dumps(cards, ensure_ascii=False)
 
 
+@pytest.mark.parametrize(
+    "pending_case",
+    ["memory-assets", "cleanup", "missing-boundary"],
+)
+@pytest.mark.asyncio
+async def test_feishu_ordinary_chat_never_sends_pending_stale_context_to_provider(
+    route_env,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_case: str,
+) -> None:
+    from app.services import rag
+
+    session, character = entities()
+    session.feishu_chat_id = "chat-1"
+    db = DB(session, character)
+    await route_env.store.append_pair(
+        1,
+        "AUTHORITATIVE_RECENT_USER",
+        "AUTHORITATIVE_RECENT_ASSISTANT",
+        char_name="Character",
+        user_name="User",
+    )
+    if pending_case == "memory-assets":
+        await route_env.store.save_state(
+            1,
+            MemoryState(
+                rebuild_memory_required=True,
+                rebuild_assets_required=True,
+                rebuild_from_message=2,
+            ),
+        )
+    await route_env.store.write_text(1, "story_state.md", "STALE_STORY")
+    await route_env.store.write_text(1, "summary.md", "STALE_SUMMARY")
+    await route_env.store.write_text(
+        1,
+        "episodes/episode-000001.md",
+        "STALE_EPISODE",
+    )
+
+    async def memory_context(*args, **kwargs):
+        if pending_case == "cleanup":
+            await route_env.store.save_state(
+                1,
+                MemoryState(cleanup_required=True, rebuild_from_message=2),
+            )
+        elif pending_case == "missing-boundary":
+            await route_env.store.save_state(
+                1,
+                MemoryState(rebuild_story_required=True),
+            )
+        return "STALE_MEMORY"
+
+    async def stale_profile(*args, **kwargs):
+        return "STALE_PROFILE"
+
+    async def stale_assets(*args, **kwargs):
+        return "STALE_ASSETS"
+
+    async def stale_index(*args, **kwargs):
+        return {"chunks": [{"text": "STALE_RAG"}]}
+
+    async def stale_search(*args, **kwargs):
+        return [{"text": "STALE_RAG", "score": 1.0}]
+
+    captured: list[list[dict[str, Any]]] = []
+
+    async def complete(**kwargs):
+        captured.append(kwargs["messages"])
+        return {"content": "正文", "usage": {}}
+
+    async def send_card(chat_id, card):
+        return None
+
+    monkeypatch.setattr(sessions, "load_memory_relevant", memory_context)
+    monkeypatch.setattr(
+        sessions,
+        "load_mentioned_character_profiles",
+        stale_profile,
+    )
+    monkeypatch.setattr(sessions, "load_assets_summary", stale_assets)
+    monkeypatch.setattr(sessions, "load_assets", stale_assets)
+    monkeypatch.setattr(sessions, "is_asset_relevant", lambda content: True)
+    monkeypatch.setattr(rag, "load_index", stale_index)
+    monkeypatch.setattr(rag, "search", stale_search)
+    monkeypatch.setattr(feishu, "chat_completion", complete)
+    monkeypatch.setattr(
+        feishu.feishu_client,
+        "send_interactive_card",
+        send_card,
+    )
+
+    await feishu._handle_message(feishu_event("AUTHORITATIVE_INPUT"), db)
+
+    provider_text = "\n".join(
+        str(message.get("content", "")) for message in captured[0]
+    )
+    assert "AUTHORITATIVE_RECENT_USER" in provider_text
+    assert "AUTHORITATIVE_RECENT_ASSISTANT" in provider_text
+    assert "AUTHORITATIVE_INPUT" in provider_text
+    assert "STALE_MEMORY" not in provider_text
+    assert "STALE_PROFILE" not in provider_text
+    assert "STALE_ASSETS" not in provider_text
+    if pending_case != "memory-assets":
+        for marker in (
+            "STALE_STORY",
+            "STALE_EPISODE",
+            "STALE_RAG",
+            "STALE_SUMMARY",
+        ):
+            assert marker not in provider_text
+
+
 @pytest.mark.asyncio
 async def test_feishu_reset_clears_markdown_chat(route_env, monkeypatch) -> None:
     monkeypatch.setattr("app.config.settings.episode_size_messages", 2)
@@ -617,7 +796,7 @@ async def test_feishu_reset_clears_markdown_chat(route_env, monkeypatch) -> None
     await feishu._handle_command("/reset", "chat-1", "sender", db)
 
     assert await route_env.store.load_chat(1) == []
-    assert await route_env.store.read_text(1, "memory.md") == "preserved long-term memory"
+    assert not (route_env.store.session_dir(1) / "memory.md").exists()
     assert await route_env.store.read_text(1, "story_state.md") == ""
     assert await route_env.store.read_text(1, "summary.md") == ""
     assert not (

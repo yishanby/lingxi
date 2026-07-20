@@ -27,6 +27,7 @@ from app.services.chat_service import (
     ChatService,
     ContextBudgetExceeded,
     DomainContext,
+    NoCompletePairError,
     TurnRequest,
 )
 from app.services import memory as memory_service
@@ -765,7 +766,7 @@ async def _handle_command(
         )
         try:
             await service.undo(session_id)
-        except ValueError as exc:
+        except NoCompletePairError as exc:
             raise HTTPException(400, "No complete message pair to undo") from exc
         except Exception as exc:
             logger.warning(
@@ -828,7 +829,7 @@ async def _handle_command(
         except LLMError as exc:
             logger.warning("LLM retry failed for session %s", session_id)
             raise HTTPException(502, "LLM request failed") from exc
-        except ValueError as exc:
+        except NoCompletePairError as exc:
             raise HTTPException(400, "No complete message pair to retry") from exc
 
         await _record_turn_usage(

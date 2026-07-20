@@ -6,6 +6,12 @@ from pathlib import Path
 import pytest
 
 from app.services.md_store import ChatRecord, MarkdownMemoryStore
+from app.services.stage_receipts import (
+    ChatSourceIdentity,
+    StageUpdateResult,
+    chat_source_identity,
+    text_artifact,
+)
 from app.services.story_memory import (
     create_due_episodes,
     render_records,
@@ -28,6 +34,58 @@ def records(start: int, end: int | None = None) -> list[ChatRecord]:
         )
         for number in range(start, end + 1)
     ]
+
+
+def source_through(end: int) -> ChatSourceIdentity:
+    """Identity for the full deterministic chat fixture through ``end``."""
+    return chat_source_identity(records(end))
+
+
+def summary_unit_source(authoritative_end: int) -> ChatSourceIdentity:
+    """Identity for the summary fixture's declared authoritative chat frontier."""
+    return source_through(authoritative_end)
+
+
+async def assert_persisted_stage_identities(
+    store: MarkdownMemoryStore,
+    session_id: int,
+    result: StageUpdateResult,
+) -> None:
+    async def recompute(artifacts):
+        identities = []
+        for artifact in artifacts:
+            identities.append(
+                text_artifact(
+                    artifact.path,
+                    await store.read_text(session_id, artifact.path),
+                )
+            )
+        return tuple(identities)
+
+    assert result.artifacts == await recompute(result.artifacts)
+    assert result.inputs == await recompute(result.inputs)
+
+
+async def assert_stage_result(
+    store: MarkdownMemoryStore,
+    result: StageUpdateResult,
+    *,
+    stage: str,
+    source: ChatSourceIdentity,
+    checkpoint: int,
+    artifact_paths: tuple[str, ...] | None = None,
+    input_paths: tuple[str, ...] | None = None,
+) -> None:
+    assert isinstance(result, StageUpdateResult)
+    assert result.stage == stage
+    assert result.completed is True
+    assert result.source == source
+    assert result.checkpoint == checkpoint
+    if artifact_paths is not None:
+        assert tuple(artifact.path for artifact in result.artifacts) == artifact_paths
+    if input_paths is not None:
+        assert tuple(artifact.path for artifact in result.inputs) == input_paths
+    await assert_persisted_stage_identities(store, 1, result)
 
 
 def story_state() -> str:
@@ -135,7 +193,13 @@ async def _assert_generated_heading_rejected(
             return story_state() + generated_suffix
 
         with pytest.raises(ValueError, match="story state"):
-            await update_story_state(store, 1, records(2), fake_complete)
+            await update_story_state(
+                store,
+                1,
+                records(2),
+                fake_complete,
+                source=source_through(2),
+            )
 
         assert await store.read_text(1, "story_state.md") == old
     elif target == "episode":
@@ -153,6 +217,7 @@ async def _assert_generated_heading_rejected(
                 20,
                 fake_complete,
                 episode_size=20,
+                source=source_through(40),
             )
 
         assert await store.read_text(1, "episodes/episode-000001.md") == old
@@ -176,6 +241,7 @@ async def _assert_generated_heading_rejected(
                 0,
                 fake_complete,
                 max_tokens=200,
+                source=summary_unit_source(20),
             )
 
         assert await store.read_text(1, "summary.md") == old
@@ -218,7 +284,22 @@ async def test_generated_narrative_plot_state_words_are_not_headings_and_are_all
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await update_story_state(store, 1, records(2), fake_complete) == generated
+        result = await update_story_state(
+            store,
+            1,
+            records(2),
+            fake_complete,
+            source=source_through(2),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="story",
+            source=source_through(2),
+            checkpoint=2,
+            artifact_paths=("story_state.md",),
+            input_paths=(),
+        )
         assert await store.read_text(1, "story_state.md") == generated + "\n"
     elif target == "episode":
         generated = episode_body().replace("完成章节", f"完成章节\n\n{narrative}")
@@ -226,14 +307,24 @@ async def test_generated_narrative_plot_state_words_are_not_headings_and_are_all
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await create_due_episodes(
+        result = await create_due_episodes(
             store,
             1,
             records(20),
             0,
             fake_complete,
             episode_size=20,
-        ) == 20
+            source=source_through(20),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="episode",
+            source=source_through(20),
+            checkpoint=20,
+            artifact_paths=("episodes/episode-000001.md",),
+            input_paths=(),
+        )
         assert narrative in await store.read_text(1, "episodes/episode-000001.md")
     else:
         await store.write_text(
@@ -246,13 +337,23 @@ async def test_generated_narrative_plot_state_words_are_not_headings_and_are_all
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await update_summary_from_episodes(
+        result = await update_summary_from_episodes(
             store,
             1,
             0,
             fake_complete,
             max_tokens=200,
-        ) == 20
+            source=summary_unit_source(20),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="summary",
+            source=summary_unit_source(20),
+            checkpoint=20,
+            artifact_paths=("summary.md",),
+            input_paths=("episodes/episode-000001.md",),
+        )
         assert await store.read_text(1, "summary.md") == generated + "\n"
 
 
@@ -276,7 +377,22 @@ async def test_fenced_heading_literal_does_not_count_as_document_heading(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await update_story_state(store, 1, records(2), fake_complete) == generated
+        result = await update_story_state(
+            store,
+            1,
+            records(2),
+            fake_complete,
+            source=source_through(2),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="story",
+            source=source_through(2),
+            checkpoint=2,
+            artifact_paths=("story_state.md",),
+            input_paths=(),
+        )
         assert await store.read_text(1, "story_state.md") == generated + "\n"
     elif target == "episode":
         generated = episode_body().replace("完成章节", f"完成章节\n\n{code_block}")
@@ -284,14 +400,24 @@ async def test_fenced_heading_literal_does_not_count_as_document_heading(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await create_due_episodes(
+        result = await create_due_episodes(
             store,
             1,
             records(20),
             0,
             fake_complete,
             episode_size=20,
-        ) == 20
+            source=source_through(20),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="episode",
+            source=source_through(20),
+            checkpoint=20,
+            artifact_paths=("episodes/episode-000001.md",),
+            input_paths=(),
+        )
         assert code_block in await store.read_text(1, "episodes/episode-000001.md")
     else:
         await store.write_text(
@@ -309,13 +435,23 @@ async def test_fenced_heading_literal_does_not_count_as_document_heading(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await update_summary_from_episodes(
+        result = await update_summary_from_episodes(
             store,
             1,
             0,
             fake_complete,
             max_tokens=200,
-        ) == 20
+            source=summary_unit_source(20),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="summary",
+            source=summary_unit_source(20),
+            checkpoint=20,
+            artifact_paths=("summary.md",),
+            input_paths=("episodes/episode-000001.md",),
+        )
         assert await store.read_text(1, "summary.md") == generated + "\n"
 
 
@@ -346,7 +482,22 @@ async def test_heading_literal_in_container_fence_is_allowed(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await update_story_state(store, 1, records(2), fake_complete) == generated
+        result = await update_story_state(
+            store,
+            1,
+            records(2),
+            fake_complete,
+            source=source_through(2),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="story",
+            source=source_through(2),
+            checkpoint=2,
+            artifact_paths=("story_state.md",),
+            input_paths=(),
+        )
         assert await store.read_text(1, "story_state.md") == generated + "\n"
     elif target == "episode":
         generated = episode_body().replace("完成章节", f"完成章节\n\n{code_block}")
@@ -354,14 +505,24 @@ async def test_heading_literal_in_container_fence_is_allowed(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await create_due_episodes(
+        result = await create_due_episodes(
             store,
             1,
             records(20),
             0,
             fake_complete,
             episode_size=20,
-        ) == 20
+            source=source_through(20),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="episode",
+            source=source_through(20),
+            checkpoint=20,
+            artifact_paths=("episodes/episode-000001.md",),
+            input_paths=(),
+        )
         assert code_block in await store.read_text(1, "episodes/episode-000001.md")
     else:
         await store.write_text(
@@ -374,13 +535,23 @@ async def test_heading_literal_in_container_fence_is_allowed(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await update_summary_from_episodes(
+        result = await update_summary_from_episodes(
             store,
             1,
             0,
             fake_complete,
             max_tokens=200,
-        ) == 20
+            source=summary_unit_source(20),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="summary",
+            source=summary_unit_source(20),
+            checkpoint=20,
+            artifact_paths=("summary.md",),
+            input_paths=("episodes/episode-000001.md",),
+        )
         assert await store.read_text(1, "summary.md") == generated + "\n"
 
 
@@ -402,7 +573,22 @@ async def test_list_followed_by_thematic_break_is_not_setext_heading(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await update_story_state(store, 1, records(2), fake_complete) == generated
+        result = await update_story_state(
+            store,
+            1,
+            records(2),
+            fake_complete,
+            source=source_through(2),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="story",
+            source=source_through(2),
+            checkpoint=2,
+            artifact_paths=("story_state.md",),
+            input_paths=(),
+        )
         assert await store.read_text(1, "story_state.md") == generated + "\n"
     elif target == "episode":
         generated = episode_body().replace("完成章节", f"完成章节\n\n{content}")
@@ -410,14 +596,24 @@ async def test_list_followed_by_thematic_break_is_not_setext_heading(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await create_due_episodes(
+        result = await create_due_episodes(
             store,
             1,
             records(20),
             0,
             fake_complete,
             episode_size=20,
-        ) == 20
+            source=source_through(20),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="episode",
+            source=source_through(20),
+            checkpoint=20,
+            artifact_paths=("episodes/episode-000001.md",),
+            input_paths=(),
+        )
         assert content in await store.read_text(1, "episodes/episode-000001.md")
     else:
         await store.write_text(
@@ -430,13 +626,23 @@ async def test_list_followed_by_thematic_break_is_not_setext_heading(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await update_summary_from_episodes(
+        result = await update_summary_from_episodes(
             store,
             1,
             0,
             fake_complete,
             max_tokens=200,
-        ) == 20
+            source=summary_unit_source(20),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="summary",
+            source=summary_unit_source(20),
+            checkpoint=20,
+            artifact_paths=("summary.md",),
+            input_paths=("episodes/episode-000001.md",),
+        )
         assert await store.read_text(1, "summary.md") == generated + "\n"
 
 
@@ -455,7 +661,13 @@ async def test_real_extra_h2_outside_fence_is_rejected(
             return story_state() + extra
 
         with pytest.raises(ValueError, match="story state"):
-            await update_story_state(store, 1, records(2), fake_complete)
+            await update_story_state(
+                store,
+                1,
+                records(2),
+                fake_complete,
+                source=source_through(2),
+            )
         assert not (tmp_path / "1" / "story_state.md").exists()
     else:
 
@@ -470,6 +682,7 @@ async def test_real_extra_h2_outside_fence_is_rejected(
                 0,
                 fake_complete,
                 episode_size=20,
+                source=source_through(20),
             )
         assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
 
@@ -509,7 +722,13 @@ async def test_generated_required_section_rejects_nonmeaningful_markdown(
             return generated
 
         with pytest.raises(ValueError, match="story state.*empty section"):
-            await update_story_state(store, 1, records(2), fake_complete)
+            await update_story_state(
+                store,
+                1,
+                records(2),
+                fake_complete,
+                source=source_through(2),
+            )
         assert await store.read_text(1, "story_state.md") == old
     else:
         generated = episode_body().replace("完成章节", content)
@@ -525,6 +744,7 @@ async def test_generated_required_section_rejects_nonmeaningful_markdown(
                 0,
                 fake_complete,
                 episode_size=20,
+                source=source_through(20),
             )
         assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
 
@@ -563,7 +783,22 @@ async def test_generated_required_section_accepts_meaningful_markdown(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await update_story_state(store, 1, records(2), fake_complete) == generated
+        result = await update_story_state(
+            store,
+            1,
+            records(2),
+            fake_complete,
+            source=source_through(2),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="story",
+            source=source_through(2),
+            checkpoint=2,
+            artifact_paths=("story_state.md",),
+            input_paths=(),
+        )
         assert await store.read_text(1, "story_state.md") == generated + "\n"
     else:
         generated = episode_body().replace("完成章节", content)
@@ -571,14 +806,24 @@ async def test_generated_required_section_accepts_meaningful_markdown(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await create_due_episodes(
+        result = await create_due_episodes(
             store,
             1,
             records(20),
             0,
             fake_complete,
             episode_size=20,
-        ) == 20
+            source=source_through(20),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="episode",
+            source=source_through(20),
+            checkpoint=20,
+            artifact_paths=("episodes/episode-000001.md",),
+            input_paths=(),
+        )
         assert await store.read_text(
             1,
             "episodes/episode-000001.md",
@@ -607,7 +852,13 @@ async def test_generated_output_rejects_raw_html_outside_code(
             return generated
 
         with pytest.raises(ValueError, match="story state.*raw HTML"):
-            await update_story_state(store, 1, records(2), fake_complete)
+            await update_story_state(
+                store,
+                1,
+                records(2),
+                fake_complete,
+                source=source_through(2),
+            )
         assert await store.read_text(1, "story_state.md") == old
     elif target == "episode":
         generated = episode_body().replace(
@@ -626,6 +877,7 @@ async def test_generated_output_rejects_raw_html_outside_code(
                 0,
                 fake_complete,
                 episode_size=20,
+                source=source_through(20),
             )
         assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
     else:
@@ -647,6 +899,7 @@ async def test_generated_output_rejects_raw_html_outside_code(
                 0,
                 fake_complete,
                 max_tokens=200,
+                source=summary_unit_source(20),
             )
         assert await store.read_text(1, "summary.md") == old
 
@@ -676,7 +929,22 @@ async def test_generated_output_allows_raw_html_literals_in_code(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await update_story_state(store, 1, records(2), fake_complete) == generated
+        result = await update_story_state(
+            store,
+            1,
+            records(2),
+            fake_complete,
+            source=source_through(2),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="story",
+            source=source_through(2),
+            checkpoint=2,
+            artifact_paths=("story_state.md",),
+            input_paths=(),
+        )
         assert await store.read_text(1, "story_state.md") == generated + "\n"
     elif target == "episode":
         generated = episode_body().replace("完成章节", f"完成章节\n\n{literal}")
@@ -684,14 +952,24 @@ async def test_generated_output_allows_raw_html_literals_in_code(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await create_due_episodes(
+        result = await create_due_episodes(
             store,
             1,
             records(20),
             0,
             fake_complete,
             episode_size=20,
-        ) == 20
+            source=source_through(20),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="episode",
+            source=source_through(20),
+            checkpoint=20,
+            artifact_paths=("episodes/episode-000001.md",),
+            input_paths=(),
+        )
         assert await store.read_text(
             1,
             "episodes/episode-000001.md",
@@ -707,13 +985,23 @@ async def test_generated_output_allows_raw_html_literals_in_code(
         async def fake_complete(_messages: list[dict[str, str]]) -> str:
             return generated
 
-        assert await update_summary_from_episodes(
+        result = await update_summary_from_episodes(
             store,
             1,
             0,
             fake_complete,
             max_tokens=200,
-        ) == 20
+            source=summary_unit_source(20),
+        )
+        await assert_stage_result(
+            store,
+            result,
+            stage="summary",
+            source=summary_unit_source(20),
+            checkpoint=20,
+            artifact_paths=("summary.md",),
+            input_paths=("episodes/episode-000001.md",),
+        )
         assert await store.read_text(1, "summary.md") == generated + "\n"
 
 
@@ -746,12 +1034,27 @@ async def test_story_state_migrates_legacy_state_to_current_snapshot(
         assert "不得输出任何其他真实 Markdown 标题" in messages[0]["content"]
         return f"\n{expected}\n"
 
-    result = await update_story_state(store, 1, records(2), fake_complete)
+    result = await update_story_state(
+        store,
+        1,
+        records(2),
+        fake_complete,
+        source=source_through(2),
+    )
 
-    assert result == expected
-    assert "未完成剧情线" not in result
-    assert all(marker not in result for marker in ("[open]", "[closed]", "[done]"))
-    assert await store.read_text(1, "story_state.md") == expected + "\n"
+    await assert_stage_result(
+        store,
+        result,
+        stage="story",
+        source=source_through(2),
+        checkpoint=2,
+        artifact_paths=("story_state.md",),
+        input_paths=(),
+    )
+    persisted = await store.read_text(1, "story_state.md")
+    assert persisted == expected + "\n"
+    assert "未完成剧情线" not in persisted
+    assert all(marker not in persisted for marker in ("[open]", "[closed]", "[done]"))
     assert len(calls) == 1
 
 
@@ -792,7 +1095,13 @@ async def test_invalid_story_snapshot_does_not_replace_prior_file(
         return invalid
 
     with pytest.raises(ValueError, match="story state"):
-        await update_story_state(store, 1, records(2), fake_complete)
+        await update_story_state(
+            store,
+            1,
+            records(2),
+            fake_complete,
+            source=source_through(2),
+        )
 
     assert await store.read_text(1, "story_state.md") == old
 
@@ -815,7 +1124,13 @@ async def test_story_state_completion_failure_preserves_old_file(
         raise failure
 
     with pytest.raises(type(failure)):
-        await update_story_state(store, 1, records(2), fake_complete)
+        await update_story_state(
+            store,
+            1,
+            records(2),
+            fake_complete,
+            source=source_through(2),
+        )
 
     assert await store.read_text(1, "story_state.md") == old
 
@@ -831,16 +1146,25 @@ async def test_episode_covers_exact_message_range(tmp_path: Path) -> None:
         prompts.append(messages[-1]["content"])
         return episode_body()
 
-    checkpoint = await create_due_episodes(
+    result = await create_due_episodes(
         store,
         1,
         records(25),
         0,
         fake_complete,
         episode_size=20,
+        source=source_through(25),
     )
 
-    assert checkpoint == 20
+    await assert_stage_result(
+        store,
+        result,
+        stage="episode",
+        source=source_through(25),
+        checkpoint=20,
+        artifact_paths=("episodes/episode-000001.md",),
+        input_paths=(),
+    )
     assert [path.name for path in (tmp_path / "1" / "episodes").iterdir()] == [
         "episode-000001.md"
     ]
@@ -907,6 +1231,7 @@ async def test_generated_episode_rejects_real_range_metadata_comment(
             0,
             fake_complete,
             episode_size=20,
+            source=source_through(20),
         )
 
     assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
@@ -942,14 +1267,24 @@ async def test_generated_episode_allows_range_marker_literal_in_code(
     async def fake_complete(_messages: list[dict[str, str]]) -> str:
         return generated
 
-    assert await create_due_episodes(
+    result = await create_due_episodes(
         store,
         1,
         records(20),
         0,
         fake_complete,
         episode_size=20,
-    ) == 20
+        source=source_through(20),
+    )
+    await assert_stage_result(
+        store,
+        result,
+        stage="episode",
+        source=source_through(20),
+        checkpoint=20,
+        artifact_paths=("episodes/episode-000001.md",),
+        input_paths=(),
+    )
     assert await store.read_text(
         1,
         "episodes/episode-000001.md",
@@ -984,6 +1319,7 @@ async def test_existing_episode_rejects_duplicate_real_range_metadata(
                 0,
                 must_not_complete,
                 episode_size=20,
+                source=source_through(20),
             )
         else:
             await update_summary_from_episodes(
@@ -992,6 +1328,7 @@ async def test_existing_episode_rejects_duplicate_real_range_metadata(
                 0,
                 must_not_complete,
                 max_tokens=100,
+                source=summary_unit_source(20),
             )
 
     assert calls == 0
@@ -1014,16 +1351,28 @@ async def test_episode_nonzero_checkpoint_selects_numbers_not_list_indexes(
         prompts.append(messages[-1]["content"])
         return episode_body("第二章")
 
-    checkpoint = await create_due_episodes(
+    result = await create_due_episodes(
         store,
         1,
         records(21, 40),
         20,
         fake_complete,
         episode_size=20,
+        source=source_through(40),
     )
 
-    assert checkpoint == 40
+    await assert_stage_result(
+        store,
+        result,
+        stage="episode",
+        source=source_through(40),
+        checkpoint=40,
+        artifact_paths=(
+            "episodes/episode-000001.md",
+            "episodes/episode-000002.md",
+        ),
+        input_paths=(),
+    )
     assert "[21] user: message 21" in prompts[0]
     assert "[40] assistant: message 40" in prompts[0]
     assert "message 20" not in prompts[0]
@@ -1044,14 +1393,24 @@ async def test_empty_history_without_episodes_returns_zero_without_completion(
         calls += 1
         raise AssertionError("completion must not be called")
 
-    assert await create_due_episodes(
+    result = await create_due_episodes(
         store,
         1,
         [],
         0,
         must_not_complete,
         episode_size=20,
-    ) == 0
+        source=source_through(0),
+    )
+    await assert_stage_result(
+        store,
+        result,
+        stage="episode",
+        source=source_through(0),
+        checkpoint=0,
+        artifact_paths=(),
+        input_paths=(),
+    )
     assert calls == 0
     assert not (tmp_path / "1" / "episodes").exists()
 
@@ -1080,6 +1439,7 @@ async def test_empty_history_rejects_stale_existing_episode_without_rewrite(
             0,
             must_not_complete,
             episode_size=20,
+            source=source_through(0),
         )
 
     assert calls == 0
@@ -1108,21 +1468,23 @@ async def test_empty_history_stops_stale_episode_before_summary_resurrection(
         summary_calls += 1
         return "错误复活的摘要"
 
-    async def run_pipeline() -> int:
-        checkpoint = await create_due_episodes(
+    async def run_pipeline() -> StageUpdateResult:
+        episode_result = await create_due_episodes(
             store,
             1,
             [],
             0,
             episode_complete,
             episode_size=20,
+            source=source_through(0),
         )
         return await update_summary_from_episodes(
             store,
             1,
-            checkpoint,
+            episode_result.checkpoint,
             summary_complete,
             max_tokens=100,
+            source=summary_unit_source(0),
         )
 
     with pytest.raises(ValueError, match="existing episode.*available records"):
@@ -1169,6 +1531,7 @@ async def test_existing_episode_chain_cannot_extend_beyond_supplied_history(
             0,
             must_not_complete,
             episode_size=20,
+            source=source_through(20),
         )
 
     assert calls == 0
@@ -1224,6 +1587,7 @@ async def test_episode_creation_validates_entire_existing_chain_before_completio
             20,
             fake_complete,
             episode_size=20,
+            source=source_through(40),
         )
 
     assert calls == 0
@@ -1288,6 +1652,7 @@ async def test_existing_episode_rejects_non_ascii_envelope_digits(
             0,
             must_not_complete,
             episode_size=20,
+            source=source_through(20),
         )
 
     assert calls == 0
@@ -1305,16 +1670,25 @@ async def test_existing_episode_is_idempotent_without_another_completion(
     async def must_not_complete(_messages: list[dict[str, str]]) -> str:
         raise AssertionError("completion must not be called")
 
-    checkpoint = await create_due_episodes(
+    result = await create_due_episodes(
         store,
         1,
         records(20),
         0,
         must_not_complete,
         episode_size=20,
+        source=source_through(20),
     )
 
-    assert checkpoint == 20
+    await assert_stage_result(
+        store,
+        result,
+        stage="episode",
+        source=source_through(20),
+        checkpoint=20,
+        artifact_paths=("episodes/episode-000001.md",),
+        input_paths=(),
+    )
     assert await store.read_text(1, "episodes/episode-000001.md") == existing
 
 
@@ -1337,14 +1711,24 @@ async def test_legacy_episode_with_extra_h2_and_marker_is_reused_without_rewrite
     async def must_not_complete(_messages: list[dict[str, str]]) -> str:
         raise AssertionError("completion must not be called")
 
-    assert await create_due_episodes(
+    result = await create_due_episodes(
         store,
         1,
         records(20),
         0,
         must_not_complete,
         episode_size=20,
-    ) == 20
+        source=source_through(20),
+    )
+    await assert_stage_result(
+        store,
+        result,
+        stage="episode",
+        source=source_through(20),
+        checkpoint=20,
+        artifact_paths=("episodes/episode-000001.md",),
+        input_paths=(),
+    )
     assert (path.read_bytes(), path.stat().st_mtime_ns) == before
 
 
@@ -1365,6 +1749,7 @@ async def test_conflicting_existing_episode_is_never_overwritten(tmp_path: Path)
             0,
             must_not_complete,
             episode_size=20,
+            source=source_through(21),
         )
 
     assert await store.read_text(1, "episodes/episode-000001.md") == conflict
@@ -1409,6 +1794,7 @@ async def test_invalid_episode_output_does_not_create_file(
             0,
             fake_complete,
             episode_size=20,
+            source=source_through(20),
         )
 
     assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
@@ -1455,6 +1841,7 @@ async def test_episode_rejects_invalid_interval_or_record_sequence(
             checkpoint,
             must_not_complete,
             episode_size=episode_size,
+            source=chat_source_identity(source),
         )
 
 
@@ -1481,6 +1868,7 @@ async def test_episode_completion_failure_does_not_create_file(
             0,
             fake_complete,
             episode_size=20,
+            source=source_through(20),
         )
 
     assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
@@ -1513,6 +1901,7 @@ async def test_later_episode_failure_preserves_progress_and_retry_reuses_it(
             0,
             fail_second,
             episode_size=20,
+            source=source_through(40),
         )
 
     first_expected = episode_document(1, 1, 20, "第一章")
@@ -1531,14 +1920,27 @@ async def test_later_episode_failure_preserves_progress_and_retry_reuses_it(
         retry_prompts.append(messages[-1]["content"])
         return episode_body("第二章")
 
-    assert await create_due_episodes(
+    result = await create_due_episodes(
         store,
         1,
         records(40),
         0,
         complete_missing,
         episode_size=20,
-    ) == 40
+        source=source_through(40),
+    )
+    await assert_stage_result(
+        store,
+        result,
+        stage="episode",
+        source=source_through(40),
+        checkpoint=40,
+        artifact_paths=(
+            "episodes/episode-000001.md",
+            "episodes/episode-000002.md",
+        ),
+        input_paths=(),
+    )
 
     assert len(retry_prompts) == 1
     assert "[21] user: message 21" in retry_prompts[0]
@@ -1582,15 +1984,27 @@ async def test_summary_uses_only_pending_episodes_and_returns_last_end(
         assert "[open] 约定在月圆前返回" in prompt
         return "早期事件：旅人在序章救下守门人。\n\n人物关系与后续约定均已记录。"
 
-    checkpoint = await update_summary_from_episodes(
+    result = await update_summary_from_episodes(
         store,
         1,
         20,
         fake_complete,
         max_tokens=200,
+        source=summary_unit_source(40),
     )
 
-    assert checkpoint == 40
+    await assert_stage_result(
+        store,
+        result,
+        stage="summary",
+        source=summary_unit_source(40),
+        checkpoint=40,
+        artifact_paths=("summary.md",),
+        input_paths=(
+            "episodes/episode-000001.md",
+            "episodes/episode-000002.md",
+        ),
+    )
     summary = await store.read_text(1, "summary.md")
     assert "早期事件：旅人在序章救下守门人" in summary
     assert all(marker not in summary for marker in ("[open]", "[closed]", "[done]"))
@@ -1620,13 +2034,23 @@ async def test_summary_migrates_legacy_episode_with_extra_h2_and_marker(
         assert "<aside>旧格式 HTML 注记</aside>" in prompt
         return "旧章节及其线索已迁移到连续叙事。"
 
-    assert await update_summary_from_episodes(
+    result = await update_summary_from_episodes(
         store,
         1,
         0,
         fake_complete,
         max_tokens=100,
-    ) == 20
+        source=summary_unit_source(20),
+    )
+    await assert_stage_result(
+        store,
+        result,
+        stage="summary",
+        source=summary_unit_source(20),
+        checkpoint=20,
+        artifact_paths=("summary.md",),
+        input_paths=("episodes/episode-000001.md",),
+    )
     assert await store.read_text(1, "episodes/episode-000001.md") == legacy
     assert await store.read_text(1, "summary.md") == "旧章节及其线索已迁移到连续叙事。\n"
 
@@ -1643,13 +2067,23 @@ async def test_summary_with_no_pending_episodes_does_not_call_or_write(
     async def must_not_complete(_messages: list[dict[str, str]]) -> str:
         raise AssertionError("completion must not be called")
 
-    assert await update_summary_from_episodes(
+    result = await update_summary_from_episodes(
         store,
         1,
         20,
         must_not_complete,
         max_tokens=100,
-    ) == 20
+        source=summary_unit_source(20),
+    )
+    await assert_stage_result(
+        store,
+        result,
+        stage="summary",
+        source=summary_unit_source(20),
+        checkpoint=20,
+        artifact_paths=("summary.md",),
+        input_paths=("episodes/episode-000001.md",),
+    )
     assert await store.read_text(1, "summary.md") == old
 
 
@@ -1692,6 +2126,9 @@ async def test_summary_checkpoint_must_be_zero_or_existing_episode_end(
     old = "旧摘要保持不变\n"
     await store.write_text(1, "summary.md", old)
     calls = 0
+    authoritative_source = summary_unit_source(
+        max((end for _, _, end in ranges), default=0)
+    )
 
     async def must_not_complete(_messages: list[dict[str, str]]) -> str:
         nonlocal calls
@@ -1705,6 +2142,7 @@ async def test_summary_checkpoint_must_be_zero_or_existing_episode_end(
             checkpoint,
             must_not_complete,
             max_tokens=100,
+            source=authoritative_source,
         )
 
     assert calls == 0
@@ -1739,14 +2177,31 @@ async def test_summary_accepts_zero_or_final_episode_end_without_work(
     async def must_not_complete(_messages: list[dict[str, str]]) -> str:
         raise AssertionError("completion must not be called")
 
-    assert await update_summary_from_episodes(
+    authoritative_source = summary_unit_source(
+        max((end for _, _, end in ranges), default=0)
+    )
+
+    result = await update_summary_from_episodes(
         store,
         1,
         checkpoint,
         must_not_complete,
         max_tokens=100,
-    ) == checkpoint
-    assert await store.read_text(1, "summary.md") == old
+        source=authoritative_source,
+    )
+    await assert_stage_result(
+        store,
+        result,
+        stage="summary",
+        source=authoritative_source,
+        checkpoint=checkpoint,
+        artifact_paths=() if not ranges else ("summary.md",),
+        input_paths=tuple(
+            f"episodes/episode-{number:06d}.md" for number, _, _ in ranges
+        ),
+    )
+    expected_summary = old if ranges else ""
+    assert await store.read_text(1, "summary.md") == expected_summary
 
 
 @pytest.mark.asyncio
@@ -1772,6 +2227,7 @@ async def test_summary_validates_episode_chain_before_checkpoint(
             10,
             must_not_complete,
             max_tokens=100,
+            source=summary_unit_source(21),
         )
 
     assert await store.read_text(1, "summary.md") == old
@@ -1779,28 +2235,46 @@ async def test_summary_validates_episode_chain_before_checkpoint(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "documents",
+    ("documents", "source_end"),
     [
-        [("episode-000001.md", "# Episode 000001\n\nno metadata\n")],
-        [("episode-000001.md", episode_document(1, 1, 20).replace("1-20", "20-1"))],
-        [
-            ("episode-000001.md", episode_document(1, 1, 20)),
-            ("episode-000002.md", episode_document(2, 20, 39)),
-        ],
-        [
-            ("episode-000001.md", episode_document(1, 1, 20)),
-            ("episode-000002.md", episode_document(2, 22, 41)),
-        ],
-        [
-            ("episode-000001.md", episode_document(1, 21, 40)),
-            ("episode-000002.md", episode_document(2, 1, 20)),
-        ],
+        ([("episode-000001.md", "# Episode 000001\n\nno metadata\n")], 20),
+        (
+            [
+                (
+                    "episode-000001.md",
+                    episode_document(1, 1, 20).replace("1-20", "20-1"),
+                )
+            ],
+            20,
+        ),
+        (
+            [
+                ("episode-000001.md", episode_document(1, 1, 20)),
+                ("episode-000002.md", episode_document(2, 20, 39)),
+            ],
+            39,
+        ),
+        (
+            [
+                ("episode-000001.md", episode_document(1, 1, 20)),
+                ("episode-000002.md", episode_document(2, 22, 41)),
+            ],
+            41,
+        ),
+        (
+            [
+                ("episode-000001.md", episode_document(1, 21, 40)),
+                ("episode-000002.md", episode_document(2, 1, 20)),
+            ],
+            40,
+        ),
     ],
     ids=["no-metadata", "reversed-range", "overlap", "gap", "out-of-order"],
 )
 async def test_malformed_episode_set_does_not_advance_or_replace_summary(
     tmp_path: Path,
     documents: list[tuple[str, str]],
+    source_end: int,
 ) -> None:
     store = MarkdownMemoryStore(tmp_path)
     old = "旧摘要\n"
@@ -1818,6 +2292,7 @@ async def test_malformed_episode_set_does_not_advance_or_replace_summary(
             0,
             must_not_complete,
             max_tokens=100,
+            source=summary_unit_source(source_end),
         )
 
     assert await store.read_text(1, "summary.md") == old
@@ -1833,16 +2308,25 @@ async def test_summary_is_truncated_to_token_bound_even_for_one_long_line(
     async def fake_complete(_messages: list[dict[str, str]]) -> str:
         return "很长的摘要内容" * 100
 
-    checkpoint = await update_summary_from_episodes(
+    result = await update_summary_from_episodes(
         store,
         1,
         0,
         fake_complete,
         max_tokens=12,
+        source=summary_unit_source(20),
     )
 
     summary = (await store.read_text(1, "summary.md")).rstrip("\n")
-    assert checkpoint == 20
+    await assert_stage_result(
+        store,
+        result,
+        stage="summary",
+        source=summary_unit_source(20),
+        checkpoint=20,
+        artifact_paths=("summary.md",),
+        input_paths=("episodes/episode-000001.md",),
+    )
     assert summary
     assert estimate_tokens(summary) <= 12
 
@@ -1866,6 +2350,7 @@ async def test_summary_rejects_heading_beyond_truncation_boundary(
             0,
             fake_complete,
             max_tokens=12,
+            source=summary_unit_source(20),
         )
 
     assert await store.read_text(1, "summary.md") == old
@@ -1890,6 +2375,7 @@ async def test_summary_rejects_heading_created_by_truncation(
             0,
             fake_complete,
             max_tokens=1,
+            source=summary_unit_source(20),
         )
 
     assert await store.read_text(1, "summary.md") == old
@@ -1934,6 +2420,7 @@ async def test_invalid_summary_output_preserves_legacy_summary(
             0,
             fake_complete,
             max_tokens=100,
+            source=summary_unit_source(20),
         )
 
     assert await store.read_text(1, "summary.md") == old
@@ -1970,6 +2457,7 @@ async def test_invalid_or_failed_summary_preserves_old_file(
             0,
             fake_complete,
             max_tokens=100,
+            source=summary_unit_source(20),
         )
 
     assert await store.read_text(1, "summary.md") == old
@@ -2004,4 +2492,5 @@ async def test_summary_rejects_invalid_checkpoint_or_token_budget(
             checkpoint,
             must_not_complete,
             max_tokens=max_tokens,
+            source=summary_unit_source(0),
         )

@@ -149,6 +149,8 @@ _MEMORY_STATE_PREFIX = re.compile(
     rf"<!-- last-error-length: (?P<last_error_length>{_STATE_NUMBER}) -->\n"
 )
 _INTENT_SHA256 = r"[0-9a-f]{64}"
+_INVALIDATION_INTENT_MAX_CHARS = 4096
+_INVALIDATION_INTENT_MAX_BYTES = 4096
 _INVALIDATION_INTENT_DOCUMENT = re.compile(
     r"\A# Invalidation Intent\n\n"
     r"<!-- schema-version: (?P<schema_version>1) -->\n"
@@ -347,28 +349,60 @@ class MarkdownMemoryStore:
 
     def session_dir(self, session_id: int) -> Path:
         _validate_session_id(session_id)
-        path = (self.base / str(session_id)).resolve()
+        intended = self.base / str(session_id)
+        if self._is_path_alias(intended):
+            raise ValueError("session path escaped memory base")
+        path = intended.resolve()
         try:
             relative = path.relative_to(self.base)
         except ValueError as exc:
             raise ValueError("session path escaped memory base") from exc
-        if not relative.parts:
+        if not relative.parts or path != intended:
             raise ValueError("session path escaped memory base")
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def file_path(self, session_id: int, relative: str | Path) -> Path:
-        """Resolve a portable safe path and guarantee session containment."""
+    @staticmethod
+    def _is_path_alias(path: Path) -> bool:
+        """Return whether one lexical entry is a symlink or directory junction."""
+        if os.path.islink(path):
+            return True
+        is_junction = getattr(os.path, "isjunction", None)
+        return bool(is_junction is not None and is_junction(path))
+
+    def _lexical_file_path(
+        self,
+        session_id: int,
+        relative: str | Path,
+        *,
+        allow_final_alias: bool,
+    ) -> Path:
         parts = _safe_relative_parts(relative)
         directory = self.session_dir(session_id)
-        path = directory.joinpath(*parts).resolve()
+        path = directory.joinpath(*parts)
+        parent = path.parent
         try:
-            path.relative_to(directory)
+            parent.relative_to(directory)
         except ValueError as exc:
             raise ValueError("file path must be a safe relative path") from exc
-        if path == directory:
+        if path == directory or parent.resolve() != parent:
+            raise ValueError("file path must be a safe relative path")
+        cursor = directory
+        for component in parent.relative_to(directory).parts:
+            cursor /= component
+            if self._is_path_alias(cursor):
+                raise ValueError("file path must be a safe relative path")
+        if not allow_final_alias and self._is_path_alias(path):
             raise ValueError("file path must be a safe relative path")
         return path
+
+    def file_path(self, session_id: int, relative: str | Path) -> Path:
+        """Return a safe lexical file path without following aliases."""
+        return self._lexical_file_path(
+            session_id,
+            relative,
+            allow_final_alias=False,
+        )
 
     def character_path(self, session_id: int, name: str) -> Path:
         """Return a validated safe path below the character directory."""
@@ -385,21 +419,14 @@ class MarkdownMemoryStore:
         except ValueError as exc:
             raise ValueError("unsafe character profile name") from exc
 
-        session_directory = self.session_dir(session_id)
-        directory = (session_directory / "characters").resolve()
         try:
-            directory.relative_to(session_directory)
+            path = self.file_path(
+                session_id,
+                f"characters/{name}.md",
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
         except ValueError as exc:
             raise ValueError("character path escaped profile directory") from exc
-        directory.mkdir(parents=True, exist_ok=True)
-
-        path = (directory / f"{name}.md").resolve()
-        try:
-            path.relative_to(directory)
-        except ValueError as exc:
-            raise ValueError("character path escaped profile directory") from exc
-        if path.parent != directory:
-            raise ValueError("character path escaped profile directory")
         return path
 
     async def _read_text_unlocked(
@@ -446,6 +473,27 @@ class MarkdownMemoryStore:
         finally:
             temp.unlink(missing_ok=True)
 
+    async def _delete_file_unlocked(
+        self,
+        session_id: int,
+        relative: str | Path,
+    ) -> None:
+        target = self._lexical_file_path(
+            session_id,
+            relative,
+            allow_final_alias=True,
+        )
+        if self._is_path_alias(target):
+            if target.is_dir():
+                raise ValueError("deletion target must be a file")
+            target.unlink(missing_ok=True)
+            return
+        if not target.exists():
+            return
+        if target.is_dir():
+            raise ValueError("deletion target must be a file")
+        target.unlink()
+
     async def _append_records_unlocked(
         self,
         session_id: int,
@@ -474,6 +522,14 @@ class MarkdownMemoryStore:
     ) -> None:
         async with self.transaction(session_id) as transaction:
             await transaction.write_text(relative, text)
+
+    async def delete_file(
+        self,
+        session_id: int,
+        relative: str | Path,
+    ) -> None:
+        async with self.transaction(session_id) as transaction:
+            await transaction.delete_file(relative)
 
     async def append_record(
         self,
@@ -534,6 +590,7 @@ class MarkdownMemoryStore:
                 intent is None
                 and not state.cleanup_required
                 and not state.checkpoint_exceeds(total)
+                and not (total == 0 and state.rebuild_required)
                 and (state.rebuild_required or state.rebuild_from_message is None)
             ):
                 return
@@ -587,6 +644,8 @@ class MarkdownMemoryStore:
                     raise
                 await transaction.start_invalidation(plan)
                 await transaction.finish_invalidation_cleanup(plan)
+                if not retained:
+                    await transaction.reconcile_empty_history()
                 await transaction.clear_invalidation_intent()
                 return retained
 
@@ -613,6 +672,8 @@ class MarkdownMemoryStore:
                 plan = await transaction.plan_invalidation(message_number)
                 await transaction.start_invalidation(plan)
                 await transaction.finish_invalidation_cleanup(plan)
+                if total == 0:
+                    await transaction.reconcile_empty_history()
 
     async def replace_final_pair(
         self,
@@ -680,6 +741,9 @@ class MarkdownMemoryTransaction:
     async def write_text(self, relative: str | Path, text: str) -> None:
         await self._store._write_text_unlocked(self.session_id, relative, text)
 
+    async def delete_file(self, relative: str | Path) -> None:
+        await self._store._delete_file_unlocked(self.session_id, relative)
+
     async def append_record(
         self,
         role: str,
@@ -731,9 +795,17 @@ class MarkdownMemoryTransaction:
             self.session_id,
             "invalidation_intent.md",
         )
-        if not path.exists():
+        try:
+            async with aiofiles.open(path, "rb") as handle:
+                payload = await handle.read(_INVALIDATION_INTENT_MAX_BYTES + 1)
+        except FileNotFoundError:
             return None
-        text = await self.read_text("invalidation_intent.md")
+        if len(payload) > _INVALIDATION_INTENT_MAX_BYTES:
+            raise InvalidationIntentError("invalid invalidation intent")
+        try:
+            text = payload.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            raise InvalidationIntentError("invalid invalidation intent") from None
         return parse_invalidation_intent(text)
 
     async def save_invalidation_intent(self, intent: InvalidationIntent) -> None:
@@ -743,10 +815,7 @@ class MarkdownMemoryTransaction:
         )
 
     async def clear_invalidation_intent(self) -> None:
-        self._store.file_path(
-            self.session_id,
-            "invalidation_intent.md",
-        ).unlink(missing_ok=True)
+        await self.delete_file("invalidation_intent.md")
 
     async def resolve_invalidation_intent(self) -> bool:
         """Resolve one journal by canonical old/target identity, old first."""
@@ -773,6 +842,8 @@ class MarkdownMemoryTransaction:
         plan = await self.plan_invalidation(intent.boundary)
         await self.start_invalidation(plan)
         await self.finish_invalidation_cleanup(plan)
+        if not records:
+            await self.reconcile_empty_history()
         await self.clear_invalidation_intent()
         return True
 
@@ -786,6 +857,9 @@ class MarkdownMemoryTransaction:
             current = replace(current, rebuild_from_message=None)
             await self.save_state(current)
         exceeds = current.checkpoint_exceeds(total)
+        if total == 0 and current.rebuild_required and not current.cleanup_required:
+            await self.reconcile_empty_history()
+            return await self.load_state()
         if not current.cleanup_required and not exceeds:
             return current
         boundary = (
@@ -807,6 +881,9 @@ class MarkdownMemoryTransaction:
             current = await self.load_state()
         if current.cleanup_required:
             await self.finish_invalidation_cleanup(plan)
+            current = await self.load_state()
+        if total == 0 and current.rebuild_required:
+            await self.reconcile_empty_history()
         return await self.load_state()
 
     async def plan_invalidation(self, message_number: int) -> _InvalidationPlan:
@@ -824,11 +901,12 @@ class MarkdownMemoryTransaction:
             "rag/index.json",
         ):
             self._store.file_path(self.session_id, relative)
-        episodes = await story_memory._load_existing_episode_chain(
+        episodes, incompatible_episodes = (
+            await story_memory._load_episode_chain_for_invalidation(
             self._store,
             self,
             episode_size=settings.episode_size_messages,
-            checkpoint=0,
+            )
         )
         surviving_episode_end = max(
             (
@@ -841,11 +919,11 @@ class MarkdownMemoryTransaction:
         files_to_delete = tuple(
             f"episodes/episode-{episode.number:06d}.md"
             for episode in sorted(
-                episodes.values(),
+                (*episodes.values(), *incompatible_episodes),
                 key=lambda episode: episode.number,
                 reverse=True,
             )
-            if episode.end > message_number
+            if episode in incompatible_episodes or episode.end > message_number
         )
         for relative in files_to_delete:
             self._store.file_path(self.session_id, relative)
@@ -857,17 +935,16 @@ class MarkdownMemoryTransaction:
 
     async def start_invalidation(self, plan: _InvalidationPlan) -> None:
         """Persist recovery markers after authoritative chat has committed."""
-        force = plan.message_number > 0
         await self.save_state(
             MemoryState(
                 last_episode_message=plan.surviving_episode_end,
                 cleanup_required=True,
-                rebuild_story_required=force,
-                rebuild_memory_required=force,
-                rebuild_episode_required=force,
-                rebuild_summary_required=force,
-                rebuild_rag_required=force,
-                rebuild_assets_required=force,
+                rebuild_story_required=True,
+                rebuild_memory_required=True,
+                rebuild_episode_required=True,
+                rebuild_summary_required=True,
+                rebuild_rag_required=True,
+                rebuild_assets_required=True,
                 rebuild_from_message=plan.message_number,
             )
         )
@@ -884,12 +961,50 @@ class MarkdownMemoryTransaction:
         await self.write_text("story_state.md", "")
         await self.write_text("summary.md", "")
         for relative in plan.episode_files_to_delete:
-            self._store.file_path(self.session_id, relative).unlink(missing_ok=True)
+            await self.delete_file(relative)
         state = await self.load_state()
         updated = replace(state, cleanup_required=False)
         if not updated.rebuild_required:
             updated = replace(updated, rebuild_from_message=None)
         await self.save_state(updated)
+
+    async def reconcile_empty_history(self) -> None:
+        """Idempotently remove every active derivation for authoritative emptiness."""
+        from app.services import rag
+
+        if await self.load_chat():
+            raise InvalidationIntentError(
+                "empty-history reconciliation requires empty authoritative chat"
+            )
+        session = self._store.session_dir(self.session_id)
+        derived_directories: list[tuple[Path, str]] = []
+        for directory_name, pattern in (
+            ("characters", "*.md"),
+            ("episodes", "episode-*.md"),
+        ):
+            intended = session / directory_name
+            if not intended.exists():
+                continue
+            directory = intended.resolve()
+            if directory != intended or directory.parent != session:
+                raise ValueError("derived artifact directory escaped session directory")
+            derived_directories.append((directory, pattern))
+        for relative in ("memory.md", "assets.md", "assets_summary.txt"):
+            await self.delete_file(relative)
+        for directory, pattern in derived_directories:
+            for path in sorted(directory.glob(pattern), reverse=True):
+                resolved = path.resolve()
+                if resolved.parent != directory:
+                    raise ValueError("derived artifact escaped session directory")
+                await self.delete_file(path.relative_to(session))
+        await self.write_text("story_state.md", "")
+        await self.write_text("summary.md", "")
+        await rag.save_index(
+            self.session_id,
+            rag.empty_index(),
+            transaction=self,
+        )
+        await self.save_state(MemoryState())
 
     async def invalidate_after(self, message_number: int) -> None:
         """Invalidate derivations when authoritative chat is already committed."""
@@ -1034,6 +1149,15 @@ def build_invalidation_intent(
 
 def parse_invalidation_intent(text: str) -> InvalidationIntent:
     """Parse one complete strict invalidation journal document."""
+    try:
+        oversized = (
+            len(text) > _INVALIDATION_INTENT_MAX_CHARS
+            or len(text.encode("utf-8")) > _INVALIDATION_INTENT_MAX_BYTES
+        )
+    except (AttributeError, TypeError, UnicodeEncodeError):
+        raise InvalidationIntentError("invalid invalidation intent") from None
+    if oversized:
+        raise InvalidationIntentError("invalid invalidation intent")
     match = _INVALIDATION_INTENT_DOCUMENT.fullmatch(text)
     if match is None:
         raise InvalidationIntentError("invalid invalidation intent")

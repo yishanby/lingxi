@@ -17,6 +17,11 @@ from app.services.md_store import (
     MarkdownMemoryStore,
     MarkdownMemoryTransaction,
 )
+from app.services.stage_receipts import (
+    ChatSourceIdentity,
+    StageUpdateResult,
+    text_artifact,
+)
 from app.services.token_utils import estimate_tokens, truncate_to_tokens
 
 Completion = Callable[[list[dict[str, str]]], Awaitable[str]]
@@ -410,12 +415,64 @@ async def _load_existing_episode_chain(
     return episodes
 
 
+async def _load_episode_chain_for_invalidation(
+    store: MarkdownMemoryStore,
+    transaction: MarkdownMemoryTransaction,
+    *,
+    episode_size: int,
+) -> tuple[dict[int, _Episode], tuple[_Episode, ...]]:
+    """Split a structurally valid chain into current-size prefix and old-size suffix."""
+    episode_directory = store.session_dir(transaction.session_id) / "episodes"
+    paths = (
+        sorted(episode_directory.glob("episode-*.md"))
+        if episode_directory.exists()
+        else []
+    )
+    canonical: dict[int, _Episode] = {}
+    incompatible: list[_Episode] = []
+    prior_end = 0
+    historical_size: int | None = None
+    size_mismatch_seen = False
+    for expected_number, path in enumerate(paths, start=1):
+        text = await transaction.read_text(f"episodes/{path.name}")
+        try:
+            episode = _parse_episode(text, path.name)
+        except ValueError as exc:
+            raise ValueError(f"existing episode is invalid: {path.name}") from exc
+        width = episode.end - episode.start + 1
+        if (
+            episode.number != expected_number
+            or episode.start != prior_end + 1
+            or (historical_size is not None and width != historical_size)
+        ):
+            raise ValueError(
+                "existing episode chain has conflicting, duplicate, out-of-order, "
+                f"or gapped metadata: {path.name}"
+            )
+        historical_size = width if historical_size is None else historical_size
+        prior_end = episode.end
+        expected_start = (expected_number - 1) * episode_size + 1
+        expected_end = expected_number * episode_size
+        if (
+            size_mismatch_seen
+            or episode.start != expected_start
+            or episode.end != expected_end
+        ):
+            size_mismatch_seen = True
+            incompatible.append(episode)
+        else:
+            canonical[episode.number] = episode
+    return canonical, tuple(incompatible)
+
+
 async def update_story_state(
     store: MarkdownMemoryStore,
     session_id: int,
     records: list[ChatRecord],
     complete: Completion,
-) -> str:
+    *,
+    source: ChatSourceIdentity,
+) -> StageUpdateResult:
     """Replace current story state only after validating a complete result."""
     async with store.transaction(session_id) as transaction:
         existing = await transaction.read_text("story_state.md")
@@ -434,8 +491,15 @@ async def update_story_state(
             label="story state",
         )
         _validate_story_state(updated)
-        await transaction.write_text("story_state.md", updated + "\n")
-        return updated
+        document = updated + "\n"
+        await transaction.write_text("story_state.md", document)
+        return StageUpdateResult(
+            stage="story",
+            completed=True,
+            source=source,
+            checkpoint=source.count,
+            artifacts=(text_artifact("story_state.md", document),),
+        )
 
 
 async def create_due_episodes(
@@ -446,7 +510,8 @@ async def create_due_episodes(
     complete: Completion,
     *,
     episode_size: int,
-) -> int:
+    source: ChatSourceIdentity,
+) -> StageUpdateResult:
     """Create every due immutable episode and return its message checkpoint."""
     _validate_nonnegative_integer(last_episode_message, label="episode checkpoint")
     if type(episode_size) is not int or episode_size <= 0:
@@ -476,9 +541,7 @@ async def create_due_episodes(
             raise ValueError("existing episode chain exceeds available records")
         if last_episode_message > history_end:
             raise ValueError("episode checkpoint exceeds available records")
-        if not records:
-            return 0
-        while history_end - checkpoint >= episode_size:
+        while records and history_end - checkpoint >= episode_size:
             start = checkpoint + 1
             end = checkpoint + episode_size
             try:
@@ -515,7 +578,23 @@ async def create_due_episodes(
                 document,
             )
             checkpoint = end
-    return checkpoint
+        artifacts = tuple(
+            text_artifact(
+                f"episodes/episode-{episode.number:06d}.md",
+                episode.text,
+            )
+            for episode in sorted(
+                existing_episodes.values(),
+                key=lambda item: item.number,
+            )
+        )
+    return StageUpdateResult(
+        stage="episode",
+        completed=True,
+        source=source,
+        checkpoint=checkpoint,
+        artifacts=artifacts,
+    )
 
 
 def _truncate_summary(text: str, max_tokens: int) -> str:
@@ -534,6 +613,34 @@ def _truncate_summary(text: str, max_tokens: int) -> str:
     return updated[:low].rstrip()
 
 
+async def load_summary_episode_chain(
+    store: MarkdownMemoryStore,
+    transaction: MarkdownMemoryTransaction,
+) -> list[_Episode]:
+    """Load the canonical contiguous episode chain consumed by summaries."""
+    episode_directory = store.session_dir(transaction.session_id) / "episodes"
+    paths = (
+        sorted(episode_directory.glob("episode-*.md"))
+        if episode_directory.exists()
+        else []
+    )
+    episodes: list[_Episode] = []
+    previous_end = 0
+    for expected_number, path in enumerate(paths, start=1):
+        text = await transaction.read_text(f"episodes/{path.name}")
+        episode = _parse_episode(text, path.name)
+        if episode.number != expected_number:
+            raise ValueError(f"episode filenames are not contiguous: {path.name}")
+        if episode.start != previous_end + 1:
+            raise ValueError(
+                "episode ranges overlap, are out of order, or have a gap: "
+                f"{path.name}"
+            )
+        episodes.append(episode)
+        previous_end = episode.end
+    return episodes
+
+
 async def update_summary_from_episodes(
     store: MarkdownMemoryStore,
     session_id: int,
@@ -541,32 +648,14 @@ async def update_summary_from_episodes(
     complete: Completion,
     *,
     max_tokens: int,
-) -> int:
+    source: ChatSourceIdentity,
+) -> StageUpdateResult:
     """Update the rolling summary from a strictly validated episode sequence."""
     if type(max_tokens) is not int or max_tokens <= 0:
         raise ValueError("summary token budget must be a positive integer")
 
     async with store.transaction(session_id) as transaction:
-        episode_directory = store.session_dir(session_id) / "episodes"
-        paths = (
-            sorted(episode_directory.glob("episode-*.md"))
-            if episode_directory.exists()
-            else []
-        )
-        episodes: list[_Episode] = []
-        previous_end = 0
-        for expected_number, path in enumerate(paths, start=1):
-            text = await transaction.read_text(f"episodes/{path.name}")
-            episode = _parse_episode(text, path.name)
-            if episode.number != expected_number:
-                raise ValueError(f"episode filenames are not contiguous: {path.name}")
-            if episode.start != previous_end + 1:
-                raise ValueError(
-                    "episode ranges overlap, are out of order, or have a gap: "
-                    f"{path.name}"
-                )
-            episodes.append(episode)
-            previous_end = episode.end
+        episodes = await load_summary_episode_chain(store, transaction)
 
         _validate_nonnegative_integer(
             last_summary_message,
@@ -578,11 +667,36 @@ async def update_summary_from_episodes(
                 "summary checkpoint must be zero or match an existing episode end"
             )
 
+        inputs = tuple(
+            text_artifact(
+                f"episodes/episode-{episode.number:06d}.md",
+                episode.text,
+            )
+            for episode in episodes
+        )
         pending = [
             episode for episode in episodes if episode.end > last_summary_message
         ]
         if not pending:
-            return last_summary_message
+            if not episodes:
+                await transaction.delete_file("summary.md")
+                artifacts = ()
+            else:
+                summary_path = store.file_path(session_id, "summary.md")
+                existing = await transaction.read_text("summary.md")
+                artifacts = (
+                    (text_artifact("summary.md", existing),)
+                    if summary_path.exists()
+                    else ()
+                )
+            return StageUpdateResult(
+                stage="summary",
+                completed=True,
+                source=source,
+                checkpoint=last_summary_message,
+                artifacts=artifacts,
+                inputs=inputs,
+            )
 
         existing = await transaction.read_text("summary.md")
         messages = [
@@ -605,5 +719,13 @@ async def update_summary_from_episodes(
         _reject_generated_raw_html(updated, label="summary")
         _validate_generated_headings(updated, (), label="summary")
         _reject_machine_markers(updated, label="summary")
-        await transaction.write_text("summary.md", updated + "\n")
-        return pending[-1].end
+        document = updated + "\n"
+        await transaction.write_text("summary.md", document)
+        return StageUpdateResult(
+            stage="summary",
+            completed=True,
+            source=source,
+            checkpoint=pending[-1].end,
+            artifacts=(text_artifact("summary.md", document),),
+            inputs=inputs,
+        )
