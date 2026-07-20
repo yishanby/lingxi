@@ -534,6 +534,7 @@ class MarkdownMemoryStore:
                 intent is None
                 and not state.cleanup_required
                 and not state.checkpoint_exceeds(total)
+                and (state.rebuild_required or state.rebuild_from_message is None)
             ):
                 return
         pipeline_lock = await self.pipeline_lock_for(session_id)
@@ -726,9 +727,13 @@ class MarkdownMemoryTransaction:
         )
 
     async def load_invalidation_intent(self) -> InvalidationIntent | None:
-        text = await self.read_text("invalidation_intent.md")
-        if not text:
+        path = self._store.file_path(
+            self.session_id,
+            "invalidation_intent.md",
+        )
+        if not path.exists():
             return None
+        text = await self.read_text("invalidation_intent.md")
         return parse_invalidation_intent(text)
 
     async def save_invalidation_intent(self, intent: InvalidationIntent) -> None:
@@ -777,10 +782,15 @@ class MarkdownMemoryTransaction:
             raise ValueError("total must be a nonnegative integer")
         await self.resolve_invalidation_intent()
         current = await self.load_state()
+        if not current.rebuild_required and current.rebuild_from_message is not None:
+            current = replace(current, rebuild_from_message=None)
+            await self.save_state(current)
         exceeds = current.checkpoint_exceeds(total)
         if not current.cleanup_required and not exceeds:
             return current
-        boundary = current.rebuild_from_message
+        boundary = (
+            current.rebuild_from_message if current.rebuild_required else None
+        )
         if boundary is None:
             if not exceeds:
                 raise InvalidationIntentError(
@@ -876,7 +886,10 @@ class MarkdownMemoryTransaction:
         for relative in plan.episode_files_to_delete:
             self._store.file_path(self.session_id, relative).unlink(missing_ok=True)
         state = await self.load_state()
-        await self.save_state(replace(state, cleanup_required=False))
+        updated = replace(state, cleanup_required=False)
+        if not updated.rebuild_required:
+            updated = replace(updated, rebuild_from_message=None)
+        await self.save_state(updated)
 
     async def invalidate_after(self, message_number: int) -> None:
         """Invalidate derivations when authoritative chat is already committed."""

@@ -4,6 +4,7 @@ import asyncio
 import ast
 import inspect
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from app.config import settings
 from app.services import memory, rag, story_memory
 from app.services.md_store import (
     ChatRecord,
+    InvalidationIntentError,
     MarkdownMemoryStore,
     MemoryState,
     render_chat_records,
@@ -948,6 +950,66 @@ async def test_forced_rebuild_retry_skips_stages_with_persisted_progress(
 
 
 @pytest.mark.asyncio
+async def test_completed_retry_clears_boundary_before_legacy_reset_to_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "story_state_interval_messages", 100)
+    monkeypatch.setattr(settings, "memory_extract_interval_messages", 100)
+    monkeypatch.setattr(settings, "episode_size_messages", 2)
+    monkeypatch.setattr(settings, "rag_index_interval_messages", 100)
+    monkeypatch.setattr(settings, "assets_interval_messages", 100)
+    store = MarkdownMemoryStore(tmp_path)
+    records = await _seed_stale_retry_artifacts(store)
+
+    await store.replace_final_pair(
+        1,
+        expected_user=records[-2],
+        expected_assistant=records[-1],
+        assistant_content="replacement assistant",
+    )
+
+    async def story(*args, **kwargs):
+        return "story"
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def episodes(*args, **kwargs):
+        return 2
+
+    async def summary(*args, **kwargs):
+        return 2
+
+    async def assets(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(story_memory, "update_story_state", story)
+    monkeypatch.setattr(memory, "extract_memory_and_characters", noop)
+    monkeypatch.setattr(story_memory, "create_due_episodes", episodes)
+    monkeypatch.setattr(story_memory, "update_summary_from_episodes", summary)
+    monkeypatch.setattr(rag, "build_index", noop)
+    monkeypatch.setattr(memory, "update_assets", assets)
+
+    await MemoryPipeline(store).run(1, BACKEND)
+
+    completed = await store.load_state(1)
+    assert not completed.rebuild_required
+    assert completed.rebuild_from_message is None
+
+    # Simulate a pre-journal reset that committed chat before updating V2 state.
+    async with store.transaction(1) as transaction:
+        await transaction.write_text("chat.md", "")
+
+    await MemoryPipeline(MarkdownMemoryStore(tmp_path)).run(1, {})
+
+    recovered = await store.load_state(1)
+    assert not recovered.rebuild_required
+    assert recovered.rebuild_from_message is None
+    assert not list((tmp_path / "1" / "episodes").glob("episode-*.md"))
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_beyond_truncated_total_triggers_startup_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1466,6 +1528,71 @@ async def test_untrusted_intent_fails_without_any_derived_write(
     with pytest.raises(ValueError, match=expected_error):
         await MemoryPipeline(MarkdownMemoryStore(tmp_path)).run(1, BACKEND)
 
+    assert {
+        relative: (session / relative).read_bytes() for relative in relatives
+    } == before
+
+
+@pytest.mark.parametrize(
+    "intent_bytes",
+    [b"", b" \t\r\n"],
+    ids=["zero-byte", "whitespace"],
+)
+@pytest.mark.asyncio
+async def test_scanner_and_pipeline_reject_present_empty_intent_without_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    intent_bytes: bytes,
+) -> None:
+    monkeypatch.setattr(settings, "story_state_interval_messages", 100)
+    monkeypatch.setattr(settings, "memory_extract_interval_messages", 100)
+    monkeypatch.setattr(settings, "episode_size_messages", 100)
+    monkeypatch.setattr(settings, "rag_index_interval_messages", 100)
+    monkeypatch.setattr(settings, "assets_interval_messages", 100)
+    store = MarkdownMemoryStore(tmp_path)
+    await _seed_stale_retry_artifacts(store)
+    session = tmp_path / "1"
+    (session / "invalidation_intent.md").write_bytes(intent_bytes)
+    relatives = (
+        "chat.md",
+        "memory_state.md",
+        "memory.md",
+        "story_state.md",
+        "summary.md",
+        "episodes/episode-000001.md",
+        "episodes/episode-000002.md",
+        "rag/index.json",
+        "invalidation_intent.md",
+    )
+    before = {relative: (session / relative).read_bytes() for relative in relatives}
+
+    async def resolve(session_id: int) -> dict[str, object]:
+        return BACKEND
+
+    manager = MemoryTaskManager(MemoryPipeline(store), resolve)
+    with caplog.at_level(logging.ERROR, logger="app.services.memory_tasks"):
+        await manager.scan_pending_sessions()
+
+    scan_errors = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Failed to scan memory state for session 1"
+    ]
+    assert len(scan_errors) == 1
+    assert scan_errors[0].exc_info is not None
+    scan_error = scan_errors[0].exc_info[1]
+    assert isinstance(scan_error, InvalidationIntentError)
+    assert str(scan_error) == "invalid invalidation intent"
+    assert manager.pending == set()
+    assert {
+        relative: (session / relative).read_bytes() for relative in relatives
+    } == before
+
+    with pytest.raises(InvalidationIntentError) as captured:
+        await MemoryPipeline(MarkdownMemoryStore(tmp_path)).run(1, BACKEND)
+
+    assert str(captured.value) == "invalid invalidation intent"
     assert {
         relative: (session / relative).read_bytes() for relative in relatives
     } == before

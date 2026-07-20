@@ -14,7 +14,7 @@ from app.services.chat_service import (
     StreamEvent,
     TurnRequest,
 )
-from app.services.md_store import MarkdownMemoryStore
+from app.services.md_store import InvalidationIntentError, MarkdownMemoryStore
 from app.services.md_store import MemoryState
 from app.services.output_guard import OutputGuardError
 from app.services.prompt_policy import REQUIRED_OPENING
@@ -218,6 +218,92 @@ async def test_mutating_commands_fail_before_touching_malformed_intent(
     assert await store.read_text(1, "chat.md") == before_chat
     assert await store.read_text(1, "invalidation_intent.md") == malformed
     assert completion_calls == 0
+
+
+@pytest.mark.parametrize("operation", ["send", "retry"])
+@pytest.mark.parametrize(
+    "intent_bytes",
+    [b"", b" \t\r\n"],
+    ids=["zero-byte", "whitespace"],
+)
+@pytest.mark.asyncio
+async def test_turn_recovery_refuses_present_empty_intent_without_any_mutation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    intent_bytes: bytes,
+) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "episode_size_messages", 2)
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "old user",
+        "old assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "story_state.md", "unchanged story")
+    await store.write_text(1, "summary.md", "unchanged summary")
+    await store.write_text(
+        1,
+        "episodes/episode-000001.md",
+        "# Episode 000001\n\n"
+        "<!-- messages: 1-2 -->\n\n"
+        "## 剧情摘要\n- unchanged events\n\n"
+        "## 状态变化\n- unchanged state\n\n"
+        "## 承诺与伏笔\n- unchanged facts\n",
+    )
+    await store.write_text(
+        1,
+        "rag/index.json",
+        '{"chunks": [], "embeddings": [], "indexed_messages": 2}',
+    )
+    await store.save_state(
+        1,
+        MemoryState(
+            last_memory_message=2,
+            last_story_state_message=2,
+            last_summary_message=2,
+            last_episode_message=2,
+            last_rag_message=2,
+            last_character_message=2,
+            last_assets_message=2,
+        ),
+    )
+    session = tmp_path / "1"
+    (session / "invalidation_intent.md").write_bytes(intent_bytes)
+    relatives = (
+        "chat.md",
+        "memory_state.md",
+        "story_state.md",
+        "summary.md",
+        "episodes/episode-000001.md",
+        "rag/index.json",
+        "invalidation_intent.md",
+    )
+    before = {relative: (session / relative).read_bytes() for relative in relatives}
+    completion_calls = 0
+
+    async def complete(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal completion_calls
+        completion_calls += 1
+        return {"content": "replacement", "usage": USAGE}
+
+    service = ChatService(store, None, completion=complete)
+
+    with pytest.raises(InvalidationIntentError) as captured:
+        if operation == "send":
+            await service.send(request(content="next"))
+        else:
+            await service.retry(request())
+
+    assert str(captured.value) == "invalid invalidation intent"
+    assert completion_calls == 0
+    assert {
+        relative: (session / relative).read_bytes() for relative in relatives
+    } == before
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ from app.config import settings
 from app.services import rag
 from app.services.md_store import (
     ChatRecord,
+    InvalidationIntentError,
     MarkdownMemoryStore,
     MemoryState,
     parse_chat_markdown,
@@ -557,6 +558,57 @@ async def test_absent_state_returns_defaults_and_read_text_returns_empty(tmp_pat
 
     assert await store.load_state(9) == MemoryState()
     assert await store.read_text(9, "missing.md") == ""
+
+
+@pytest.mark.asyncio
+async def test_recovery_clears_inactive_boundary_without_other_pending_work(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.save_state(1, MemoryState(rebuild_from_message=2))
+
+    await MarkdownMemoryStore(tmp_path).recover_invalidation(1)
+
+    assert await store.load_state(1) == MemoryState()
+
+
+@pytest.mark.asyncio
+async def test_legacy_checkpoint_recovery_ignores_inactive_boundary_for_empty_chat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "episode_size_messages", 2)
+    store = MarkdownMemoryStore(tmp_path)
+    await store.write_text(1, "story_state.md", "stale story")
+    await store.write_text(1, "summary.md", "stale summary")
+    await store.write_text(1, "episodes/episode-000001.md", _episode_document(1, 1, 2))
+    await store.write_text(
+        1,
+        "rag/index.json",
+        '{"chunks": [{"text": "stale", "start_message": 1, '
+        '"end_message": 2}], "embeddings": [[1]], "indexed_messages": 2}',
+    )
+    await store.save_state(
+        1,
+        MemoryState(
+            last_memory_message=2,
+            last_story_state_message=2,
+            last_summary_message=2,
+            last_episode_message=2,
+            last_rag_message=2,
+            last_character_message=2,
+            last_assets_message=2,
+            rebuild_from_message=2,
+        ),
+    )
+
+    await MarkdownMemoryStore(tmp_path).recover_invalidation(1)
+
+    state = await store.load_state(1)
+    assert state == MemoryState()
+    assert await store.read_text(1, "story_state.md") == ""
+    assert await store.read_text(1, "summary.md") == ""
+    assert not list((tmp_path / "1" / "episodes").glob("episode-*.md"))
 
 
 def test_none_last_error_parses_as_empty() -> None:
@@ -1408,6 +1460,69 @@ async def test_reset_truncate_refuses_malformed_intent_without_mutation(
     assert await store.read_text(1, "invalidation_intent.md") == malformed
 
 
+@pytest.mark.parametrize(
+    "intent_bytes",
+    [b"", b" \t\r\n"],
+    ids=["zero-byte", "whitespace"],
+)
+@pytest.mark.asyncio
+async def test_truncate_refuses_present_empty_intent_without_any_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    intent_bytes: bytes,
+) -> None:
+    monkeypatch.setattr(settings, "episode_size_messages", 2)
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "old user",
+        "old assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "story_state.md", "unchanged story")
+    await store.write_text(1, "summary.md", "unchanged summary")
+    await store.write_text(1, "episodes/episode-000001.md", _episode_document(1, 1, 2))
+    await store.write_text(
+        1,
+        "rag/index.json",
+        '{"chunks": [], "embeddings": [], "indexed_messages": 2}',
+    )
+    await store.save_state(
+        1,
+        MemoryState(
+            last_memory_message=2,
+            last_story_state_message=2,
+            last_summary_message=2,
+            last_episode_message=2,
+            last_rag_message=2,
+            last_character_message=2,
+            last_assets_message=2,
+        ),
+    )
+    session = tmp_path / "1"
+    intent_path = session / "invalidation_intent.md"
+    intent_path.write_bytes(intent_bytes)
+    relatives = (
+        "chat.md",
+        "memory_state.md",
+        "story_state.md",
+        "summary.md",
+        "episodes/episode-000001.md",
+        "rag/index.json",
+        "invalidation_intent.md",
+    )
+    before = {relative: (session / relative).read_bytes() for relative in relatives}
+
+    with pytest.raises(InvalidationIntentError) as captured:
+        await store.truncate_chat(1, remove_count=2)
+
+    assert str(captured.value) == "invalid invalidation intent"
+    assert {
+        relative: (session / relative).read_bytes() for relative in relatives
+    } == before
+
+
 @pytest.mark.asyncio
 async def test_reset_truncate_refuses_boundaryless_cleanup_without_mutation(
     tmp_path: Path,
@@ -1604,10 +1719,14 @@ async def test_target_intent_rearms_cleanup_when_prior_boundary_is_identical(
         ),
     )
     real_replace = md_store_module.os.replace
+    state_writes = 0
 
     def fail_state(source: Path, target: Path) -> None:
+        nonlocal state_writes
         if target.name == "memory_state.md":
-            raise OSError("new state marker failed")
+            state_writes += 1
+            if state_writes == 2:
+                raise OSError("new state marker failed")
         real_replace(source, target)
 
     monkeypatch.setattr(md_store_module.os, "replace", fail_state)

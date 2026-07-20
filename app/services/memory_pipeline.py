@@ -55,7 +55,10 @@ class MemoryPipeline:
     async def _save_changes(self, session_id: int, **changes: Any) -> None:
         async with self.store.transaction(session_id) as transaction:
             state = await transaction.load_state()
-            await transaction.save_state(replace(state, **changes))
+            updated = replace(state, **changes)
+            if not updated.rebuild_required:
+                updated = replace(updated, rebuild_from_message=None)
+            await transaction.save_state(updated)
 
     async def _load_state(self, session_id: int) -> MemoryState:
         async with self.store.transaction(session_id) as transaction:
