@@ -11,13 +11,16 @@ import logging
 import math
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiofiles
 import httpx
 
 from app.config import settings
 from app.services.md_store import ChatRecord, MarkdownMemoryStore
+
+if TYPE_CHECKING:
+    from app.services.md_store import MarkdownMemoryTransaction
 
 logger = logging.getLogger(__name__)
 
@@ -178,8 +181,23 @@ def parse_chat_md(chat_md_text: str) -> list[dict[str, str]]:
 # ── Index management ──────────────────────────────────────────────────────
 
 
-async def load_index(session_id: int) -> dict[str, Any]:
+async def load_index(
+    session_id: int,
+    *,
+    store: MarkdownMemoryStore | None = None,
+    transaction: MarkdownMemoryTransaction | None = None,
+) -> dict[str, Any]:
     """Load the RAG index for a session. Returns {chunks: [...], embeddings: [...]}."""
+    if transaction is not None:
+        text = await transaction.read_text("rag/index.json")
+        if not text:
+            return {"chunks": [], "embeddings": [], "indexed_messages": 0}
+        return json.loads(text)
+    if store is not None:
+        text = await store.read_text(session_id, "rag/index.json")
+        if not text:
+            return {"chunks": [], "embeddings": [], "indexed_messages": 0}
+        return json.loads(text)
     path = _index_dir(session_id) / "index.json"
     if not path.exists():
         return {"chunks": [], "embeddings": [], "indexed_messages": 0}
@@ -187,47 +205,95 @@ async def load_index(session_id: int) -> dict[str, Any]:
         return json.loads(await f.read())
 
 
-async def save_index(session_id: int, index: dict[str, Any]) -> None:
+async def save_index(
+    session_id: int,
+    index: dict[str, Any],
+    *,
+    store: MarkdownMemoryStore | None = None,
+    transaction: MarkdownMemoryTransaction | None = None,
+) -> None:
     """Save the RAG index."""
-    await MarkdownMemoryStore(MEMORY_BASE).write_text(
-        session_id,
-        "rag/index.json",
-        json.dumps(index, ensure_ascii=False),
+    text = json.dumps(index, ensure_ascii=False)
+    if transaction is not None:
+        await transaction.write_text("rag/index.json", text)
+        return
+    await (store or MarkdownMemoryStore(MEMORY_BASE)).write_text(
+        session_id, "rag/index.json", text
     )
 
 
-async def invalidate_after(session_id: int, message_number: int) -> None:
+async def invalidate_after(
+    session_id: int,
+    message_number: int,
+    *,
+    store: MarkdownMemoryStore | None = None,
+    transaction: MarkdownMemoryTransaction | None = None,
+) -> None:
     """Remove range-aware chunks that extend past a rollback boundary."""
     if type(message_number) is not int or message_number < 0:
         raise ValueError("message_number must be a nonnegative integer")
 
-    index = await load_index(session_id)
+    try:
+        index = await load_index(
+            session_id,
+            store=store,
+            transaction=transaction,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        index = {"chunks": [], "embeddings": [], "indexed_messages": 0}
     retained_chunks: list[Any] = []
     retained_embeddings: list[Any] = []
-    retained_range_ends: list[int] = []
-    for chunk, embedding in zip(
-        index.get("chunks", []),
-        index.get("embeddings", []),
-    ):
-        end_message = chunk.get("end_message", 0) if isinstance(chunk, dict) else 0
+    paired = list(
+        zip(
+            index.get("chunks", []),
+            index.get("embeddings", []),
+        )
+    )
+    retained_range_ends = [
+        chunk["end_message"]
+        for chunk, _embedding in paired
         if (
-            type(end_message) is int
-            and end_message != 0
-            and end_message > message_number
+            isinstance(chunk, dict)
+            and type(chunk.get("start_message")) is int
+            and type(chunk.get("end_message")) is int
+            and chunk["start_message"] > 0
+            and chunk["end_message"] >= chunk["start_message"]
+            and chunk["end_message"] <= message_number
+        )
+    ]
+    has_retained_ranged_chunk = bool(retained_range_ends)
+    for chunk, embedding in paired:
+        if not isinstance(chunk, dict):
+            if has_retained_ranged_chunk:
+                retained_chunks.append(chunk)
+                retained_embeddings.append(embedding)
+            continue
+        start_message = chunk.get("start_message")
+        end_message = chunk.get("end_message")
+        if (
+            type(start_message) is not int
+            or type(end_message) is not int
+            or start_message <= 0
+            or end_message < start_message
         ):
+            if has_retained_ranged_chunk:
+                retained_chunks.append(chunk)
+                retained_embeddings.append(embedding)
+            continue
+        if end_message > message_number:
             continue
         retained_chunks.append(chunk)
         retained_embeddings.append(embedding)
-        if type(end_message) is int and end_message > 0:
-            retained_range_ends.append(end_message)
 
     index["chunks"] = retained_chunks
     index["embeddings"] = retained_embeddings
-    index["indexed_messages"] = min(
-        index.get("indexed_messages", 0),
-        max(retained_range_ends, default=0),
+    index["indexed_messages"] = max(retained_range_ends, default=0)
+    await save_index(
+        session_id,
+        index,
+        store=store,
+        transaction=transaction,
     )
-    await save_index(session_id, index)
 
 
 async def build_index(

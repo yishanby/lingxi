@@ -9,6 +9,7 @@ import weakref
 
 import pytest
 
+from app.services import rag
 from app.services.md_store import (
     ChatRecord,
     MarkdownMemoryStore,
@@ -924,3 +925,261 @@ async def test_legacy_append_normalizes_unknown_user_message_type_to_ic(
     )
 
     assert (await memory.load_chat_md(7))[0]["msg_type"] == "ic"
+
+
+def _episode_document(number: int, start: int, end: int) -> str:
+    return (
+        f"# Episode {number:06d}\n\n"
+        f"<!-- messages: {start}-{end} -->\n\n"
+        "## 剧情摘要\n- 已发生的事件\n\n"
+        "## 状态变化\n- 状态已变化\n\n"
+        "## 承诺与伏笔\n- 保留的事实\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_truncate_chat_invalidates_every_derived_checkpoint_and_keeps_memory(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 11):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    await store.write_text(1, "memory.md", "long-term memory must survive")
+    await store.write_text(1, "story_state.md", "stale story")
+    await store.write_text(1, "summary.md", "stale summary")
+    await store.write_text(
+        1,
+        "episodes/episode-000001.md",
+        _episode_document(1, 1, 20),
+    )
+    await store.write_text(
+        1,
+        "rag/index.json",
+        '{"chunks": ['
+        '{"text": "1-5", "start_message": 1, "end_message": 5},'
+        '{"text": "6-10", "start_message": 6, "end_message": 10},'
+        '{"text": "11-15", "start_message": 11, "end_message": 15},'
+        '{"text": "16-20", "start_message": 16, "end_message": 20}'
+        '], "embeddings": [[1], [2], [3], [4]], "indexed_messages": 20}',
+    )
+    await store.save_state(
+        1,
+        MemoryState(
+            last_memory_message=20,
+            last_story_state_message=20,
+            last_summary_message=20,
+            last_episode_message=20,
+            last_rag_message=20,
+            last_character_message=20,
+            last_assets_message=20,
+            last_error="old failure",
+        ),
+    )
+
+    retained = await store.truncate_chat(1, remove_count=2)
+
+    assert retained == await store.load_chat(1)
+    assert len(retained) == 18
+    assert retained[-1].content == "assistant-9"
+    assert await store.load_state(1) == MemoryState()
+    assert await store.read_text(1, "memory.md") == "long-term memory must survive"
+    assert await store.read_text(1, "story_state.md") == ""
+    assert await store.read_text(1, "summary.md") == ""
+    assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
+    index = await rag.load_index(1, store=store)
+    assert index["indexed_messages"] == 15
+    assert [chunk["end_message"] for chunk in index["chunks"]] == [5, 10, 15]
+    assert len(index["chunks"]) == len(index["embeddings"])
+
+
+@pytest.mark.asyncio
+async def test_truncate_keeps_immutable_episode_prefix_and_valid_summary_checkpoint(
+    tmp_path: Path,
+) -> None:
+    from app.services.memory_tasks import MemoryTaskManager
+
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 21):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    first = _episode_document(1, 1, 20)
+    await store.write_text(1, "episodes/episode-000001.md", first)
+    await store.write_text(
+        1,
+        "episodes/episode-000002.md",
+        _episode_document(2, 21, 40),
+    )
+    await store.write_text(1, "summary.md", "summary through message 40")
+    await store.save_state(
+        1,
+        MemoryState(
+            last_memory_message=40,
+            last_story_state_message=40,
+            last_summary_message=40,
+            last_episode_message=40,
+            last_rag_message=40,
+            last_character_message=40,
+            last_assets_message=40,
+        ),
+    )
+
+    await store.truncate_chat(1, remove_count=2)
+
+    state = await store.load_state(1)
+    assert await store.read_text(1, "episodes/episode-000001.md") == first
+    assert not (tmp_path / "1" / "episodes" / "episode-000002.md").exists()
+    assert state.last_episode_message == 20
+    assert state.last_summary_message == 0
+    assert MemoryTaskManager._has_pending(38, state)
+
+
+@pytest.mark.parametrize("remove_count", [0, -1, 3, True])
+@pytest.mark.asyncio
+async def test_truncate_chat_rejects_invalid_count_without_changes(
+    tmp_path: Path,
+    remove_count: int,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "original user",
+        "original assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "story_state.md", "unchanged")
+    before_chat = await store.read_text(1, "chat.md")
+    before_story = await store.read_text(1, "story_state.md")
+
+    with pytest.raises(ValueError, match="remove_count"):
+        await store.truncate_chat(1, remove_count=remove_count)
+
+    assert await store.read_text(1, "chat.md") == before_chat
+    assert await store.read_text(1, "story_state.md") == before_story
+
+
+@pytest.mark.asyncio
+async def test_truncate_chat_validates_episode_metadata_before_chat_commit(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "original user",
+        "original assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(
+        1,
+        "episodes/episode-000001.md",
+        _episode_document(1, 1, 2).replace(
+            "<!-- messages: 1-2 -->",
+            "<!-- messages: 1-2 --><!-- messages: 1-2 -->",
+        ),
+    )
+    before = await store.read_text(1, "chat.md")
+
+    with pytest.raises(ValueError, match="episode"):
+        await store.truncate_chat(1, remove_count=2)
+
+    assert await store.read_text(1, "chat.md") == before
+
+
+@pytest.mark.asyncio
+async def test_truncate_failure_after_pending_state_keeps_chat_and_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "original user",
+        "original assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    await store.write_text(1, "story_state.md", "old story")
+    await store.save_state(
+        1,
+        MemoryState(
+            last_memory_message=2,
+            last_story_state_message=2,
+            last_rag_message=2,
+            last_character_message=2,
+            last_assets_message=2,
+        ),
+    )
+    original_chat = await store.read_text(1, "chat.md")
+    real_replace = md_store_module.os.replace
+
+    def fail_story_once(source: Path, target: Path) -> None:
+        if target.name == "story_state.md":
+            raise OSError("story replacement failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_story_once)
+
+    with pytest.raises(OSError, match="story replacement failed"):
+        await store.truncate_chat(1, remove_count=2)
+
+    assert await store.read_text(1, "chat.md") == original_chat
+    assert await store.load_state(1) == MemoryState()
+
+    monkeypatch.setattr(md_store_module.os, "replace", real_replace)
+    assert await store.truncate_chat(1, remove_count=2) == []
+    assert await store.load_chat(1) == []
+
+
+@pytest.mark.asyncio
+async def test_rag_invalidate_discards_legacy_chunks_before_ranged_rebuild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    monkeypatch.setattr(rag, "MEMORY_BASE", tmp_path)
+    for pair in range(1, 5):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    await store.write_text(
+        1,
+        "rag/index.json",
+        '{"chunks": ["legacy-one", "legacy-two"], '
+        '"embeddings": [[1, 0], [0, 1]], "indexed_messages": 8}',
+    )
+
+    async def embed(texts, **kwargs):
+        return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(rag, "get_embeddings", embed)
+
+    await rag.invalidate_after(1, 6, store=store)
+    invalidated = await rag.load_index(1, store=store)
+    rebuilt = await rag.build_index(1)
+
+    assert invalidated == {"chunks": [], "embeddings": [], "indexed_messages": 0}
+    assert all(isinstance(chunk, dict) for chunk in rebuilt["chunks"])
+    assert [
+        (chunk["start_message"], chunk["end_message"])
+        for chunk in rebuilt["chunks"]
+    ] == [(1, 5), (6, 8)]
+    assert len(rebuilt["chunks"]) == len(rebuilt["embeddings"])
+    assert "legacy-one" not in "\n".join(chunk["text"] for chunk in rebuilt["chunks"])

@@ -50,11 +50,9 @@ from app.services.memory import (
     load_memory,
     load_memory_relevant,
     load_summary,
-    remove_last_chat_md_entries,
     save_memory,
     update_rolling_summary,
 )
-from app.services.prompt import assemble_prompt
 from app.services.history_seed import get_history_seed
 
 logger = logging.getLogger(__name__)
@@ -761,107 +759,84 @@ async def _handle_command(
         return await _row_to_out(session)
 
     elif cmd == "/undo":
-        if len(messages) < 2:
-            raise HTTPException(400, "No messages to undo")
-        # Remove last user+assistant pair from chat.md
+        service = ChatService(
+            memory_service.md_store,
+            _managed_memory_manager(),
+        )
         try:
-            await remove_last_chat_md_entries(session_id, count=2)
+            await service.undo(session_id)
+        except ValueError as exc:
+            raise HTTPException(400, "No complete message pair to undo") from exc
         except Exception as exc:
-            logger.error(f"Failed to undo chat.md entries: {exc}")
-            raise HTTPException(500, f"Undo failed: {exc}")
+            logger.warning(
+                "Undo failed for session %s (%s)",
+                session_id,
+                type(exc).__name__,
+            )
+            raise HTTPException(500, "Undo failed") from exc
         return await _row_to_out(session)
 
     elif cmd == "/retry":
-        if not messages or messages[-1].role != "assistant":
-            raise HTTPException(400, "No assistant message to retry")
-        # Remove last assistant message
-        messages.pop()
-        # The last message should now be the user message — re-use its content
-        if not messages or messages[-1].role != "user":
-            raise HTTPException(400, "No user message found to retry")
-        retry_content = messages[-1].content
-        # Remove the user message too (will be re-added after LLM call)
-        messages.pop()
-
-        # Remove from chat.md
-        try:
-            await remove_last_chat_md_entries(session_id, count=2)
-        except Exception as exc:
-            logger.error(f"Failed to remove chat.md entries for retry: {exc}")
-
-        # Load worldbook, backend, assemble prompt, call LLM
-        wb_ids = json.loads(session.worldbook_ids) if session.worldbook_ids else []
-        all_entries: list[WorldBookEntry] = []
-        for wid in wb_ids:
-            wb = await db.get(WorldBook, wid)
-            if wb:
-                for e in json.loads(wb.entries) if wb.entries else []:
-                    all_entries.append(WorldBookEntry(**e))
-
         backend = await _resolve_backend(backend_id, db)
-        char_dict = {
-            "name": char.name,
-            "description": char.description,
-            "personality": char.personality,
-            "scenario": char.scenario,
-            "first_message": char.first_message,
-            "example_dialogues": char.example_dialogues,
-            "system_prompt": char.system_prompt,
-        }
-
-        persona_position = "in_prompt"
-        if session.persona_id:
-            persona = await db.get(Persona, session.persona_id)
-            if persona:
-                persona_position = persona.description_position or "in_prompt"
-
-        recent_dicts_retry = [{"role": m.role, "content": m.content} for m in messages[-10:]]
-        memory_context = await load_memory_relevant(session_id, retry_content, recent_dicts_retry)
-
-        summary_context = await load_summary(session_id)
-
-        llm_messages = assemble_prompt(
-            character=char_dict,
-            worldbook_entries=all_entries,
-            chat_history=messages,
-            user_message=retry_content,
+        turn_request = TurnRequest(
+            session_id=session.id,
+            content="",
+            character=_character_context(char),
             user_name=user_name,
-            user_persona=session.user_persona or "",
-            persona_position=persona_position,
-            memory_context=memory_context,
-            summary_context=summary_context,
         )
 
-        try:
-            result = await chat_completion(
+        async def load_domain_context(retained_records):
+            current = await memory_service.md_store.load_chat(session_id)
+            if (
+                len(current) < 2
+                or current[-2].role != "user"
+                or current[-1].role != "assistant"
+            ):
+                raise ValueError("chat has no complete final pair")
+            retry_user = current[-2]
+            return await _prepare_domain_context(
+                session=session,
+                char=char,
+                content=retry_user.content,
+                msg_type=retry_user.msg_type,
+                db=db,
+                records=retained_records,
+            )
+
+        async def complete(retry_messages):
+            return await chat_completion(
                 provider=backend["provider"],
                 api_key=backend["api_key"],
                 model=backend["model"],
                 base_url=backend["base_url"],
-                messages=llm_messages,
-                params=backend["params"],
+                messages=retry_messages,
+                params=dict(backend["params"]),
             )
-            reply = result["content"]
-            asyncio.create_task(record_usage(
-                session_id=session_id, user_id=session.user_id,
-                character_name=char.name, model=backend["model"], usage=result["usage"],
-            ))
-        except LLMError as exc:
-            raise HTTPException(502, f"LLM error: {exc}")
 
-        now = datetime.datetime.utcnow().isoformat()
+        service = ChatService(
+            memory_service.md_store,
+            _managed_memory_manager(),
+            completion=complete,
+            domain_context_loader=load_domain_context,
+        )
         try:
-            await append_chat_md(
-                session_id, "user", retry_content,
-                char_name=char.name, user_name=user_name,
-            )
-            await append_chat_md(
-                session_id, "assistant", reply,
-                char_name=char.name, user_name=user_name,
-            )
-        except Exception as exc:
-            logger.error(f"Failed to append chat.md on retry: {exc}")
+            result = await service.retry(turn_request)
+        except ContextBudgetExceeded as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except OutputGuardError as exc:
+            raise HTTPException(422, "模型拒绝生成，请重试 /retry") from exc
+        except LLMError as exc:
+            logger.warning("LLM retry failed for session %s", session_id)
+            raise HTTPException(502, "LLM request failed") from exc
+        except ValueError as exc:
+            raise HTTPException(400, "No complete message pair to retry") from exc
 
+        await _record_turn_usage(
+            session=session,
+            char=char,
+            backend=backend,
+            usage=result.usage,
+        )
         return await _row_to_out(session)
 
     elif cmd == "/chars":

@@ -15,6 +15,8 @@ from app.services.chat_service import (
     TurnRequest,
 )
 from app.services.md_store import MarkdownMemoryStore
+from app.services.md_store import MemoryState
+from app.services.output_guard import OutputGuardError
 from app.services.prompt_policy import REQUIRED_OPENING
 from app.schemas.api import WorldBookEntry
 
@@ -1145,3 +1147,338 @@ async def test_stream_context_budget_failure_emits_safe_error(tmp_path) -> None:
     assert events[0].error
     assert "secret" not in events[0].error
     assert await store.load_chat(1) == []
+
+
+async def _seed_retry_pair(store: MarkdownMemoryStore) -> tuple[Any, Any]:
+    await store.append_pair(
+        1,
+        "prefix user",
+        "prefix assistant",
+        char_name="灵汐",
+        user_name="逸山",
+    )
+    await store.append_pair(
+        1,
+        "retry this",
+        "original answer",
+        char_name="灵汐",
+        user_name="Original User",
+        msg_type="ooc",
+    )
+    records = await store.load_chat(1)
+    await store.save_state(
+        1,
+        MemoryState(
+            last_memory_message=4,
+            last_story_state_message=4,
+            last_summary_message=0,
+            last_episode_message=0,
+            last_rag_message=4,
+            last_character_message=4,
+            last_assets_message=4,
+        ),
+    )
+    await store.write_text(1, "story_state.md", "stale final-pair story")
+    await store.write_text(1, "summary.md", "stale final-pair summary")
+    return records[-2], records[-1]
+
+
+@pytest.mark.asyncio
+async def test_retry_replaces_exactly_one_final_pair_from_logically_retained_history(
+    tmp_path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    original_user, original_assistant = await _seed_retry_pair(store)
+    manager = MemoryManager()
+    builder = CapturingBuilder()
+    loader_records: list[tuple[Any, ...]] = []
+
+    async def loader(records):
+        loader_records.append(records)
+        return DomainContext(
+            story_state="stale final-pair story",
+            memory="preserved memory",
+            character_profiles=["stale profile"],
+            assets="stale assets",
+            episodes=["stale episode"],
+            rag=["stale rag"],
+            overall_summary="stale final-pair summary",
+        )
+
+    async def complete(messages):
+        return {"content": "replacement answer", "usage": USAGE}
+
+    result = await ChatService(
+        store,
+        manager,
+        completion=complete,
+        context_builder=builder,
+        domain_context_loader=loader,
+    ).retry(request(content="/retry"))
+
+    records = await store.load_chat(1)
+    assert len(records) == 4
+    assert records[-2] == original_user
+    assert records[-1].number == original_assistant.number
+    assert records[-1].name == original_assistant.name
+    assert records[-1].timestamp == original_assistant.timestamp
+    assert records[-1].content == f"{REQUIRED_OPENING}\n\nreplacement answer"
+    assert len(loader_records) == 1
+    assert [record.content for record in loader_records[0]] == [
+        "prefix user",
+        "prefix assistant",
+    ]
+    sources = builder.sources[0]
+    assert sources.recent == [
+        {"role": "user", "content": "prefix user"},
+        {"role": "assistant", "content": "prefix assistant"},
+    ]
+    assert sources.user_message == "retry this"
+    assert sources.memory == "preserved memory"
+    assert sources.story_state == ""
+    assert sources.summary == ""
+    assert sources.episodes == []
+    assert sources.rag == []
+    assert sources.assets == ""
+    assert sources.character_profiles == []
+    assert await store.load_state(1) == MemoryState()
+    assert await store.read_text(1, "story_state.md") == ""
+    assert await store.read_text(1, "summary.md") == ""
+    assert manager.submitted == [1]
+    assert result.usage == USAGE
+
+
+@pytest.mark.asyncio
+async def test_retry_provider_failure_preserves_original_pair_and_state(tmp_path) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await _seed_retry_pair(store)
+    original_chat = await store.read_text(1, "chat.md")
+    original_state = await store.load_state(1)
+    manager = MemoryManager()
+
+    async def fail(messages):
+        raise RuntimeError("provider unavailable")
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await ChatService(store, manager, completion=fail).retry(
+            request(content="/retry")
+        )
+
+    assert await store.read_text(1, "chat.md") == original_chat
+    assert await store.load_state(1) == original_state
+    assert await store.read_text(1, "story_state.md") == "stale final-pair story"
+    assert manager.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_retry_context_budget_failure_preserves_original_pair_and_state(
+    tmp_path,
+) -> None:
+    class FailingBuilder:
+        def build(self, sources):
+            raise ValueError("mandatory input too large")
+
+    store = MarkdownMemoryStore(tmp_path)
+    await _seed_retry_pair(store)
+    original_chat = await store.read_text(1, "chat.md")
+    original_state = await store.load_state(1)
+    manager = MemoryManager()
+
+    async def unused(messages):
+        raise AssertionError("provider must not run")
+
+    with pytest.raises(ContextBudgetExceeded):
+        await ChatService(
+            store,
+            manager,
+            completion=unused,
+            context_builder=FailingBuilder(),
+        ).retry(request(content="/retry"))
+
+    assert await store.read_text(1, "chat.md") == original_chat
+    assert await store.load_state(1) == original_state
+    assert manager.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_retry_refusal_exhaustion_preserves_original_pair_and_state(
+    tmp_path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await _seed_retry_pair(store)
+    original_chat = await store.read_text(1, "chat.md")
+    original_state = await store.load_state(1)
+    manager = MemoryManager()
+    calls = 0
+
+    async def refuse(messages):
+        nonlocal calls
+        calls += 1
+        return {"content": "I cannot continue this story.", "usage": USAGE}
+
+    with pytest.raises(OutputGuardError):
+        await ChatService(store, manager, completion=refuse).retry(
+            request(content="/retry")
+        )
+
+    assert calls == 2
+    assert await store.read_text(1, "chat.md") == original_chat
+    assert await store.load_state(1) == original_state
+    assert manager.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_retry_waits_for_pipeline_before_atomic_replacement(tmp_path) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await _seed_retry_pair(store)
+    original_chat = await store.read_text(1, "chat.md")
+    provider_finished = asyncio.Event()
+
+    async def complete(messages):
+        provider_finished.set()
+        return {"content": "replacement", "usage": {}}
+
+    pipeline_lock = await store.pipeline_lock_for(1)
+    await pipeline_lock.acquire()
+    try:
+        retry_task = asyncio.create_task(
+            ChatService(store, MemoryManager(), completion=complete).retry(
+                request(content="/retry")
+            )
+        )
+        await provider_finished.wait()
+        await asyncio.sleep(0)
+        assert not retry_task.done()
+        assert await store.read_text(1, "chat.md") == original_chat
+    finally:
+        pipeline_lock.release()
+
+    await asyncio.wait_for(retry_task, timeout=1)
+    assert (await store.load_chat(1))[-1].content.endswith("replacement")
+
+
+@pytest.mark.asyncio
+async def test_retry_submit_failure_keeps_single_committed_pair(tmp_path) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await _seed_retry_pair(store)
+    manager = MemoryManager(fail=True)
+
+    async def complete(messages):
+        return {"content": "replacement", "usage": {}}
+
+    await ChatService(store, manager, completion=complete).retry(
+        request(content="/retry")
+    )
+
+    records = await store.load_chat(1)
+    assert len(records) == 4
+    assert [record.content for record in records].count("retry this") == 1
+    assert [record.content for record in records].count(
+        f"{REQUIRED_OPENING}\n\nreplacement"
+    ) == 1
+    assert manager.submitted == [1]
+
+
+@pytest.mark.asyncio
+async def test_undo_removes_one_complete_pair_invalidates_and_submits(tmp_path) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await _seed_retry_pair(store)
+    manager = MemoryManager()
+
+    retained = await ChatService(store, manager).undo(1)
+
+    assert [record.content for record in retained] == [
+        "prefix user",
+        "prefix assistant",
+    ]
+    assert retained == await store.load_chat(1)
+    assert await store.load_state(1) == MemoryState()
+    assert manager.submitted == [1]
+
+
+@pytest.mark.asyncio
+async def test_undo_rejects_incomplete_final_pair_without_side_effects(tmp_path) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_record(1, "user", "incomplete", name="User")
+    original = await store.read_text(1, "chat.md")
+    manager = MemoryManager()
+
+    with pytest.raises(ValueError, match="complete user/assistant pair"):
+        await ChatService(store, manager).undo(1)
+
+    assert await store.read_text(1, "chat.md") == original
+    assert manager.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_undo_waits_for_inflight_send_turn(tmp_path) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "old user",
+        "old assistant",
+        char_name="灵汐",
+        user_name="逸山",
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def complete(messages):
+        started.set()
+        await release.wait()
+        return {"content": "new assistant", "usage": {}}
+
+    send_task = asyncio.create_task(
+        ChatService(store, MemoryManager(), completion=complete).send(
+            request(content="new user")
+        )
+    )
+    await started.wait()
+    undo_task = asyncio.create_task(ChatService(store, MemoryManager()).undo(1))
+    await asyncio.sleep(0)
+    assert not undo_task.done()
+
+    release.set()
+    await asyncio.gather(send_task, undo_task)
+
+    assert [record.content for record in await store.load_chat(1)] == [
+        "old user",
+        "old assistant",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_undo_waits_for_inflight_stream_turn(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "old user",
+        "old assistant",
+        char_name="灵汐",
+        user_name="逸山",
+    )
+    release = asyncio.Event()
+
+    async def stream(messages):
+        yield "new assistant"
+        await release.wait()
+
+    response = ChatService(
+        store, MemoryManager(), stream_completion=stream
+    ).stream(request(content="new user"))
+    assert (await anext(response)).delta
+    pending_stream = asyncio.create_task(anext(response))
+    undo_task = asyncio.create_task(ChatService(store, MemoryManager()).undo(1))
+    await asyncio.sleep(0)
+    assert not undo_task.done()
+
+    release.set()
+    assert (await pending_stream).done
+    await response.aclose()
+    await undo_task
+
+    assert [record.content for record in await store.load_chat(1)] == [
+        "old user",
+        "old assistant",
+    ]

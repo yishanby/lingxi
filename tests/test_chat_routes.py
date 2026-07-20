@@ -196,6 +196,122 @@ async def test_sessions_rest_delegates_guarded_turn_and_records_combined_usage(
 
 
 @pytest.mark.asyncio
+async def test_sessions_retry_delegates_atomic_replacement_and_records_usage(
+    route_env, monkeypatch
+) -> None:
+    session, character = entities()
+    db = DB(session, character)
+    await route_env.store.append_pair(
+        1, "retry user", "old answer", char_name="灵汐", user_name="逸山"
+    )
+    await route_env.store.write_text(1, "story_state.md", "stale retry state")
+
+    async def complete(**kwargs):
+        return {"content": "new answer", "usage": {"total_tokens": 9}}
+
+    monkeypatch.setattr(sessions, "chat_completion", complete)
+
+    response = await sessions.send_message(
+        1, SessionMessageIn(content="/retry"), db
+    )
+
+    assert [(message.role, message.content) for message in response.messages] == [
+        ("user", "retry user"),
+        ("assistant", f"{REQUIRED_OPENING}\n\nnew answer"),
+    ]
+    assert route_env.manager.submitted == [1]
+    assert route_env.usage_calls == [
+        {
+            "session_id": 1,
+            "user_id": session.user_id,
+            "character_name": "灵汐",
+            "model": "model",
+            "usage": {"total_tokens": 9},
+        }
+    ]
+    assert await route_env.store.read_text(1, "story_state.md") == ""
+
+
+@pytest.mark.asyncio
+async def test_sessions_undo_delegates_invalidation_and_pipeline_submit(
+    route_env,
+) -> None:
+    session, character = entities()
+    db = DB(session, character)
+    await route_env.store.append_pair(
+        1, "undo user", "undo answer", char_name="灵汐", user_name="逸山"
+    )
+    await route_env.store.write_text(1, "summary.md", "stale undo summary")
+
+    response = await sessions.send_message(1, SessionMessageIn(content="/undo"), db)
+
+    assert response.messages == []
+    assert route_env.manager.submitted == [1]
+    assert await route_env.store.read_text(1, "summary.md") == ""
+
+
+@pytest.mark.asyncio
+async def test_sessions_retry_resolves_original_user_under_the_turn_lock(
+    route_env,
+    monkeypatch,
+) -> None:
+    session, character = entities()
+    db = DB(session, character)
+    await route_env.store.append_pair(
+        1, "first user", "first answer", char_name="灵汐", user_name="逸山"
+    )
+    backend_started = asyncio.Event()
+    release_backend = asyncio.Event()
+    relevance_queries: list[str] = []
+
+    async def blocking_backend(backend_id, db):
+        backend_started.set()
+        await release_backend.wait()
+        return route_env.backend
+
+    async def relevant(session_id, content, recent):
+        relevance_queries.append(content)
+        return ""
+
+    async def route_complete(**kwargs):
+        return {"content": "retried answer", "usage": {}}
+
+    async def concurrent_complete(messages):
+        return {"content": "second answer", "usage": {}}
+
+    monkeypatch.setattr(sessions, "_resolve_backend", blocking_backend)
+    monkeypatch.setattr(sessions, "load_memory_relevant", relevant)
+    monkeypatch.setattr(sessions, "chat_completion", route_complete)
+
+    retry_task = asyncio.create_task(
+        sessions.send_message(1, SessionMessageIn(content="/retry"), db)
+    )
+    await backend_started.wait()
+    await ChatService(
+        route_env.store,
+        route_env.manager,
+        completion=concurrent_complete,
+    ).send(
+        TurnRequest(
+            session_id=1,
+            content="second user",
+            character={"name": "灵汐"},
+            user_name="逸山",
+        )
+    )
+    release_backend.set()
+    await retry_task
+
+    assert relevance_queries == ["second user"]
+    assert [record.content for record in await route_env.store.load_chat(1)] == [
+        "first user",
+        "first answer",
+        "second user",
+        f"{REQUIRED_OPENING}\n\nretried answer",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_established_session_without_examples_does_not_load_history_seed(
     route_env, monkeypatch
 ) -> None:
@@ -471,6 +587,25 @@ async def test_feishu_reset_clears_markdown_chat(route_env, monkeypatch) -> None
     await route_env.store.append_pair(
         1, "问", "答", char_name="灵汐", user_name="逸山"
     )
+    await route_env.store.write_text(1, "memory.md", "preserved long-term memory")
+    await route_env.store.write_text(1, "story_state.md", "stale story")
+    await route_env.store.write_text(1, "summary.md", "stale summary")
+    await route_env.store.write_text(
+        1,
+        "episodes/episode-000001.md",
+        (
+            "# Episode 000001\n\n<!-- messages: 1-2 -->\n\n"
+            "## 剧情摘要\n- 旧剧情\n\n"
+            "## 状态变化\n- 旧状态\n\n"
+            "## 承诺与伏笔\n- 旧伏笔\n"
+        ),
+    )
+    await route_env.store.write_text(
+        1,
+        "rag/index.json",
+        '{"chunks": [{"text": "stale rag", "start_message": 1, '
+        '"end_message": 2}], "embeddings": [[1]], "indexed_messages": 2}',
+    )
     sent: list[str] = []
 
     async def send_text(chat_id, text):
@@ -481,6 +616,13 @@ async def test_feishu_reset_clears_markdown_chat(route_env, monkeypatch) -> None
     await feishu._handle_command("/reset", "chat-1", "sender", db)
 
     assert await route_env.store.load_chat(1) == []
+    assert await route_env.store.read_text(1, "memory.md") == "preserved long-term memory"
+    assert await route_env.store.read_text(1, "story_state.md") == ""
+    assert await route_env.store.read_text(1, "summary.md") == ""
+    assert not (
+        route_env.store.session_dir(1) / "episodes" / "episode-000001.md"
+    ).exists()
+    assert "stale rag" not in await route_env.store.read_text(1, "rag/index.json")
     assert sent
 
 

@@ -10,7 +10,7 @@ import tempfile
 import unicodedata
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from weakref import WeakValueDictionary
 
@@ -428,6 +428,84 @@ class MarkdownMemoryStore:
         async with self.transaction(session_id) as transaction:
             await transaction.save_state(state)
 
+    async def truncate_chat(
+        self,
+        session_id: int,
+        *,
+        remove_count: int,
+    ) -> list[ChatRecord]:
+        """Atomically replace authoritative chat after invalidating derived state.
+
+        Lock order is pipeline then transaction. ChatService already owns the
+        turn lock before entering here, so concurrent turns cannot interleave.
+        """
+        if type(remove_count) is not int or remove_count < 1:
+            raise ValueError("remove_count must be a positive integer")
+        pipeline_lock = await self.pipeline_lock_for(session_id)
+        async with pipeline_lock:
+            async with self.transaction(session_id) as transaction:
+                records = await transaction.load_chat()
+                if remove_count > len(records):
+                    raise ValueError("remove_count exceeds available chat records")
+                retained = records[:-remove_count]
+                await transaction.invalidate_after(len(retained))
+                await transaction.write_text("chat.md", render_chat_records(retained))
+                return retained
+
+    async def invalidate_after(
+        self,
+        session_id: int,
+        message_number: int,
+    ) -> None:
+        """Invalidate derived artifacts after an authoritative message boundary."""
+        pipeline_lock = await self.pipeline_lock_for(session_id)
+        async with pipeline_lock:
+            async with self.transaction(session_id) as transaction:
+                records = await transaction.load_chat()
+                total = records[-1].number if records else 0
+                if (
+                    type(message_number) is not int
+                    or message_number < 0
+                    or message_number > total
+                ):
+                    raise ValueError(
+                        "message_number must be within authoritative chat history"
+                    )
+                await transaction.invalidate_after(message_number)
+
+    async def replace_final_pair(
+        self,
+        session_id: int,
+        *,
+        expected_user: ChatRecord,
+        expected_assistant: ChatRecord,
+        assistant_content: str,
+    ) -> list[ChatRecord]:
+        """Replace one snapshotted final pair after invalidating its derivations."""
+        if not isinstance(assistant_content, str):
+            raise ValueError("assistant_content must be text")
+        pipeline_lock = await self.pipeline_lock_for(session_id)
+        async with pipeline_lock:
+            async with self.transaction(session_id) as transaction:
+                records = await transaction.load_chat()
+                if (
+                    len(records) < 2
+                    or records[-2] != expected_user
+                    or records[-1] != expected_assistant
+                    or expected_user.role != "user"
+                    or expected_assistant.role != "assistant"
+                ):
+                    raise ValueError("final chat pair changed before replacement")
+                prefix = records[:-2]
+                replacement = replace(
+                    expected_assistant,
+                    content=assistant_content,
+                )
+                updated = [*prefix, expected_user, replacement]
+                await transaction.invalidate_after(len(prefix))
+                await transaction.write_text("chat.md", render_chat_records(updated))
+                return updated
+
 
 class MarkdownMemoryTransaction:
     """Non-locking session operations available only to a lock owner."""
@@ -487,6 +565,61 @@ class MarkdownMemoryTransaction:
             "memory_state.md",
             render_memory_state(state),
         )
+
+    async def invalidate_after(self, message_number: int) -> None:
+        """Invalidate derived state while the caller owns the session transaction."""
+        from app.services import rag, story_memory
+
+        episode_directory = self._store.session_dir(self.session_id) / "episodes"
+        paths = (
+            sorted(path for path in episode_directory.iterdir() if path.is_file())
+            if episode_directory.exists()
+            else []
+        )
+        episodes = []
+        previous_end = 0
+        for expected_number, path in enumerate(paths, start=1):
+            text = await self.read_text(f"episodes/{path.name}")
+            try:
+                episode = story_memory._parse_episode(text, path.name)
+            except ValueError as exc:
+                raise ValueError(f"existing episode is invalid: {path.name}") from exc
+            if (
+                episode.number != expected_number
+                or episode.start != previous_end + 1
+            ):
+                raise ValueError(
+                    "existing episode chain has conflicting, out-of-order, or "
+                    f"gapped metadata: {path.name}"
+                )
+            episodes.append((path, episode))
+            previous_end = episode.end
+
+        surviving_episode_end = max(
+            (
+                episode.end
+                for _path, episode in episodes
+                if episode.end <= message_number
+            ),
+            default=0,
+        )
+        # Persist pending work first. If a later disposable-artifact write fails,
+        # startup scanning can safely resume against the still-authoritative chat.
+        await self.save_state(
+            MemoryState(last_episode_message=surviving_episode_end)
+        )
+
+        await rag.invalidate_after(
+            self.session_id,
+            message_number,
+            transaction=self,
+        )
+        await self.write_text("story_state.md", "")
+        await self.write_text("summary.md", "")
+
+        for path, episode in episodes:
+            if episode.end > message_number:
+                path.unlink(missing_ok=True)
 
 
 def _content_start(text: str, header_end: int) -> int:

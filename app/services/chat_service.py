@@ -7,7 +7,7 @@ import inspect
 import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from app.config import settings
@@ -151,6 +151,54 @@ class ChatService:
                 char_name=self._character_name(request),
                 user_name=request.user_name,
                 msg_type=request.msg_type,
+            )
+            await self._submit_memory(request.session_id)
+            usage = result.get("usage")
+            return TurnResult(
+                content=content,
+                usage=copy.deepcopy(usage) if isinstance(usage, dict) else {},
+                retry_count=int(result.get("retry_count", 0)),
+            )
+
+    async def undo(self, session_id: int) -> list[ChatRecord]:
+        """Remove one complete final pair and enqueue regeneration once."""
+        turn_lock = await self.store.turn_lock_for(session_id)
+        async with turn_lock:
+            records = await self.store.load_chat(session_id)
+            self._final_pair(records)
+            retained = await self.store.truncate_chat(
+                session_id,
+                remove_count=2,
+            )
+            await self._submit_memory(session_id)
+            return retained
+
+    async def retry(self, request: TurnRequest) -> TurnResult:
+        """Generate first, then atomically replace one complete final pair."""
+        if self._completion is None:
+            raise RuntimeError("non-stream completion is not configured")
+        turn_lock = await self.store.turn_lock_for(request.session_id)
+        async with turn_lock:
+            records = await self.store.load_chat(request.session_id)
+            original_user, original_assistant = self._final_pair(records)
+            retry_request = replace(
+                request,
+                content=original_user.content,
+                user_name=original_user.name,
+                msg_type=original_user.msg_type,
+            )
+            messages = await self._build_messages(
+                retry_request,
+                records=records[:-2],
+                discard_invalidated_context=True,
+            )
+            result = await complete_with_guard(self._completion, messages)
+            content = str(result["content"])
+            await self.store.replace_final_pair(
+                request.session_id,
+                expected_user=original_user,
+                expected_assistant=original_assistant,
+                assistant_content=content,
             )
             await self._submit_memory(request.session_id)
             usage = result.get("usage")
@@ -324,9 +372,26 @@ class ChatService:
             return False
         return True
 
-    async def _build_messages(self, request: TurnRequest) -> list[dict[str, Any]]:
-        records = await self.store.load_chat(request.session_id)
+    async def _build_messages(
+        self,
+        request: TurnRequest,
+        *,
+        records: Sequence[ChatRecord] | None = None,
+        discard_invalidated_context: bool = False,
+    ) -> list[dict[str, Any]]:
+        if records is None:
+            records = await self.store.load_chat(request.session_id)
         domain = await self._load_domain_context(request, records)
+        if discard_invalidated_context:
+            domain = replace(
+                domain,
+                story_state="",
+                character_profiles=(),
+                assets="",
+                episodes=(),
+                rag=(),
+                overall_summary="",
+            )
         recent = [
             {"role": record.role, "content": record.content}
             for record in records
@@ -427,6 +492,16 @@ class ChatService:
     @staticmethod
     def _character_name(request: TurnRequest) -> str:
         return str(request.character.get("name") or "角色")
+
+    @staticmethod
+    def _final_pair(records: Sequence[ChatRecord]) -> tuple[ChatRecord, ChatRecord]:
+        if (
+            len(records) < 2
+            or records[-2].role != "user"
+            or records[-1].role != "assistant"
+        ):
+            raise ValueError("chat must end with a complete user/assistant pair")
+        return records[-2], records[-1]
 
     @staticmethod
     def _opening_guard_ready(buffer: str) -> bool:

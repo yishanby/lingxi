@@ -212,7 +212,14 @@ async def _handle_command(
         if session:
             turn_lock = await memory_service.md_store.turn_lock_for(session.id)
             async with turn_lock:
-                await memory_service.md_store.write_text(session.id, "chat.md", "")
+                records = await memory_service.md_store.load_chat(session.id)
+                if records:
+                    await memory_service.md_store.truncate_chat(
+                        session.id,
+                        remove_count=len(records),
+                    )
+                else:
+                    await memory_service.md_store.invalidate_after(session.id, 0)
             # Keep the V1 column empty for compatibility; Markdown is authoritative.
             session.messages = "[]"
             await db.commit()
