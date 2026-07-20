@@ -4,8 +4,10 @@ import logging
 
 import pytest
 
-from app.services.token_utils import estimate_messages_tokens, estimate_tokens
+from app.config import settings
+from app.schemas.api import MessageItem, WorldBookEntry
 from app.services.context_builder import ContextBuilder, ContextSources
+from app.services.token_utils import estimate_messages_tokens, estimate_tokens
 from app.services.prompt_policy import (
     REQUIRED_OPENING,
     build_invariant_prompt,
@@ -64,7 +66,6 @@ def test_build_prioritizes_protected_context_within_total_budget() -> None:
     assert REQUIRED_OPENING in combined
     assert current_state in combined
     assert early_fact in combined
-    assert summary_fact in combined
     assert result.messages[-1] == {"role": "user", "content": current_user_message}
     assert result.messages[-3:-1] == sources.recent
     assert result.total_tokens == estimate_messages_tokens(result.messages)
@@ -231,3 +232,92 @@ def test_optional_recent_selection_is_newest_first_but_output_is_chronological()
     assert not any(
         message["content"] == "最旧消息。" for message in result.messages
     )
+
+
+def test_clipped_high_priority_layer_consumes_budget_before_summary() -> None:
+    sources = ContextSources(
+        character={
+            "name": "C",
+            "description": "HIGH_PRIORITY_FACT " + "character-detail " * 500,
+        },
+        summary="LOW_PRIORITY_SUMMARY " * 100,
+        user_message="continue",
+    )
+
+    result = ContextBuilder(total_budget=366, min_recent_messages=0).build(sources)
+
+    combined = "\n".join(message["content"] for message in result.messages)
+    assert "HIGH_PRIORITY_FACT" in combined
+    assert "LOW_PRIORITY_SUMMARY" not in combined
+    assert result.total_tokens == estimate_messages_tokens(result.messages)
+    assert sum(result.tokens_by_layer.values()) == result.total_tokens
+    assert result.total_tokens <= 366
+
+
+def test_assemble_prompt_maps_story_state_and_episodes() -> None:
+    story_state = "CURRENT_STORY_STATE: the gate is open."
+    episode = "EPISODE_FACT: the key was hidden in the clock."
+
+    messages = assemble_prompt(
+        character=_character(),
+        worldbook_entries=[],
+        chat_history=[],
+        user_message="continue",
+        story_state=story_state,
+        episodes=[episode],
+    )
+
+    combined = "\n".join(message["content"] for message in messages)
+    assert story_state in combined
+    assert episode in combined
+    assert messages[-1] == {"role": "user", "content": "continue"}
+    assert estimate_messages_tokens(messages) <= settings.total_token_budget
+
+
+@pytest.mark.parametrize(
+    ("persona_position", "includes_persona"),
+    [
+        ("after_scenario", True),
+        ("in_prompt", True),
+        ("none", False),
+    ],
+)
+def test_assemble_prompt_preserves_persona_and_worldbook_position_order(
+    persona_position: str,
+    includes_persona: bool,
+) -> None:
+    messages = assemble_prompt(
+        character=_character(
+            scenario="SCENARIO_MARKER",
+            description="DESCRIPTION_MARKER",
+        ),
+        worldbook_entries=[
+            WorldBookEntry(
+                keyword="trigger",
+                content="BEFORE_CHARACTER_MARKER",
+                position="before_char",
+            ),
+            WorldBookEntry(
+                keyword="trigger",
+                content="AFTER_CHARACTER_MARKER",
+                position="after_char",
+            ),
+        ],
+        chat_history=[MessageItem(role="assistant", content="existing")],
+        user_message="trigger",
+        user_persona="PERSONA_MARKER",
+        persona_position=persona_position,
+    )
+
+    combined = "\n".join(message["content"] for message in messages)
+    scenario_index = combined.index("SCENARIO_MARKER")
+    before_index = combined.index("BEFORE_CHARACTER_MARKER")
+    description_index = combined.index("DESCRIPTION_MARKER")
+    after_index = combined.index("AFTER_CHARACTER_MARKER")
+    if includes_persona:
+        persona_index = combined.index("PERSONA_MARKER")
+        assert scenario_index < persona_index < before_index
+    else:
+        assert "PERSONA_MARKER" not in combined
+        assert scenario_index < before_index
+    assert before_index < description_index < after_index

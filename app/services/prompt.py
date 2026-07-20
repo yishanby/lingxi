@@ -37,6 +37,47 @@ def _match_worldbook_entries(
     return before, after
 
 
+def _legacy_character_context(
+    character: dict[str, Any],
+    *,
+    user_name: str,
+    user_persona: str,
+    persona_position: str,
+    worldbook_before: list[str],
+    worldbook_after: list[str],
+) -> list[str]:
+    """Render the highest-priority tier in the legacy relative order."""
+    char_name = str(character.get("name") or "角色")
+
+    def substitute(value: Any) -> str:
+        return str(value).replace("{{user}}", user_name).replace(
+            "{{char}}", char_name
+        )
+
+    parts: list[str] = []
+    if character.get("system_prompt"):
+        parts.append(substitute(character["system_prompt"]))
+    if character.get("personality"):
+        parts.append(f"Personality: {substitute(character['personality'])}")
+    if character.get("scenario"):
+        parts.append(f"Scenario: {substitute(character['scenario'])}")
+    if user_persona and persona_position in ("after_scenario", "in_prompt"):
+        parts.append(
+            f"[User Character: {user_name}]\n{substitute(user_persona)}"
+        )
+    if worldbook_before:
+        parts.append("[World Info]\n" + "\n".join(worldbook_before))
+    if character.get("description"):
+        parts.append(
+            f"[Character: {char_name}]\n{substitute(character['description'])}"
+        )
+    if worldbook_after:
+        parts.append(
+            "[Additional World Info]\n" + "\n".join(worldbook_after)
+        )
+    return parts
+
+
 def assemble_prompt(
     *,
     character: dict[str, Any],
@@ -52,6 +93,8 @@ def assemble_prompt(
     assets_full: str = "",
     character_profiles: str = "",
     rag_context: str = "",
+    story_state: str = "",
+    episodes: list[str] | None = None,
 ) -> list[dict[str, str]]:
     """Build the full messages payload for an LLM chat-completion call."""
     from app.config import settings
@@ -69,18 +112,23 @@ def assemble_prompt(
     if assets_full:
         assets_parts.append(f"[资产详情]\n{assets_full}")
 
+    ordered_character_context = _legacy_character_context(
+        character,
+        user_name=user_name,
+        user_persona=user_persona,
+        persona_position=persona_position,
+        worldbook_before=wb_before,
+        worldbook_after=wb_after,
+    )
+
     sources = ContextSources(
         character=character,
-        worldbook=[*wb_before, *wb_after],
         user_name=user_name,
-        user_persona=(
-            user_persona
-            if persona_position in ("after_scenario", "in_prompt")
-            else ""
-        ),
+        story_state=story_state,
         memory=memory_context,
         character_profiles=[character_profiles] if character_profiles else [],
         assets="\n\n".join(assets_parts),
+        episodes=list(episodes or []),
         rag=[rag_context] if rag_context else [],
         summary=summary_context,
         recent=[
@@ -89,6 +137,7 @@ def assemble_prompt(
         ],
         user_message=user_message,
         is_new_conversation=not chat_history,
+        ordered_character_context=ordered_character_context,
     )
     result = ContextBuilder(
         total_budget=settings.total_token_budget,

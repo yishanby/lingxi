@@ -31,6 +31,7 @@ class ContextSources:
     recent: list[dict[str, str]] = field(default_factory=list)
     user_message: str = ""
     is_new_conversation: bool = False
+    ordered_character_context: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -94,9 +95,12 @@ class ContextBuilder:
         episode_context: list[dict[str, str]] = []
         summary_context: list[dict[str, str]] = []
         selected_older_reversed: list[dict[str, str]] = []
+        selection_open = True
 
         for candidate, destination in self._character_candidates(sources, char_name):
-            fitted, remaining, _ = _fit_optional_message(candidate, remaining)
+            if not selection_open:
+                break
+            fitted, remaining, complete = _fit_optional_message(candidate, remaining)
             if fitted is not None:
                 if destination == "example":
                     character_examples.append(fitted)
@@ -104,33 +108,44 @@ class ContextBuilder:
                     history_seed.append(fitted)
                 else:
                     character_context.append(fitted)
+            if not complete:
+                selection_open = False
 
         recall = _recall_message(sources)
-        if recall is not None:
-            fitted, remaining, _ = _fit_optional_message(recall, remaining)
+        if selection_open and recall is not None:
+            fitted, remaining, complete = _fit_optional_message(recall, remaining)
             if fitted is not None:
                 recall_context.append(fitted)
+            if not complete:
+                selection_open = False
 
         episodes = _episode_rag_message(sources.episodes, sources.rag)
-        if episodes is not None:
-            fitted, remaining, _ = _fit_optional_message(episodes, remaining)
+        if selection_open and episodes is not None:
+            fitted, remaining, complete = _fit_optional_message(episodes, remaining)
             if fitted is not None:
                 episode_context.append(fitted)
+            if not complete:
+                selection_open = False
 
-        if sources.summary:
-            fitted, remaining, _ = _fit_labeled_system_message(
+        if selection_open and sources.summary:
+            fitted, remaining, complete = _fit_labeled_system_message(
                 "[Story So Far]", sources.summary, remaining
             )
             if fitted is not None:
                 summary_context.append(fitted)
-
-        for message in reversed(older_recent):
-            fitted, remaining, complete = _fit_optional_message(message, remaining)
-            if fitted is None:
-                break
-            selected_older_reversed.append(fitted)
             if not complete:
-                break
+                selection_open = False
+
+        if selection_open:
+            for message in reversed(older_recent):
+                fitted, remaining, complete = _fit_optional_message(
+                    message, remaining
+                )
+                if fitted is None:
+                    break
+                selected_older_reversed.append(fitted)
+                if not complete:
+                    break
         selected_recent = list(reversed(selected_older_reversed)) + protected_recent
 
         messages = (
@@ -168,6 +183,46 @@ class ContextBuilder:
 
     @staticmethod
     def _character_candidates(
+        sources: ContextSources, char_name: str
+    ) -> list[tuple[dict[str, str], str]]:
+        candidates: list[tuple[dict[str, str], str]] = []
+        ordered_context = [
+            part for part in sources.ordered_character_context if part
+        ]
+        if ordered_context:
+            candidates.append(
+                (
+                    {
+                        "role": "system",
+                        "content": "\n\n".join(ordered_context),
+                    },
+                    "context",
+                )
+            )
+        else:
+            candidates.extend(
+                ContextBuilder._default_character_context_candidates(
+                    sources, char_name
+                )
+            )
+
+        examples = sources.character.get("example_dialogues")
+        if examples:
+            candidates.extend(
+                (message, "example")
+                for message in _parse_example_dialogues(
+                    str(examples), char_name, sources.user_name
+                )
+            )
+        if sources.is_new_conversation:
+            candidates.extend(
+                (_copy_message(message), "seed")
+                for message in (sources.character.get("_history_seed") or [])
+            )
+        return candidates
+
+    @staticmethod
+    def _default_character_context_candidates(
         sources: ContextSources, char_name: str
     ) -> list[tuple[dict[str, str], str]]:
         candidates: list[tuple[dict[str, str], str]] = []
@@ -220,19 +275,6 @@ class ContextBuilder:
                 )
             )
 
-        examples = sources.character.get("example_dialogues")
-        if examples:
-            candidates.extend(
-                (message, "example")
-                for message in _parse_example_dialogues(
-                    str(examples), char_name, sources.user_name
-                )
-            )
-        if sources.is_new_conversation:
-            candidates.extend(
-                (_copy_message(message), "seed")
-                for message in (sources.character.get("_history_seed") or [])
-            )
         return candidates
 
 
@@ -253,12 +295,28 @@ def _fit_optional_message(
     content_budget = remaining - 4
     if content_budget <= 0:
         return None, remaining, False
-    clipped = truncate_to_tokens(message["content"], content_budget)
+    clipped = _truncate_prefix_to_tokens(message["content"], content_budget)
     if not clipped:
         return None, remaining, False
     fitted = {"role": message["role"], "content": clipped}
     fitted_tokens = estimate_tokens(clipped) + 4
     return fitted, remaining - fitted_tokens, False
+
+
+def _truncate_prefix_to_tokens(text: str, max_tokens: int) -> str:
+    if max_tokens <= 0:
+        return ""
+    if estimate_tokens(text) <= max_tokens:
+        return text
+    low = 0
+    high = len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if estimate_tokens(text[:middle]) <= max_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low]
 
 
 def _fit_labeled_system_message(
@@ -272,9 +330,10 @@ def _fit_labeled_system_message(
     header = f"{label}\n"
     body_budget = remaining - estimate_tokens(header) - 4
     if body_budget <= 0:
-        return _fit_optional_message(
+        fitted, remaining_after_label, _ = _fit_optional_message(
             {"role": "system", "content": label}, remaining
         )
+        return fitted, remaining_after_label, False
     clipped = truncate_to_tokens(text, body_budget)
     fitted = {"role": "system", "content": header + clipped}
     while clipped and estimate_messages_tokens([fitted]) > remaining:
