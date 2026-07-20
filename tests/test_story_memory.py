@@ -1033,9 +1033,110 @@ async def test_episode_nonzero_checkpoint_selects_numbers_not_list_indexes(
 
 
 @pytest.mark.asyncio
+async def test_empty_history_without_episodes_returns_zero_without_completion(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    calls = 0
+
+    async def must_not_complete(_messages: list[dict[str, str]]) -> str:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("completion must not be called")
+
+    assert await create_due_episodes(
+        store,
+        1,
+        [],
+        0,
+        must_not_complete,
+        episode_size=20,
+    ) == 0
+    assert calls == 0
+    assert not (tmp_path / "1" / "episodes").exists()
+
+
+@pytest.mark.asyncio
+async def test_empty_history_rejects_stale_existing_episode_without_rewrite(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    stale = episode_document(1, 1, 20, "已撤销章节")
+    await store.write_text(1, "episodes/episode-000001.md", stale)
+    path = tmp_path / "1" / "episodes" / "episode-000001.md"
+    before = (path.read_bytes(), path.stat().st_mtime_ns)
+    calls = 0
+
+    async def must_not_complete(_messages: list[dict[str, str]]) -> str:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("completion must not be called")
+
+    with pytest.raises(ValueError, match="existing episode.*available records"):
+        await create_due_episodes(
+            store,
+            1,
+            [],
+            0,
+            must_not_complete,
+            episode_size=20,
+        )
+
+    assert calls == 0
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+
+
+@pytest.mark.asyncio
+async def test_empty_history_stops_stale_episode_before_summary_resurrection(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    stale = episode_document(1, 1, 20, "已撤销章节")
+    await store.write_text(1, "episodes/episode-000001.md", stale)
+    old_summary = "撤销后摘要保持不变\n"
+    await store.write_text(1, "summary.md", old_summary)
+    episode_calls = 0
+    summary_calls = 0
+
+    async def episode_complete(_messages: list[dict[str, str]]) -> str:
+        nonlocal episode_calls
+        episode_calls += 1
+        raise AssertionError("episode completion must not be called")
+
+    async def summary_complete(_messages: list[dict[str, str]]) -> str:
+        nonlocal summary_calls
+        summary_calls += 1
+        return "错误复活的摘要"
+
+    async def run_pipeline() -> int:
+        checkpoint = await create_due_episodes(
+            store,
+            1,
+            [],
+            0,
+            episode_complete,
+            episode_size=20,
+        )
+        return await update_summary_from_episodes(
+            store,
+            1,
+            checkpoint,
+            summary_complete,
+            max_tokens=100,
+        )
+
+    with pytest.raises(ValueError, match="existing episode.*available records"):
+        await run_pipeline()
+
+    assert episode_calls == 0
+    assert summary_calls == 0
+    assert await store.read_text(1, "episodes/episode-000001.md") == stale
+    assert await store.read_text(1, "summary.md") == old_summary
+
+
+@pytest.mark.asyncio
 async def test_existing_episode_chain_cannot_extend_beyond_supplied_history(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = MarkdownMemoryStore(tmp_path)
     existing = {
@@ -1045,19 +1146,15 @@ async def test_existing_episode_chain_cannot_extend_beyond_supplied_history(
     for filename, document in existing.items():
         await store.write_text(1, f"episodes/{filename}", document)
 
+    episode_directory = tmp_path / "1" / "episodes"
+    before = {
+        filename: (
+            (episode_directory / filename).read_bytes(),
+            (episode_directory / filename).stat().st_mtime_ns,
+        )
+        for filename in existing
+    }
     calls = 0
-    writes: list[str] = []
-    original_write = store._write_text_unlocked
-
-    async def track_write(
-        session_id: int,
-        relative: str | Path,
-        text: str,
-    ) -> None:
-        writes.append(str(relative))
-        await original_write(session_id, relative, text)
-
-    monkeypatch.setattr(store, "_write_text_unlocked", track_write)
 
     async def must_not_complete(_messages: list[dict[str, str]]) -> str:
         nonlocal calls
@@ -1075,11 +1172,13 @@ async def test_existing_episode_chain_cannot_extend_beyond_supplied_history(
         )
 
     assert calls == 0
-    assert writes == []
-    assert {
-        filename: await store.read_text(1, f"episodes/{filename}")
+    assert before == {
+        filename: (
+            (episode_directory / filename).read_bytes(),
+            (episode_directory / filename).stat().st_mtime_ns,
+        )
         for filename in existing
-    } == existing
+    }
 
 
 @pytest.mark.asyncio
@@ -1222,7 +1321,6 @@ async def test_existing_episode_is_idempotent_without_another_completion(
 @pytest.mark.asyncio
 async def test_legacy_episode_with_extra_h2_and_marker_is_reused_without_rewrite(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = MarkdownMemoryStore(tmp_path)
     legacy = episode_document(1, 1, 20, "旧章节").replace(
@@ -1233,18 +1331,8 @@ async def test_legacy_episode_with_extra_h2_and_marker_is_reused_without_rewrite
         ),
     )
     await store.write_text(1, "episodes/episode-000001.md", legacy)
-    writes: list[str] = []
-    original_write = store._write_text_unlocked
-
-    async def track_write(
-        session_id: int,
-        relative: str | Path,
-        text: str,
-    ) -> None:
-        writes.append(str(relative))
-        await original_write(session_id, relative, text)
-
-    monkeypatch.setattr(store, "_write_text_unlocked", track_write)
+    path = tmp_path / "1" / "episodes" / "episode-000001.md"
+    before = (path.read_bytes(), path.stat().st_mtime_ns)
 
     async def must_not_complete(_messages: list[dict[str, str]]) -> str:
         raise AssertionError("completion must not be called")
@@ -1257,8 +1345,7 @@ async def test_legacy_episode_with_extra_h2_and_marker_is_reused_without_rewrite
         must_not_complete,
         episode_size=20,
     ) == 20
-    assert writes == []
-    assert await store.read_text(1, "episodes/episode-000001.md") == legacy
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
 
 
 @pytest.mark.asyncio
@@ -1407,7 +1494,6 @@ async def test_episode_completion_failure_does_not_create_file(
 )
 async def test_later_episode_failure_preserves_progress_and_retry_reuses_it(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     failure: BaseException,
 ) -> None:
     store = MarkdownMemoryStore(tmp_path)
@@ -1437,18 +1523,8 @@ async def test_later_episode_failure_preserves_progress_and_retry_reuses_it(
     assert "[21] user: message 21" in attempt_prompts[1]
     assert "[40] assistant: message 40" in attempt_prompts[1]
 
-    writes: list[str] = []
-    original_write = store._write_text_unlocked
-
-    async def track_write(
-        session_id: int,
-        relative: str | Path,
-        text: str,
-    ) -> None:
-        writes.append(str(relative))
-        await original_write(session_id, relative, text)
-
-    monkeypatch.setattr(store, "_write_text_unlocked", track_write)
+    first_path = tmp_path / "1" / "episodes" / "episode-000001.md"
+    first_before_retry = (first_path.read_bytes(), first_path.stat().st_mtime_ns)
     retry_prompts: list[str] = []
 
     async def complete_missing(messages: list[dict[str, str]]) -> str:
@@ -1468,8 +1544,7 @@ async def test_later_episode_failure_preserves_progress_and_retry_reuses_it(
     assert "[21] user: message 21" in retry_prompts[0]
     assert "[40] assistant: message 40" in retry_prompts[0]
     assert "message 20" not in retry_prompts[0]
-    assert writes == ["episodes/episode-000002.md"]
-    assert await store.read_text(1, "episodes/episode-000001.md") == first_expected
+    assert (first_path.read_bytes(), first_path.stat().st_mtime_ns) == first_before_retry
     assert await store.read_text(
         1,
         "episodes/episode-000002.md",

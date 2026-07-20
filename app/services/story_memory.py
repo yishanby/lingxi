@@ -455,13 +455,10 @@ async def create_due_episodes(
         raise ValueError("episode checkpoint must align to episode size")
     _validate_records(records)
 
-    if not records:
-        if last_episode_message:
-            raise ValueError("episode checkpoint exceeds available records")
-        return 0
-    if last_episode_message > records[-1].number:
+    history_end = records[-1].number if records else 0
+    if records and last_episode_message > history_end:
         raise ValueError("episode checkpoint exceeds available records")
-    if last_episode_message < records[0].number - 1:
+    if records and last_episode_message < records[0].number - 1:
         raise ValueError("records do not include the next episode message")
 
     by_number = {record.number: record for record in records}
@@ -471,13 +468,17 @@ async def create_due_episodes(
             store,
             transaction,
             episode_size=episode_size,
-            checkpoint=last_episode_message,
+            checkpoint=min(last_episode_message, history_end),
         )
         if existing_episodes and max(
             episode.end for episode in existing_episodes.values()
-        ) > records[-1].number:
+        ) > history_end:
             raise ValueError("existing episode chain exceeds available records")
-        while records[-1].number - checkpoint >= episode_size:
+        if last_episode_message > history_end:
+            raise ValueError("episode checkpoint exceeds available records")
+        if not records:
+            return 0
+        while history_end - checkpoint >= episode_size:
             start = checkpoint + 1
             end = checkpoint + episode_size
             try:
