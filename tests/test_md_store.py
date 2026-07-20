@@ -2307,6 +2307,44 @@ async def test_chat_replace_failure_preserves_every_authoritative_and_derived_fi
 
 
 @pytest.mark.asyncio
+async def test_replace_final_pair_chat_commit_failure_preserves_original_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "original user",
+        "original assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    records = await store.load_chat(1)
+    original_chat = await store.read_text(1, "chat.md")
+    real_replace = md_store_module.os.replace
+
+    def fail_chat(source: Path, target: Path) -> None:
+        if target.name == "chat.md":
+            raise OSError("chat replacement failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_chat)
+
+    with pytest.raises(OSError, match="chat replacement failed"):
+        await store.replace_final_pair(
+            1,
+            expected_user=records[-2],
+            expected_assistant=records[-1],
+            assistant_content="replacement",
+        )
+
+    assert await store.read_text(1, "chat.md") == original_chat
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
+
+
+@pytest.mark.asyncio
 async def test_recovery_discards_crash_before_chat_replace_without_invalidation(
     tmp_path: Path,
 ) -> None:
@@ -2529,6 +2567,7 @@ async def test_direct_retry_replace_refuses_malformed_intent_without_mutation(
 async def test_leftover_intent_after_cleanup_is_idempotently_removed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     store = MarkdownMemoryStore(tmp_path)
     for pair in range(1, 3):
@@ -2551,19 +2590,22 @@ async def test_leftover_intent_after_cleanup_is_idempotently_removed(
         real_unlink(path, missing_ok=missing_ok)
 
     monkeypatch.setattr(Path, "unlink", fail_intent_unlink)
+    caplog.set_level(logging.WARNING, logger="app.services.md_store")
 
-    with pytest.raises(OSError, match="intent unlink failed"):
-        await store.replace_final_pair(
-            1,
-            expected_user=records[-2],
-            expected_assistant=records[-1],
-            assistant_content="replacement",
-        )
+    updated = await store.replace_final_pair(
+        1,
+        expected_user=records[-2],
+        expected_assistant=records[-1],
+        assistant_content="replacement",
+    )
 
     state = await store.load_state(1)
+    assert updated[-1].content == "replacement"
     assert not state.cleanup_required
     assert state.rebuild_from_message == 2
     assert (tmp_path / "1" / "invalidation_intent.md").exists()
+    assert "recovery remains pending" in caplog.text
+    assert "intent unlink failed" not in caplog.text
     session = tmp_path / "1"
     relatives = (
         "chat.md",
@@ -2655,13 +2697,15 @@ async def test_target_intent_rearms_cleanup_when_prior_boundary_is_identical(
 
     monkeypatch.setattr(md_store_module.os, "replace", fail_state)
 
-    with pytest.raises(OSError, match="new state marker failed"):
-        await store.replace_final_pair(
-            1,
-            expected_user=records[-2],
-            expected_assistant=records[-1],
-            assistant_content="second replacement",
-        )
+    updated = await store.replace_final_pair(
+        1,
+        expected_user=records[-2],
+        expected_assistant=records[-1],
+        assistant_content="second replacement",
+    )
+
+    assert updated[-1].content == "second replacement"
+    assert (tmp_path / "1" / "invalidation_intent.md").exists()
 
     monkeypatch.setattr(md_store_module.os, "replace", real_replace)
     await MarkdownMemoryStore(tmp_path).recover_invalidation(1)
@@ -2792,9 +2836,9 @@ async def test_episode_cleanup_deletes_in_reverse_and_pipeline_retry_recovers(
 
     monkeypatch.setattr(Path, "unlink", fail_one)
 
-    with pytest.raises(OSError, match="episode deletion failed"):
-        await store.truncate_chat(1, remove_count=6)
+    retained = await store.truncate_chat(1, remove_count=6)
 
+    assert retained == []
     assert await store.load_chat(1) == []
     assert deletions == attempted
     assert sorted(
@@ -2814,6 +2858,7 @@ async def test_episode_cleanup_deletes_in_reverse_and_pipeline_retry_recovers(
 async def test_truncate_cleanup_failure_commits_chat_and_pipeline_recovers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import app.services.md_store as md_store_module
 
@@ -2844,18 +2889,109 @@ async def test_truncate_cleanup_failure_commits_chat_and_pipeline_recovers(
         real_replace(source, target)
 
     monkeypatch.setattr(md_store_module.os, "replace", fail_story_once)
+    caplog.set_level(logging.WARNING, logger="app.services.md_store")
 
-    with pytest.raises(OSError, match="story replacement failed"):
-        await store.truncate_chat(1, remove_count=2)
+    retained = await store.truncate_chat(1, remove_count=2)
 
+    assert retained == []
     assert await store.load_chat(1) == []
     assert (await store.load_state(1)).cleanup_required
+    assert "recovery remains pending" in caplog.text
+    assert "story replacement failed" not in caplog.text
 
     monkeypatch.setattr(md_store_module.os, "replace", real_replace)
     from app.services.memory_pipeline import MemoryPipeline
 
     await MemoryPipeline(store).run(1, {})
     assert not (await store.load_state(1)).rebuild_required
+
+
+@pytest.mark.asyncio
+async def test_empty_reconciliation_failure_returns_committed_truncation_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path)
+    await store.append_pair(
+        1,
+        "original user",
+        "original assistant",
+        char_name="Character",
+        user_name="User",
+    )
+    real_reconcile = md_store_module.MarkdownMemoryTransaction.reconcile_empty_history
+
+    async def fail_reconcile(transaction) -> None:
+        raise OSError("empty reconciliation failed")
+
+    monkeypatch.setattr(
+        md_store_module.MarkdownMemoryTransaction,
+        "reconcile_empty_history",
+        fail_reconcile,
+    )
+
+    retained = await store.truncate_chat(1, remove_count=2)
+
+    assert retained == []
+    assert await store.load_chat(1) == []
+    assert (tmp_path / "1" / "invalidation_intent.md").exists()
+
+    monkeypatch.setattr(
+        md_store_module.MarkdownMemoryTransaction,
+        "reconcile_empty_history",
+        real_reconcile,
+    )
+    await MarkdownMemoryStore(tmp_path).recover_invalidation(1)
+
+    assert await store.load_state(1) == MemoryState()
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_post_commit_cancellation_propagates_and_remains_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path)
+    for pair in range(1, 3):
+        await store.append_pair(
+            1,
+            f"user-{pair}",
+            f"assistant-{pair}",
+            char_name="Character",
+            user_name="User",
+        )
+    real_start = md_store_module.MarkdownMemoryTransaction.start_invalidation
+
+    async def cancel_start(transaction, plan) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        md_store_module.MarkdownMemoryTransaction,
+        "start_invalidation",
+        cancel_start,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await store.truncate_chat(1, remove_count=2)
+
+    committed = await store.load_chat(1)
+    assert [record.content for record in committed] == ["user-1", "assistant-1"]
+    assert (tmp_path / "1" / "invalidation_intent.md").exists()
+
+    monkeypatch.setattr(
+        md_store_module.MarkdownMemoryTransaction,
+        "start_invalidation",
+        real_start,
+    )
+    await MarkdownMemoryStore(tmp_path).recover_invalidation(1)
+
+    assert await store.load_chat(1) == committed
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
 
 
 @pytest.mark.asyncio

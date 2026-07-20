@@ -1053,9 +1053,9 @@ class MarkdownMemoryStore:
 
         Lock order is pipeline then transaction. ChatService already owns the
         turn lock before entering here, so concurrent turns cannot interleave.
-        A failure after the chat replacement means the truncation committed;
-        callers must reload instead of repeating it while startup recovery
-        finishes any marker-backed cleanup.
+        Ordinary failures after chat replacement leave marker-backed recovery
+        pending and still return the committed records. Cancellation continues
+        to propagate while the journal preserves the committed boundary.
         """
         if type(remove_count) is not int or remove_count < 1:
             raise ValueError("remove_count must be a positive integer")
@@ -1084,11 +1084,19 @@ class MarkdownMemoryStore:
                 except Exception:
                     await transaction.clear_invalidation_intent()
                     raise
-                await transaction.start_invalidation(plan)
-                await transaction.finish_invalidation_cleanup(plan)
-                if not retained:
-                    await transaction.reconcile_empty_history()
-                await transaction.clear_invalidation_intent()
+                try:
+                    await transaction.start_invalidation(plan)
+                    await transaction.finish_invalidation_cleanup(plan)
+                    if not retained:
+                        await transaction.reconcile_empty_history()
+                    await transaction.clear_invalidation_intent()
+                except Exception as exc:
+                    logger.warning(
+                        "Committed chat truncation for session %s; "
+                        "invalidation recovery remains pending (%s)",
+                        session_id,
+                        type(exc).__name__,
+                    )
                 return retained
 
     async def invalidate_after(
@@ -1125,7 +1133,7 @@ class MarkdownMemoryStore:
         expected_assistant: ChatRecord,
         assistant_content: str,
     ) -> list[ChatRecord]:
-        """Replace one snapshotted final pair after invalidating its derivations."""
+        """Commit one final-pair replacement, leaving cleanup recoverable."""
         if not isinstance(assistant_content, str):
             raise ValueError("assistant_content must be text")
         pipeline_lock = await self.pipeline_lock_for(session_id)
@@ -1164,9 +1172,17 @@ class MarkdownMemoryStore:
                 except Exception:
                     await transaction.clear_invalidation_intent()
                     raise
-                await transaction.start_invalidation(plan)
-                await transaction.finish_invalidation_cleanup(plan)
-                await transaction.clear_invalidation_intent()
+                try:
+                    await transaction.start_invalidation(plan)
+                    await transaction.finish_invalidation_cleanup(plan)
+                    await transaction.clear_invalidation_intent()
+                except Exception as exc:
+                    logger.warning(
+                        "Committed final-pair replacement for session %s; "
+                        "invalidation recovery remains pending (%s)",
+                        session_id,
+                        type(exc).__name__,
+                    )
                 return updated
 
 

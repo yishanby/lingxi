@@ -188,13 +188,14 @@ async def test_send_recovers_unresolved_intent_before_context_and_releases_pipel
         real_replace(source, target)
 
     monkeypatch.setattr(md_store_module.os, "replace", fail_state)
-    with pytest.raises(OSError, match="state marker failed"):
-        await store.replace_final_pair(
-            1,
-            expected_user=records[-2],
-            expected_assistant=records[-1],
-            assistant_content="replacement assistant",
-        )
+    updated = await store.replace_final_pair(
+        1,
+        expected_user=records[-2],
+        expected_assistant=records[-1],
+        assistant_content="replacement assistant",
+    )
+    assert updated[-1].content == "replacement assistant"
+    assert (tmp_path / "1" / "invalidation_intent.md").exists()
     monkeypatch.setattr(md_store_module.os, "replace", real_replace)
 
     async def complete(messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -868,13 +869,14 @@ async def test_stream_recovers_unresolved_intent_before_context_and_provider(
         real_replace(source, target)
 
     monkeypatch.setattr(md_store_module.os, "replace", fail_state)
-    with pytest.raises(OSError, match="state marker failed"):
-        await store.replace_final_pair(
-            1,
-            expected_user=records[-2],
-            expected_assistant=records[-1],
-            assistant_content="replacement assistant",
-        )
+    updated = await store.replace_final_pair(
+        1,
+        expected_user=records[-2],
+        expected_assistant=records[-1],
+        assistant_content="replacement assistant",
+    )
+    assert updated[-1].content == "replacement assistant"
+    assert (tmp_path / "1" / "invalidation_intent.md").exists()
     monkeypatch.setattr(md_store_module.os, "replace", real_replace)
 
     async def stream(messages: list[dict[str, Any]]):
@@ -1872,6 +1874,54 @@ async def test_retry_submit_failure_keeps_single_committed_pair(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_retry_post_commit_cleanup_failure_returns_replacement_and_submits_once(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path)
+    await _seed_retry_pair(store)
+    manager = MemoryManager()
+    real_replace = md_store_module.os.replace
+    cleanup_failures = 0
+
+    def fail_story_once(source, target) -> None:
+        nonlocal cleanup_failures
+        if target.name == "story_state.md" and cleanup_failures == 0:
+            cleanup_failures += 1
+            raise OSError("post-commit cleanup failed")
+        real_replace(source, target)
+
+    async def complete(messages):
+        return {"content": "replacement", "usage": USAGE}
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_story_once)
+
+    result = await ChatService(store, manager, completion=complete).retry(
+        request(content="/retry")
+    )
+
+    committed = await store.load_chat(1)
+    assert result.content == f"{REQUIRED_OPENING}\n\nreplacement"
+    assert result.usage == USAGE
+    assert [record.content for record in committed] == [
+        "prefix user",
+        "prefix assistant",
+        "retry this",
+        f"{REQUIRED_OPENING}\n\nreplacement",
+    ]
+    assert manager.submitted == [1]
+    assert cleanup_failures == 1
+
+    monkeypatch.setattr(md_store_module.os, "replace", real_replace)
+    await store.recover_invalidation(1)
+
+    assert await store.load_chat(1) == committed
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
+
+
+@pytest.mark.asyncio
 async def test_retry_of_only_pair_arms_full_rebuild_from_replacement_pair(
     tmp_path,
 ) -> None:
@@ -1986,6 +2036,45 @@ async def test_undo_removes_one_complete_pair_invalidates_and_submits(tmp_path) 
     assert retained == await store.load_chat(1)
     assert (await store.load_state(1)).rebuild_required
     assert manager.submitted == [1]
+
+
+@pytest.mark.asyncio
+async def test_undo_post_commit_cleanup_failure_returns_retained_and_submits_once(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.md_store as md_store_module
+
+    store = MarkdownMemoryStore(tmp_path)
+    await _seed_retry_pair(store)
+    manager = MemoryManager()
+    real_replace = md_store_module.os.replace
+    cleanup_failures = 0
+
+    def fail_story_once(source, target) -> None:
+        nonlocal cleanup_failures
+        if target.name == "story_state.md" and cleanup_failures == 0:
+            cleanup_failures += 1
+            raise OSError("post-commit cleanup failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr(md_store_module.os, "replace", fail_story_once)
+
+    retained = await ChatService(store, manager).undo(1)
+
+    assert [record.content for record in retained] == [
+        "prefix user",
+        "prefix assistant",
+    ]
+    assert await store.load_chat(1) == retained
+    assert manager.submitted == [1]
+    assert cleanup_failures == 1
+
+    monkeypatch.setattr(md_store_module.os, "replace", real_replace)
+    await store.recover_invalidation(1)
+
+    assert await store.load_chat(1) == retained
+    assert not (tmp_path / "1" / "invalidation_intent.md").exists()
 
 
 @pytest.mark.asyncio

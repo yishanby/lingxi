@@ -3430,9 +3430,10 @@ async def test_checkpoint_beyond_truncated_total_triggers_startup_recovery(
 
     monkeypatch.setattr(md_store_module.os, "replace", fail_pending_state)
 
-    with pytest.raises(OSError, match="pending state failed"):
-        await store.truncate_chat(1, remove_count=2)
+    retained = await store.truncate_chat(1, remove_count=2)
 
+    assert len(retained) == 8
+    assert retained == await store.load_chat(1)
     assert len(await store.load_chat(1)) == 8
     old_state = await store.load_state(1)
     assert old_state.last_memory_message == 10
@@ -3509,9 +3510,9 @@ async def test_partial_cleanup_failure_is_scannable_and_restart_recovers(
 
     monkeypatch.setattr(md_store_module.os, "replace", fail_target)
 
-    with pytest.raises(OSError, match="cleanup failed"):
-        await store.truncate_chat(1, remove_count=2)
+    retained = await store.truncate_chat(1, remove_count=2)
 
+    assert retained == []
     assert await store.load_chat(1) == []
     pending = await store.load_state(1)
     assert pending.cleanup_required
@@ -3554,9 +3555,9 @@ async def test_cleanup_completion_state_failure_retries_without_llm(
 
     monkeypatch.setattr(md_store_module.os, "replace", fail_second_state)
 
-    with pytest.raises(OSError, match="cleanup completion state failed"):
-        await store.truncate_chat(1, remove_count=2)
+    retained = await store.truncate_chat(1, remove_count=2)
 
+    assert retained == []
     assert await store.load_chat(1) == []
     assert (await store.load_state(1)).cleanup_required
 
@@ -3667,12 +3668,12 @@ async def test_empty_history_reconciliation_fault_is_scannable_and_restart_safe(
     monkeypatch.setattr(Path, "unlink", fail_reconciliation_delete)
     monkeypatch.setattr(md_store_module.os, "replace", fail_final_state)
 
-    with pytest.raises(OSError, match=f"{fault} reconciliation failed"):
-        if operation == "reset":
-            await store.truncate_chat(1, remove_count=2)
-        else:
-            await ChatService(store, None).undo(1)
+    if operation == "reset":
+        retained = await store.truncate_chat(1, remove_count=2)
+    else:
+        retained = await ChatService(store, None).undo(1)
 
+    assert retained == []
     assert await store.load_chat(1) == []
     pending = await store.load_state(1)
     assert pending.rebuild_required
@@ -3873,14 +3874,14 @@ async def test_retry_state_write_failure_recovers_exact_boundary_from_intent(
 
     monkeypatch.setattr(md_store_module.os, "replace", fail_state)
 
-    with pytest.raises(OSError, match="state marker failed"):
-        await store.replace_final_pair(
-            1,
-            expected_user=records[-2],
-            expected_assistant=records[-1],
-            assistant_content="replacement assistant",
-        )
+    updated = await store.replace_final_pair(
+        1,
+        expected_user=records[-2],
+        expected_assistant=records[-1],
+        assistant_content="replacement assistant",
+    )
 
+    assert updated[-1].content == "replacement assistant"
     assert (await store.load_chat(1))[-1].content == "replacement assistant"
     assert (tmp_path / "1" / "invalidation_intent.md").exists()
     old_state = await store.load_state(1)
@@ -3992,14 +3993,14 @@ async def test_retry_rag_cleanup_failure_restarts_at_persisted_boundary_two(
 
     monkeypatch.setattr(md_store_module.os, "replace", fail_rag)
 
-    with pytest.raises(OSError, match="rag cleanup failed"):
-        await store.replace_final_pair(
-            1,
-            expected_user=records[-2],
-            expected_assistant=records[-1],
-            assistant_content="replacement assistant",
-        )
+    updated = await store.replace_final_pair(
+        1,
+        expected_user=records[-2],
+        expected_assistant=records[-1],
+        assistant_content="replacement assistant",
+    )
 
+    assert updated[-1].content == "replacement assistant"
     pending = await store.load_state(1)
     assert pending.cleanup_required
     assert pending.rebuild_from_message == 2
@@ -4068,14 +4069,14 @@ async def test_retry_episode_delete_failure_reuses_prefix_and_regenerates_two(
 
     monkeypatch.setattr(Path, "unlink", fail_episode_two)
 
-    with pytest.raises(OSError, match="episode two deletion failed"):
-        await store.replace_final_pair(
-            1,
-            expected_user=records[-2],
-            expected_assistant=records[-1],
-            assistant_content="replacement assistant",
-        )
+    updated = await store.replace_final_pair(
+        1,
+        expected_user=records[-2],
+        expected_assistant=records[-1],
+        assistant_content="replacement assistant",
+    )
 
+    assert updated[-1].content == "replacement assistant"
     pending = await store.load_state(1)
     assert pending.cleanup_required
     assert pending.rebuild_from_message == 2
@@ -4173,9 +4174,10 @@ async def test_historical_episode_size_delete_failure_restarts_newest_first(
 
     monkeypatch.setattr(Path, "unlink", fail_historical_episode)
 
-    with pytest.raises(OSError, match="historical episode deletion failed"):
-        await store.truncate_chat(1, remove_count=2)
+    retained = await store.truncate_chat(1, remove_count=2)
 
+    assert len(retained) == 6
+    assert retained == await store.load_chat(1)
     assert len(await store.load_chat(1)) == 6
     assert deletion_attempts == [
         "episode-000004.md",
