@@ -96,6 +96,28 @@ _CONTAINER_HEADING_CASES = [
     pytest.param("``` invalid`\n# Appendix", id="invalid-backtick-info-atx"),
 ]
 
+_RAW_HTML_CASES = [
+    pytest.param("<span>visibleWord</span>", id="inline-span"),
+    pytest.param("<span>visibleWord", id="malformed-inline"),
+    pytest.param("<script>visibleWord</script>", id="script"),
+    pytest.param("<style>visibleWord</style>", id="style"),
+    pytest.param("<template>visibleWord</template>", id="template"),
+    pytest.param("<head><title>visibleWord</title></head>", id="head-title"),
+    pytest.param("<title>visibleWord</title>", id="title"),
+    pytest.param("<noscript>visibleWord</noscript>", id="noscript"),
+    pytest.param("<iframe>visibleWord</iframe>", id="iframe"),
+    pytest.param("<!-- benign comment -->", id="comment"),
+    pytest.param("<div hidden/>visibleWord", id="self-closing-hidden"),
+    pytest.param(
+        "<div hidden>\n\nvisibleWord\n\n</div>",
+        id="cross-block-hidden",
+    ),
+    pytest.param(
+        "![<span>image alt</span>](artifact.png)",
+        id="nested-image-alt",
+    ),
+]
+
 
 async def _assert_generated_heading_rejected(
     tmp_path: Path,
@@ -456,13 +478,19 @@ async def test_real_extra_h2_outside_fence_is_rejected(
 @pytest.mark.parametrize("target", ["story", "episode"])
 @pytest.mark.parametrize(
     "content",
-    ["<!-- -->", "-", "***", "![](artifact.png)", "![<b></b>](artifact.png)"],
+    [
+        "-",
+        "***",
+        "![](artifact.png)",
+        "![`code`](artifact.png)",
+        "![&copy;](artifact.png)",
+    ],
     ids=[
-        "comment-only",
         "bare-list-marker",
         "thematic-break",
         "empty-image-alt",
-        "formatting-only-image-alt",
+        "code-only-image-alt",
+        "entity-only-image-alt",
     ],
 )
 async def test_generated_required_section_rejects_nonmeaningful_markdown(
@@ -511,7 +539,7 @@ async def test_generated_required_section_rejects_nonmeaningful_markdown(
         "```text\n关键代码\n```",
         "    关键代码",
         "![关键线索](artifact.png)",
-        "<div>关键线索</div>",
+        "![![嵌套线索](nested.png)](artifact.png)",
     ],
     ids=[
         "text",
@@ -519,7 +547,7 @@ async def test_generated_required_section_rejects_nonmeaningful_markdown(
         "fenced-code",
         "indented-code",
         "image-alt",
-        "html-text",
+        "nested-image-alt",
     ],
 )
 async def test_generated_required_section_accepts_meaningful_markdown(
@@ -557,6 +585,138 @@ async def test_generated_required_section_accepts_meaningful_markdown(
         ) == episode_document(1, 1, 20, content)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode", "summary"])
+@pytest.mark.parametrize("raw_html", _RAW_HTML_CASES)
+async def test_generated_output_rejects_raw_html_outside_code(
+    tmp_path: Path,
+    target: str,
+    raw_html: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+
+    if target == "story":
+        old = story_state() + "\n"
+        await store.write_text(1, "story_state.md", old)
+        generated = story_state().replace(
+            "\n\n## 在场角色",
+            f"\n\n{raw_html}\n\n## 在场角色",
+        )
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        with pytest.raises(ValueError, match="story state.*raw HTML"):
+            await update_story_state(store, 1, records(2), fake_complete)
+        assert await store.read_text(1, "story_state.md") == old
+    elif target == "episode":
+        generated = episode_body().replace(
+            "\n\n## 状态变化",
+            f"\n\n{raw_html}\n\n## 状态变化",
+        )
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        with pytest.raises(ValueError, match="episode.*raw HTML"):
+            await create_due_episodes(
+                store,
+                1,
+                records(20),
+                0,
+                fake_complete,
+                episode_size=20,
+            )
+        assert not (tmp_path / "1" / "episodes" / "episode-000001.md").exists()
+    else:
+        await store.write_text(
+            1,
+            "episodes/episode-000001.md",
+            episode_document(1, 1, 20),
+        )
+        old = "旧摘要保持不变\n"
+        await store.write_text(1, "summary.md", old)
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return f"连续叙事。\n\n{raw_html}"
+
+        with pytest.raises(ValueError, match="summary.*raw HTML"):
+            await update_summary_from_episodes(
+                store,
+                1,
+                0,
+                fake_complete,
+                max_tokens=200,
+            )
+        assert await store.read_text(1, "summary.md") == old
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["story", "episode", "summary"])
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "```html\n<span>literal</span>\n```",
+        "    <script>literal</script>",
+        "`<template>literal</template>`",
+        "`<!-- benign comment -->`",
+    ],
+    ids=["fenced", "indented", "inline", "comment-inline"],
+)
+async def test_generated_output_allows_raw_html_literals_in_code(
+    tmp_path: Path,
+    target: str,
+    literal: str,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+
+    if target == "story":
+        generated = story_state().replace("- 当前地点：门厅", literal)
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await update_story_state(store, 1, records(2), fake_complete) == generated
+        assert await store.read_text(1, "story_state.md") == generated + "\n"
+    elif target == "episode":
+        generated = episode_body().replace("完成章节", f"完成章节\n\n{literal}")
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await create_due_episodes(
+            store,
+            1,
+            records(20),
+            0,
+            fake_complete,
+            episode_size=20,
+        ) == 20
+        assert await store.read_text(
+            1,
+            "episodes/episode-000001.md",
+        ) == episode_document(1, 1, 20, f"完成章节\n\n{literal}")
+    else:
+        await store.write_text(
+            1,
+            "episodes/episode-000001.md",
+            episode_document(1, 1, 20),
+        )
+        generated = f"连续叙事。\n\n{literal}"
+
+        async def fake_complete(_messages: list[dict[str, str]]) -> str:
+            return generated
+
+        assert await update_summary_from_episodes(
+            store,
+            1,
+            0,
+            fake_complete,
+            max_tokens=200,
+        ) == 20
+        assert await store.read_text(1, "summary.md") == generated + "\n"
+
+
 def test_render_records_preserves_numbers_roles_multiline_and_unicode() -> None:
     source = [
         ChatRecord(7, "user", "第一行\n第二行 🙂", "2026-01-01 00:00", "用户"),
@@ -571,7 +731,7 @@ async def test_story_state_migrates_legacy_state_to_current_snapshot(
     tmp_path: Path,
 ) -> None:
     store = MarkdownMemoryStore(tmp_path)
-    existing = legacy_story_state()
+    existing = legacy_story_state() + "\n\n<aside>旧格式 HTML 注记</aside>"
     await store.write_text(1, "story_state.md", existing)
     expected = story_state()
     calls: list[list[dict[str, str]]] = []
@@ -706,6 +866,12 @@ async def test_episode_covers_exact_message_range(tmp_path: Path) -> None:
         "\n\n<!--\fMeSsAgEs\f:\f９-２０ -->",
         "\n\n<!-- note: messages: ９-２０ -->",
         "\n\n![<!-- messages: 999-1000 -->](artifact.png)",
+        "\n\n<!-- messages： 9-10 -->",
+        " inline <!-- ｍｅｓｓａｇｅｓ: 9-10 -->",
+        "\n\n![<!-- messages&#58; 9-10 -->](artifact.png)",
+        "\n\n<!-- m\u200bessages: 9-10 -->",
+        " inline <!-- mess\u2060ages: 9-10 -->",
+        "\n\n![<!-- m\u034fessages: 9-10 -->](artifact.png)",
     ],
     ids=[
         "block",
@@ -716,6 +882,12 @@ async def test_episode_covers_exact_message_range(tmp_path: Path) -> None:
         "form-feed-whitespace",
         "prefixed-comment",
         "image-alt-comment",
+        "fullwidth-colon-block",
+        "fullwidth-label-inline",
+        "html-entity-nested-image",
+        "zero-width-block",
+        "word-joiner-inline",
+        "default-ignorable-nested-image",
     ],
 )
 async def test_generated_episode_rejects_real_range_metadata_comment(
@@ -747,8 +919,18 @@ async def test_generated_episode_rejects_real_range_metadata_comment(
         "```md\n<!-- messages: 999-1000 -->\n```",
         "    <!-- messages: 999-1000 -->",
         "`<!-- messages: 999-1000 -->`",
+        "```md\n<!-- messages： 9-10 -->\n```",
+        "    <!-- ｍｅｓｓａｇｅｓ: 9-10 -->",
+        "`<!-- m\u200bessages&#58; 9-10 -->`",
     ],
-    ids=["fenced", "indented", "inline-code"],
+    ids=[
+        "fenced",
+        "indented",
+        "inline-code",
+        "confusable-fenced",
+        "confusable-indented",
+        "confusable-inline-code",
+    ],
 )
 async def test_generated_episode_allows_range_marker_literal_in_code(
     tmp_path: Path,
@@ -1045,7 +1227,10 @@ async def test_legacy_episode_with_extra_h2_and_marker_is_reused_without_rewrite
     store = MarkdownMemoryStore(tmp_path)
     legacy = episode_document(1, 1, 20, "旧章节").replace(
         "## 状态变化",
-        "## 旧章节标题\n- [open] 旧格式线索\n\n## 状态变化",
+        (
+            "## 旧章节标题\n- [open] 旧格式线索\n"
+            "<aside>旧格式 HTML 注记</aside>\n\n## 状态变化"
+        ),
     )
     await store.write_text(1, "episodes/episode-000001.md", legacy)
     writes: list[str] = []
@@ -1306,6 +1491,7 @@ async def test_summary_uses_only_pending_episodes_and_returns_last_end(
     old = (
         "# 旧格式摘要\n\n## 未完成剧情线\n"
         "早期事件：旅人在序章救下守门人。\n- [open] 旧格式承诺\n"
+        "<aside>旧格式 HTML 注记</aside>\n"
     )
     await store.write_text(1, "summary.md", old)
     calls: list[list[dict[str, str]]] = []
@@ -1314,6 +1500,7 @@ async def test_summary_uses_only_pending_episodes_and_returns_last_end(
         calls.append(messages)
         prompt = messages[-1]["content"]
         assert old in prompt
+        assert "<aside>旧格式 HTML 注记</aside>" in prompt
         assert "序章救援" not in prompt
         assert "第二章约定" in prompt
         assert "### 未完成伏笔" in prompt
@@ -1344,7 +1531,10 @@ async def test_summary_migrates_legacy_episode_with_extra_h2_and_marker(
     store = MarkdownMemoryStore(tmp_path)
     legacy = episode_document(1, 1, 20, "旧章节").replace(
         "## 状态变化",
-        "## 旧章节标题\n- [open] 旧格式线索\n\n## 状态变化",
+        (
+            "## 旧章节标题\n- [open] 旧格式线索\n"
+            "<aside>旧格式 HTML 注记</aside>\n\n## 状态变化"
+        ),
     )
     await store.write_text(1, "episodes/episode-000001.md", legacy)
 
@@ -1352,6 +1542,7 @@ async def test_summary_migrates_legacy_episode_with_extra_h2_and_marker(
         prompt = messages[-1]["content"]
         assert "## 旧章节标题" in prompt
         assert "[open] 旧格式线索" in prompt
+        assert "<aside>旧格式 HTML 注记</aside>" in prompt
         return "旧章节及其线索已迁移到连续叙事。"
 
     assert await update_summary_from_episodes(
