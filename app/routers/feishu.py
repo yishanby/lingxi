@@ -347,6 +347,7 @@ async def _handle_card_action(body: dict[str, Any], db: AsyncSession) -> None:
     if not char:
         await feishu_client.send_text_message(open_chat_id, "Character not found.")
         return
+    char_name = char.name
 
     # Create new session
     session = Session(
@@ -359,10 +360,10 @@ async def _handle_card_action(body: dict[str, Any], db: AsyncSession) -> None:
     initial_records: list[ChatRecord] = []
     first_msg = ""
     if char.first_message:
-        first_msg = char.first_message.replace("{{user}}", "User").replace("{{char}}", char.name)
+        first_msg = char.first_message.replace("{{user}}", "User").replace("{{char}}", char_name)
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
         initial_records.append(
-            ChatRecord(0, "assistant", first_msg, now, char.name)
+            ChatRecord(0, "assistant", first_msg, now, char_name)
         )
     try:
         await create_session_with_markdown(
@@ -375,11 +376,11 @@ async def _handle_card_action(body: dict[str, Any], db: AsyncSession) -> None:
         raise HTTPException(500, "Failed to initialize session") from exc
 
     # Send first message if character has one
-    if char.first_message:
-        card = feishu_client.build_character_reply_card(char.name, first_msg)
+    if first_msg:
+        card = feishu_client.build_character_reply_card(char_name, first_msg)
         await feishu_client.send_interactive_card(open_chat_id, card)
     else:
         await feishu_client.send_text_message(
             open_chat_id,
-            f"Session started with {char.name}! Send a message to begin.",
+            f"Session started with {char_name}! Send a message to begin.",
         )

@@ -239,6 +239,7 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
     char = await db.get(Character, body.character_id)
     if not char:
         raise HTTPException(404, "Character not found")
+    char_name = char.name
 
     # Resolve persona: if persona_id is set, use it; otherwise auto-detect from character link, or use inline fields
     user_name = body.user_name or "用户"
@@ -270,11 +271,11 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
     # Prepare the complete initial Markdown history if first_message is available.
     initial_records: list[ChatRecord] = []
     if char.first_message:
-        first_msg = char.first_message.replace("{{user}}", user_name).replace("{{char}}", char.name)
+        first_msg = char.first_message.replace("{{user}}", user_name).replace("{{char}}", char_name)
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
         initial_records.extend(
             [
-                ChatRecord(0, "assistant", first_msg, now, char.name),
+                ChatRecord(0, "assistant", first_msg, now, char_name),
                 # Add compliance confirmation so the model sees the accepted scenario.
                 ChatRecord(0, "user", "(OOC: 确认开始)", now, user_name),
                 ChatRecord(
@@ -282,7 +283,7 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
                     "assistant",
                     "背景已经收到并通过校验，我将按照故事背景展开叙事。请开始你的行动。",
                     now,
-                    char.name,
+                    char_name,
                 ),
             ]
         )
@@ -315,7 +316,7 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
     except SessionInitializationError as exc:
         raise HTTPException(500, "Failed to initialize session") from exc
 
-    return await _row_to_out(session, char.name)
+    return await _row_to_out(session, char_name)
 
 
 @router.get("")
@@ -667,6 +668,9 @@ async def _run_command(
     """Serialize an ordinary command as one whole Markdown turn."""
     cmd = content.split(maxsplit=1)[0].lower()
     if cmd in {"/undo", "/retry"}:
+        # V1 fallback import owns only the short store transaction. ChatService
+        # acquires the non-reentrant whole-turn lock after this returns.
+        await _ensure_session_history(session, char.name)
         return await _dispatch_command(
             content,
             session,

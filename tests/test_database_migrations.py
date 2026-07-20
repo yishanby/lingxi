@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import (
 
 from app import main
 from app.models.tables import Base, Session
+from app.services import session_creation
 from app.services.md_store import ChatRecord, MarkdownMemoryStore
 from app.services.session_creation import (
     SessionInitializationError,
@@ -92,6 +93,23 @@ async def _legacy_engine(path: Path, *, session_id: int = 5) -> AsyncEngine:
             ),
             {"session_id": session_id},
         )
+    return engine
+
+
+async def _fresh_session_engine(path: Path) -> AsyncEngine:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text(
+                "INSERT INTO characters "
+                "(name, description, personality, scenario, first_message, "
+                "example_dialogues, system_prompt, creator_notes, tags, "
+                "linked_worldbook_ids, source) VALUES "
+                "('角色', '', '', '', '', '', '', '', '[]', '[]', 'manual')"
+            )
+        )
+    await main._migrate_database(engine)
     return engine
 
 
@@ -538,5 +556,276 @@ async def test_concurrent_shared_creates_get_distinct_ids_above_orphan_floor(
 
         assert sorted(ids) == [6, 7]
         assert store.file_path(5, "chat.md").exists()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_creator_compensation_cannot_delete_reused_successful_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = await _fresh_session_engine(tmp_path / "ownership-race.db")
+    store = MarkdownMemoryStore(tmp_path / "memory-ownership-race")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    a_rolled_back = asyncio.Event()
+    release_a_cleanup = asyncio.Event()
+    create_calls = 0
+    original_create_chat = store.create_chat
+
+    async def fail_a_create(session_id, records):
+        nonlocal create_calls
+        create_calls += 1
+        if create_calls == 1:
+            raise RuntimeError("A create failure")
+        await original_create_chat(session_id, records)
+
+    monkeypatch.setattr(store, "create_chat", fail_a_create)
+    try:
+        async with factory() as a_db, factory() as b_db:
+            a = Session(
+                character_id=1,
+                worldbook_ids="[]",
+                user_name="A",
+                user_persona="",
+                messages=None,
+                summary="",
+                summary_up_to=0,
+                status="active",
+            )
+            b = Session(
+                character_id=1,
+                worldbook_ids="[]",
+                user_name="B",
+                user_persona="",
+                messages=None,
+                summary="",
+                summary_up_to=0,
+                status="active",
+            )
+            original_a_rollback = a_db.rollback
+
+            async def pause_after_a_rollback():
+                await original_a_rollback()
+                if a.id is not None:
+                    a_rolled_back.set()
+                    await release_a_cleanup.wait()
+
+            monkeypatch.setattr(a_db, "rollback", pause_after_a_rollback)
+            a_task = asyncio.create_task(
+                create_session_with_markdown(a_db, store, a, [])
+            )
+            await asyncio.wait_for(a_rolled_back.wait(), timeout=2)
+
+            await create_session_with_markdown(b_db, store, b, [])
+            release_a_cleanup.set()
+            with pytest.raises(SessionInitializationError):
+                await a_task
+
+        async with factory() as verify:
+            persisted_b = await verify.get(Session, b.id)
+
+        assert a.id != b.id
+        assert persisted_b is not None
+        assert persisted_b.user_name == "B"
+        assert store.file_path(b.id, "chat.md").exists()
+        assert not store.file_path(a.id, "chat.md").exists()
+    finally:
+        release_a_cleanup.set()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_reserved_creator_id_is_never_reused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = await _fresh_session_engine(tmp_path / "reservation-gap.db")
+    store = MarkdownMemoryStore(tmp_path / "memory-reservation-gap")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    original_create_chat = store.create_chat
+    calls = 0
+
+    async def fail_once(session_id, records):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("first create failure")
+        await original_create_chat(session_id, records)
+
+    monkeypatch.setattr(store, "create_chat", fail_once)
+    try:
+        first = Session(
+            character_id=1,
+            worldbook_ids="[]",
+            user_name="失败",
+            user_persona="",
+            messages=None,
+            summary="",
+            summary_up_to=0,
+            status="active",
+        )
+        async with factory() as db:
+            with pytest.raises(SessionInitializationError):
+                await create_session_with_markdown(db, store, first, [])
+
+        second = Session(
+            character_id=1,
+            worldbook_ids="[]",
+            user_name="成功",
+            user_persona="",
+            messages=None,
+            summary="",
+            summary_up_to=0,
+            status="active",
+        )
+        async with factory() as db:
+            await create_session_with_markdown(db, store, second, [])
+
+        assert first.id == 1
+        assert second.id == 2
+        async with engine.connect() as conn:
+            assert (
+                await conn.execute(
+                    text("SELECT seq FROM sqlite_sequence WHERE name='sessions'")
+                )
+            ).scalar_one() == 2
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reservation_commit_then_raise_leaks_only_an_id_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = await _fresh_session_engine(tmp_path / "reservation-commit.db")
+    store = MarkdownMemoryStore(tmp_path / "memory-reservation-commit")
+    await store.create_chat(5, [])
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as db:
+            session = Session(
+                character_id=1,
+                worldbook_ids="[]",
+                user_name="不会落行",
+                user_persona="",
+                messages=None,
+                summary="",
+                summary_up_to=0,
+                status="active",
+            )
+            original_commit = db.commit
+            commit_calls = 0
+
+            async def commit_then_raise():
+                nonlocal commit_calls
+                commit_calls += 1
+                await original_commit()
+                if commit_calls == 1:
+                    raise RuntimeError("reservation acknowledgement failed")
+
+            monkeypatch.setattr(db, "commit", commit_then_raise)
+            with pytest.raises(SessionInitializationError):
+                await create_session_with_markdown(db, store, session, [])
+
+        async with engine.connect() as conn:
+            sequence = (
+                await conn.execute(
+                    text("SELECT seq FROM sqlite_sequence WHERE name='sessions'")
+                )
+            ).scalar_one()
+            rows = (
+                await conn.execute(text("SELECT id FROM sessions ORDER BY id"))
+            ).scalars().all()
+
+        assert commit_calls == 1
+        assert sequence == 6
+        assert rows == []
+        assert store.file_path(5, "chat.md").exists()
+        assert not store.file_path(6, "chat.md").exists()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reservation_commit_cancellation_propagates_without_creation_compensation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = await _fresh_session_engine(tmp_path / "reservation-cancel.db")
+    store = MarkdownMemoryStore(tmp_path / "memory-reservation-cancel")
+    await store.create_chat(5, [])
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    reservation_committed = asyncio.Event()
+    try:
+        async with factory() as db:
+            session = Session(
+                character_id=1,
+                worldbook_ids="[]",
+                user_name="取消创建",
+                user_persona="",
+                messages=None,
+                summary="",
+                summary_up_to=0,
+                status="active",
+            )
+            original_commit = db.commit
+            original_rollback = db.rollback
+            commit_calls = 0
+            rollback_calls = 0
+            creation_compensation_calls = 0
+
+            async def commit_then_wait_for_cancellation():
+                nonlocal commit_calls
+                commit_calls += 1
+                await original_commit()
+                if commit_calls == 1:
+                    reservation_committed.set()
+                    await asyncio.Event().wait()
+
+            async def track_rollback():
+                nonlocal rollback_calls
+                rollback_calls += 1
+                await original_rollback()
+
+            async def track_creation_compensation(*args, **kwargs):
+                nonlocal creation_compensation_calls
+                creation_compensation_calls += 1
+
+            monkeypatch.setattr(db, "commit", commit_then_wait_for_cancellation)
+            monkeypatch.setattr(db, "rollback", track_rollback)
+            monkeypatch.setattr(
+                session_creation,
+                "_compensate_creation",
+                track_creation_compensation,
+            )
+            creation = asyncio.create_task(
+                create_session_with_markdown(db, store, session, [])
+            )
+            await asyncio.wait_for(reservation_committed.wait(), timeout=2)
+            creation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await creation
+
+            assert commit_calls == 1
+            assert rollback_calls == 2
+            assert creation_compensation_calls == 0
+            assert session.id is None
+
+        async with engine.connect() as conn:
+            sequence = (
+                await conn.execute(
+                    text("SELECT seq FROM sqlite_sequence WHERE name='sessions'")
+                )
+            ).scalar_one()
+            rows = (
+                await conn.execute(text("SELECT id FROM sessions ORDER BY id"))
+            ).scalars().all()
+
+        assert sequence == 6
+        assert rows == []
+        assert store.file_path(5, "chat.md").exists()
+        assert not store.file_path(6, "chat.md").exists()
     finally:
         await engine.dispose()

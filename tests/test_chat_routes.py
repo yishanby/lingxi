@@ -714,6 +714,97 @@ async def test_sessions_undo_delegates_invalidation_and_pipeline_submit(
     assert await route_env.store.read_text(1, "summary.md") == ""
 
 
+@pytest.mark.asyncio
+async def test_sessions_undo_imports_db_only_v1_history_before_locking_turn(
+    route_env,
+) -> None:
+    session, character = entities()
+    legacy = [
+        {"role": "user", "content": "V1 undo user"},
+        {"role": "assistant", "content": "V1 undo answer"},
+    ]
+    session.messages = json.dumps(legacy)
+    original_legacy = session.messages
+
+    response = await sessions.send_message(
+        session.id,
+        SessionMessageIn(content="/undo"),
+        DB(session, character),
+    )
+
+    assert response.messages == []
+    assert session.messages == original_legacy
+    assert route_env.store.file_path(session.id, "chat.md").exists()
+    assert await route_env.store.load_chat(session.id) == []
+
+
+@pytest.mark.asyncio
+async def test_sessions_retry_imports_db_only_v1_history_before_locking_turn(
+    route_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, character = entities()
+    legacy = [
+        {"role": "user", "content": "V1 retry user"},
+        {"role": "assistant", "content": "V1 retry answer"},
+    ]
+    session.messages = json.dumps(legacy)
+    original_legacy = session.messages
+
+    async def complete(**kwargs):
+        return {"content": "V1 retried", "usage": {}}
+
+    monkeypatch.setattr(sessions, "chat_completion", complete)
+
+    response = await sessions.send_message(
+        session.id,
+        SessionMessageIn(content="/retry"),
+        DB(session, character),
+    )
+
+    assert [(message.role, message.content) for message in response.messages] == [
+        ("user", "V1 retry user"),
+        ("assistant", f"{REQUIRED_OPENING}\n\nV1 retried"),
+    ]
+    assert session.messages == original_legacy
+
+
+@pytest.mark.parametrize("command", ["/undo", "/retry"])
+@pytest.mark.asyncio
+async def test_v1_mutating_commands_ignore_malformed_fallback_when_chat_exists(
+    route_env,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    session, character = entities()
+    session.messages = "{malformed legacy json"
+    await route_env.store.append_pair(
+        session.id,
+        "MD user",
+        "MD answer",
+        char_name=character.name,
+        user_name=session.user_name,
+    )
+
+    async def complete(**kwargs):
+        return {"content": "MD retried", "usage": {}}
+
+    monkeypatch.setattr(sessions, "chat_completion", complete)
+
+    response = await sessions.send_message(
+        session.id,
+        SessionMessageIn(content=command),
+        DB(session, character),
+    )
+
+    if command == "/undo":
+        assert response.messages == []
+    else:
+        assert response.messages[-2].content == "MD user"
+        assert response.messages[-1].content.endswith("MD retried")
+    assert session.messages == "{malformed legacy json"
+
+
 @pytest.mark.parametrize(
     ("command", "history"),
     [

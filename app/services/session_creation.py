@@ -47,8 +47,8 @@ def _markdown_session_floor(store: MarkdownMemoryStore) -> int:
 
 
 async def _raise_sqlite_sequence_floor(db: AsyncSession, floor: int) -> None:
-    if floor <= 0:
-        return
+    if floor < 0:
+        raise ValueError("session sequence floor must be nonnegative")
     await db.execute(
         text(
             "UPDATE sqlite_sequence "
@@ -66,6 +66,61 @@ async def _raise_sqlite_sequence_floor(db: AsyncSession, floor: int) -> None:
         ),
         {"floor": floor},
     )
+
+
+async def _rollback_reservation(db: AsyncSession) -> None:
+    try:
+        await db.rollback()
+    except Exception as exc:
+        logger.warning(
+            "Session ID reservation rollback failed (%s)",
+            type(exc).__name__,
+        )
+
+
+async def _reserve_session_id(
+    db: AsyncSession,
+    store: MarkdownMemoryStore,
+) -> int | None:
+    """Persist an ID reservation before any DB row or Markdown write."""
+    if not isinstance(db, AsyncSession):
+        return None
+    if db.new or db.dirty or db.deleted:
+        raise SessionInitializationError(
+            "cannot reserve a session id with pending database changes"
+        )
+
+    try:
+        await db.rollback()
+        await _raise_sqlite_sequence_floor(db, _markdown_session_floor(store))
+        await db.execute(
+            text(
+                "UPDATE sqlite_sequence SET seq=seq+1 "
+                "WHERE name='sessions'"
+            )
+        )
+        reserved_id = int(
+            (
+                await db.execute(
+                    text(
+                        "SELECT seq FROM sqlite_sequence "
+                        "WHERE name='sessions'"
+                    )
+                )
+            ).scalar_one()
+        )
+        await db.commit()
+        return reserved_id
+    except (Exception, asyncio.CancelledError) as exc:
+        cleanup = asyncio.create_task(_rollback_reservation(db))
+        cancelled_during_cleanup = await _finish_compensation(cleanup)
+        if isinstance(exc, asyncio.CancelledError) or cancelled_during_cleanup:
+            raise asyncio.CancelledError from exc
+        logger.warning(
+            "Session ID reservation failed (%s)",
+            type(exc).__name__,
+        )
+        raise SessionInitializationError from exc
 
 
 async def _compensate_creation(
@@ -134,9 +189,11 @@ async def create_session_with_markdown(
     initial_records: Sequence[ChatRecord],
 ) -> Session:
     """Create one DB row and one create-only authoritative chat document."""
+    reserved_id = await _reserve_session_id(db, store)
+    if reserved_id is not None:
+        session.id = reserved_id
     owns_chat = False
     try:
-        await _raise_sqlite_sequence_floor(db, _markdown_session_floor(store))
         db.add(session)
         await db.flush()
         await store.create_chat(session.id, initial_records)
