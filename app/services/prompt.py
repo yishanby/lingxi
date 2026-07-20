@@ -1,4 +1,4 @@
-"""Prompt assembly – builds the messages list sent to the LLM."""
+"""Prompt assembly - builds the messages list sent to the LLM."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import re
 from typing import Any
 
 from app.schemas.api import MessageItem, WorldBookEntry
-from app.services.prompt_policy import build_invariant_prompt, build_priming_history
-from app.services.token_utils import estimate_tokens, truncate_to_tokens
+from app.services.context_builder import ContextBuilder, ContextSources
+from app.services.prompt_policy import build_priming_history
 
 logger = logging.getLogger(__name__)
 
@@ -17,15 +17,19 @@ def _match_worldbook_entries(
     entries: list[WorldBookEntry],
     recent_text: str,
 ) -> tuple[list[str], list[str]]:
-    """Return (before_char, after_char) content lists for keyword-matched entries."""
+    """Return (before_char, after_char) content lists for keyword matches."""
     before: list[str] = []
     after: list[str] = []
     lower = recent_text.lower()
     for entry in entries:
         if not entry.enabled:
             continue
-        keywords = [k.strip().lower() for k in entry.keyword.split(",") if k.strip()]
-        if any(kw in lower for kw in keywords):
+        keywords = [
+            keyword.strip().lower()
+            for keyword in entry.keyword.split(",")
+            if keyword.strip()
+        ]
+        if any(keyword in lower for keyword in keywords):
             if entry.position == "after_char":
                 after.append(entry.content)
             else:
@@ -49,182 +53,84 @@ def assemble_prompt(
     character_profiles: str = "",
     rag_context: str = "",
 ) -> list[dict[str, str]]:
-    """Build the full messages payload for an LLM chat-completion call.
-
-    Uses a token budget system to keep total input under control:
-      - Layer 0 (fixed): system prompt, character card, worldbook
-      - Layer 1 (recall): memory, assets, character profiles
-      - Layer 2 (conversation): summary + recent messages
-    """
+    """Build the full messages payload for an LLM chat-completion call."""
     from app.config import settings
 
-    messages: list[dict[str, str]] = []
-
-    # ── Layer 0: System prompt (fixed) ───────────────────────────────────
-    system_parts: list[str] = []
-
-    # Creative fiction framework - establishes this as collaborative storytelling
-    system_parts.append(build_invariant_prompt())
-
-    if character.get("system_prompt"):
-        system_parts.append(character["system_prompt"].replace("{{user}}", user_name).replace("{{char}}", character["name"]))
-    if character.get("personality"):
-        system_parts.append(f"Personality: {character['personality'].replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
-    if character.get("scenario"):
-        system_parts.append(f"Scenario: {character['scenario'].replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
-
-    # User persona
-    if user_persona and persona_position in ("after_scenario", "in_prompt"):
-        system_parts.append(f"[User Character: {user_name}]\n{user_persona.replace('{{user}}', user_name).replace('{{char}}', character['name'])}")
-
-    # Worldbook entries
     recent_text = " ".join(
-        m.content for m in chat_history[-10:]
+        message.content for message in chat_history[-10:]
     ) + " " + user_message
-    wb_before, wb_after = _match_worldbook_entries(worldbook_entries, recent_text)
+    wb_before, wb_after = _match_worldbook_entries(
+        worldbook_entries, recent_text
+    )
 
-    if wb_before:
-        system_parts.append("[World Info]\n" + "\n".join(wb_before))
-
-    if character.get("description"):
-        desc = character["description"].replace("{{user}}", user_name).replace("{{char}}", character["name"])
-        system_parts.append(f"[Character: {character['name']}]\n{desc}")
-
-    if wb_after:
-        system_parts.append("[Additional World Info]\n" + "\n".join(wb_after))
-
-    # ── Layer 1: Recall (memory, assets, profiles) ───────────────────────
-    layer1_parts: list[str] = []
-    if memory_context:
-        layer1_parts.append(f"[Long-term Memory]\n{memory_context}")
+    assets_parts: list[str] = []
     if assets_summary:
-        layer1_parts.append(f"[资产概览] {assets_summary}")
+        assets_parts.append(f"[资产概览] {assets_summary}")
     if assets_full:
-        layer1_parts.append(f"[资产详情]\n{assets_full}")
-    if character_profiles:
-        layer1_parts.append(f"[角色详情档案]\n{character_profiles}")
-    if rag_context:
-        layer1_parts.append(f"[相关历史片段]\n{rag_context}")
+        assets_parts.append(f"[资产详情]\n{assets_full}")
 
-    # Truncate layer 1 to budget
-    layer1_text = "\n\n".join(layer1_parts)
-    layer1_text = truncate_to_tokens(layer1_text, settings.layer1_budget)
-    if layer1_text:
-        system_parts.append(layer1_text)
-
-    # ── Layer 2: Summary (truncated) ─────────────────────────────────────
-    if summary_context:
-        truncated_summary = truncate_to_tokens(summary_context, settings.summary_max_tokens)
-        system_parts.append(f"[Story So Far]\n{truncated_summary}")
-
-    # Assemble system message
-    if system_parts:
-        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
-
-    # ── Example dialogues / history priming ─────────────────────────
-    if character.get("example_dialogues"):
-        examples = _parse_example_dialogues(
-            character["example_dialogues"], character["name"], user_name
-        )
-        messages.extend(examples)
-
-    # For new conversations: inject fake "already happened" history
-    # so the model continues in-character without triggering safety checks
-    if not chat_history:
-        priming_history = _build_priming_history(character["name"], user_name)
-        messages.extend(priming_history)
-        # Also append real history seed from prior sessions if available
-        if character.get("_history_seed"):
-            messages.extend(character["_history_seed"])
-
-    # ── Layer 2: Chat history (token-budget-aware) ───────────────────────
-    # Calculate remaining budget for conversation messages
-    current_tokens = sum(estimate_tokens(m["content"]) for m in messages)
-    user_msg_tokens = estimate_tokens(user_message)
-    remaining_budget = settings.total_token_budget - current_tokens - user_msg_tokens
-
-    # Take messages from newest to oldest until budget exhausted
-    selected: list[MessageItem] = []
-    used_tokens = 0
-    for m in reversed(chat_history):
-        msg_tokens = estimate_tokens(m.content)
-        if used_tokens + msg_tokens > remaining_budget and len(selected) >= settings.min_recent_messages:
-            break
-        selected.append(m)
-        used_tokens += msg_tokens
-        # Always include at least min_recent_messages
-        if used_tokens > remaining_budget and len(selected) >= settings.min_recent_messages:
-            break
-
-    selected.reverse()
-
-    for m in selected:
-        messages.append({"role": m.role, "content": m.content})
-
-    # ── Current user message ─────────────────────────────────────────────
-    messages.append({"role": "user", "content": user_message})
-
-    # ── Final budget check: trim from oldest history if still over ───────
-    total_tokens = sum(estimate_tokens(m["content"]) for m in messages)
-    if total_tokens > settings.total_token_budget:
-        _trim_to_budget(messages, settings.total_token_budget, settings.min_recent_messages)
+    sources = ContextSources(
+        character=character,
+        worldbook=[*wb_before, *wb_after],
+        user_name=user_name,
+        user_persona=(
+            user_persona
+            if persona_position in ("after_scenario", "in_prompt")
+            else ""
+        ),
+        memory=memory_context,
+        character_profiles=[character_profiles] if character_profiles else [],
+        assets="\n\n".join(assets_parts),
+        rag=[rag_context] if rag_context else [],
+        summary=summary_context,
+        recent=[
+            {"role": message.role, "content": message.content}
+            for message in chat_history
+        ],
+        user_message=user_message,
+        is_new_conversation=not chat_history,
+    )
+    result = ContextBuilder(
+        total_budget=settings.total_token_budget,
+        min_recent_messages=settings.min_recent_messages,
+    ).build(sources)
 
     logger.debug(
         "Prompt assembled: %d messages, ~%d tokens",
-        len(messages),
-        sum(estimate_tokens(m["content"]) for m in messages),
+        len(result.messages),
+        result.total_tokens,
+        extra={
+            "message_count": len(result.messages),
+            "tokens_by_layer": result.tokens_by_layer,
+            "total_tokens": result.total_tokens,
+        },
     )
-
-    # DEBUG: dump full prompt to file for diagnosis
-    import json as _json
-    try:
-        with open("data/last_prompt_debug.json", "w", encoding="utf-8") as f:
-            _json.dump(messages, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-    return messages
-
-
-def _trim_to_budget(
-    messages: list[dict[str, str]],
-    budget: int,
-    min_recent: int,
-) -> None:
-    """Remove oldest non-system, non-final messages until under budget."""
-    while sum(estimate_tokens(m["content"]) for m in messages) > budget:
-        # Find the first removable message (not system, not the last `min_recent + 1` messages)
-        # +1 for the current user message at the end
-        protected_tail = min_recent + 1
-        removable_start = None
-        for i, m in enumerate(messages):
-            if m["role"] != "system":
-                removable_start = i
-                break
-        if removable_start is None or len(messages) - removable_start <= protected_tail:
-            break  # can't remove any more
-        messages.pop(removable_start)
+    return result.messages
 
 
 def _parse_example_dialogues(
     text: str, char_name: str, user_name: str = "用户"
 ) -> list[dict[str, str]]:
-    """Parse SillyTavern example dialogue format into user/assistant message pairs."""
+    """Parse SillyTavern example dialogue into user/assistant messages."""
     messages: list[dict[str, str]] = []
     blocks = re.split(r"<START>", text, flags=re.IGNORECASE)
     for block in blocks:
         block = block.strip()
         if not block:
             continue
-        lines = block.split("\n")
-        for line in lines:
-            line = line.strip()
+        for raw_line in block.split("\n"):
+            line = raw_line.strip()
             if not line:
                 continue
-            line = line.replace("{{char}}", char_name).replace("{{user}}", user_name)
+            line = line.replace("{{char}}", char_name).replace(
+                "{{user}}", user_name
+            )
             if line.startswith(f"{char_name}:"):
                 messages.append(
-                    {"role": "assistant", "content": line[len(char_name) + 1 :].strip()}
+                    {
+                        "role": "assistant",
+                        "content": line[len(char_name) + 1 :].strip(),
+                    }
                 )
             elif line.startswith("User:"):
                 messages.append({"role": "user", "content": line[5:].strip()})
@@ -236,6 +142,8 @@ def _build_dev_seed(char_name: str, user_name: str) -> list[dict[str, str]]:
     return _build_priming_history(char_name, user_name)
 
 
-def _build_priming_history(char_name: str, user_name: str) -> list[dict[str, str]]:
+def _build_priming_history(
+    char_name: str, user_name: str
+) -> list[dict[str, str]]:
     """Legacy compatibility wrapper for the extracted priming policy."""
     return build_priming_history(char_name, user_name)

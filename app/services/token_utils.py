@@ -19,8 +19,15 @@ def estimate_tokens(text: str) -> int:
     return int(cjk / 0.75 + non_cjk / 4)
 
 
+def estimate_messages_tokens(messages: list[dict[str, str]]) -> int:
+    """Estimate chat-message tokens, including per-message framing overhead."""
+    return sum(estimate_tokens(message["content"]) + 4 for message in messages)
+
+
 def truncate_to_tokens(text: str, max_tokens: int) -> str:
     """Truncate text to approximately max_tokens, preserving complete lines."""
+    if max_tokens <= 0:
+        return ""
     if estimate_tokens(text) <= max_tokens:
         return text
     lines = text.split('\n')
@@ -32,4 +39,16 @@ def truncate_to_tokens(text: str, max_tokens: int) -> str:
             break
         result.append(line)
         total += line_tokens
-    return '\n'.join(result)
+
+    candidate = '\n'.join(result)
+    if estimate_tokens(candidate) <= max_tokens:
+        return candidate
+    low = 0
+    high = len(candidate)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if estimate_tokens(candidate[:middle]) <= max_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    return candidate[:low]
