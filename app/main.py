@@ -15,6 +15,7 @@ from app.database import async_session, engine
 from app.models.tables import Base, Session
 from app.routers import backends, characters, feishu, personas, sessions, stats, worldbooks
 from app.services import memory
+from app.services.db_migrations import migrate_database as _migrate_database
 from app.services.memory_pipeline import MemoryPipeline
 from app.services.memory_tasks import MemoryTaskManager
 
@@ -27,14 +28,6 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 memory_pipeline: MemoryPipeline | None = None
 memory_task_manager: MemoryTaskManager | None = None
-
-
-async def _column_missing(conn, table: str, column: str) -> bool:
-    """Check if a column is missing from a SQLite table."""
-    import sqlalchemy
-    result = await conn.execute(sqlalchemy.text(f"PRAGMA table_info({table})"))
-    columns = [row[1] for row in result.fetchall()]
-    return column not in columns
 
 
 async def _resolve_memory_backend(session_id: int) -> dict:
@@ -59,20 +52,7 @@ async def lifespan(app: FastAPI):
         # Create tables on startup
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-
-            # Migrate: add summary columns if missing (SQLite)
-            if await _column_missing(conn, "sessions", "summary"):
-                await conn.execute(
-                    __import__("sqlalchemy").text(
-                        "ALTER TABLE sessions ADD COLUMN summary TEXT DEFAULT ''"
-                    )
-                )
-            if await _column_missing(conn, "sessions", "summary_up_to"):
-                await conn.execute(
-                    __import__("sqlalchemy").text(
-                        "ALTER TABLE sessions ADD COLUMN summary_up_to INTEGER DEFAULT 0"
-                    )
-                )
+        await _migrate_database(engine)
 
         logger.info("Database tables ready")
 

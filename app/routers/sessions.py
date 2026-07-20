@@ -34,9 +34,12 @@ from app.services import memory as memory_service
 from app.services.llm import LLMError, chat_completion, chat_completion_stream
 from app.services.md_store import ChatRecord, LegacyChatImportError
 from app.services.output_guard import OutputGuardError
+from app.services.session_creation import (
+    SessionInitializationError,
+    create_session_with_markdown,
+)
 from app.services.token_tracker import record_usage
 from app.services.memory import (
-    append_chat_md,
     append_manual_memory,
     extract_memory_full,
     extract_memory_rebuild,
@@ -51,6 +54,7 @@ from app.services.memory import (
     load_memory_relevant,
     load_summary,
     save_memory,
+    save_summary,
     update_rolling_summary,
 )
 from app.services.history_seed import get_history_seed
@@ -263,15 +267,25 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
             user_name = persona.name
             user_persona = persona.description
 
-    # Prepare initial messages with first_message if available
-    initial_messages = []
+    # Prepare the complete initial Markdown history if first_message is available.
+    initial_records: list[ChatRecord] = []
     if char.first_message:
         first_msg = char.first_message.replace("{{user}}", user_name).replace("{{char}}", char.name)
-        now = datetime.datetime.utcnow().isoformat()
-        initial_messages.append({"role": "assistant", "content": first_msg, "timestamp": now})
-        # Add compliance confirmation so model sees it already accepted the scenario
-        initial_messages.append({"role": "user", "content": "(OOC: 确认开始)", "timestamp": now})
-        initial_messages.append({"role": "assistant", "content": "背景已经收到并通过校验，我将按照故事背景展开叙事。请开始你的行动。", "timestamp": now})
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+        initial_records.extend(
+            [
+                ChatRecord(0, "assistant", first_msg, now, char.name),
+                # Add compliance confirmation so the model sees the accepted scenario.
+                ChatRecord(0, "user", "(OOC: 确认开始)", now, user_name),
+                ChatRecord(
+                    0,
+                    "assistant",
+                    "背景已经收到并通过校验，我将按照故事背景展开叙事。请开始你的行动。",
+                    now,
+                    char.name,
+                ),
+            ]
+        )
 
     # Merge user-specified worldbook_ids with character's linked worldbooks
     wb_ids = list(body.worldbook_ids)
@@ -289,21 +303,17 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
         user_name=user_name,
         user_persona=user_persona,
         status="active",
-        messages=json.dumps(initial_messages) if initial_messages else None,
+        messages=None,
     )
-    db.add(session)
-    await db.commit()
-    await db.refresh(session)
-
-    # Write first_message to chat.md if present
-    if initial_messages:
-        try:
-            await append_chat_md(
-                session.id, "assistant", initial_messages[0]["content"],
-                char_name=char.name, user_name=user_name,
-            )
-        except Exception as exc:
-            logger.error(f"Failed to write first message to chat.md: {exc}")
+    try:
+        await create_session_with_markdown(
+            db,
+            memory_service.md_store,
+            session,
+            initial_records,
+        )
+    except SessionInitializationError as exc:
+        raise HTTPException(500, "Failed to initialize session") from exc
 
     return await _row_to_out(session, char.name)
 
@@ -555,9 +565,13 @@ async def send_message(
 
     content = body.content.strip()
     if content.startswith("/"):
-        messages = await _load_session_messages(session, char.name)
-        return await _handle_command(
-            content, session, session_id, char, messages, body.backend_id, db,
+        return await _run_command(
+            content,
+            session,
+            session_id,
+            char,
+            body.backend_id,
+            db,
         )
 
     await _ensure_session_history(session, char.name)
@@ -616,7 +630,7 @@ async def send_message(
     return await _row_to_out(session, char.name)
 
 
-async def _append_command_pair(
+async def _append_command_pair_locked(
     session_id: int,
     user_content: str,
     assistant_content: str,
@@ -624,9 +638,8 @@ async def _append_command_pair(
     char_name: str,
     user_name: str,
 ) -> None:
-    turn_lock = await memory_service.md_store.turn_lock_for(session_id)
-    async with turn_lock:
-        await memory_service.md_store.recover_invalidation(session_id)
+    """Append one receipt while the caller owns the session turn lock."""
+    try:
         await memory_service.md_store.append_pair(
             session_id,
             user_content,
@@ -634,9 +647,52 @@ async def _append_command_pair(
             char_name=char_name,
             user_name=user_name,
         )
+    except Exception as exc:
+        logger.warning(
+            "Command receipt append failed for session %s (%s)",
+            session_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(500, "Failed to record command") from exc
 
 
-async def _handle_command(
+async def _run_command(
+    content: str,
+    session: Session,
+    session_id: int,
+    char: Character,
+    backend_id: int | None,
+    db: AsyncSession,
+) -> SessionOut:
+    """Serialize an ordinary command as one whole Markdown turn."""
+    cmd = content.split(maxsplit=1)[0].lower()
+    if cmd in {"/undo", "/retry"}:
+        return await _dispatch_command(
+            content,
+            session,
+            session_id,
+            char,
+            [],
+            backend_id,
+            db,
+        )
+
+    turn_lock = await memory_service.md_store.turn_lock_for(session_id)
+    async with turn_lock:
+        await memory_service.md_store.recover_invalidation(session_id)
+        messages = await _load_session_messages(session, char.name)
+        return await _dispatch_command(
+            content,
+            session,
+            session_id,
+            char,
+            messages,
+            backend_id,
+            db,
+        )
+
+
+async def _dispatch_command(
     content: str,
     session: Session,
     session_id: int,
@@ -772,16 +828,13 @@ async def _handle_command(
             memory = await load_memory(session_id)
             response = memory if memory else "(No memories recorded yet)"
 
-        try:
-            await _append_command_pair(
-                session_id,
-                content,
-                response,
-                char_name=char.name,
-                user_name=user_name,
-            )
-        except Exception as exc:
-            logger.error(f"Failed to append chat.md for /memory: {exc}")
+        await _append_command_pair_locked(
+            session_id,
+            content,
+            response,
+            char_name=char.name,
+            user_name=user_name,
+        )
         return await _row_to_out(session)
 
     elif cmd == "/remember":
@@ -790,16 +843,13 @@ async def _handle_command(
         else:
             await append_manual_memory(session_id, arg)
             response = f"✓ Remembered: {arg}"
-        try:
-            await _append_command_pair(
-                session_id,
-                content,
-                response,
-                char_name=char.name,
-                user_name=user_name,
-            )
-        except Exception as exc:
-            logger.error(f"Failed to append chat.md for /remember: {exc}")
+        await _append_command_pair_locked(
+            session_id,
+            content,
+            response,
+            char_name=char.name,
+            user_name=user_name,
+        )
         return await _row_to_out(session)
 
     elif cmd == "/assets":
@@ -809,16 +859,13 @@ async def _handle_command(
             response = f"📊 资产概览：{summary}\n\n{assets}"
         else:
             response = "还没有资产记录。资产会在对话中自动跟踪更新。"
-        try:
-            await _append_command_pair(
-                session_id,
-                content,
-                response,
-                char_name=char.name,
-                user_name=user_name,
-            )
-        except Exception as exc:
-            logger.error(f"Failed to append chat.md for /assets: {exc}")
+        await _append_command_pair_locked(
+            session_id,
+            content,
+            response,
+            char_name=char.name,
+            user_name=user_name,
+        )
         return await _row_to_out(session)
 
     elif cmd == "/summary":
@@ -844,16 +891,13 @@ async def _handle_command(
             summary = await load_summary(session_id)
             response = summary if summary else "(还没有摘要)"
 
-        try:
-            await _append_command_pair(
-                session_id,
-                content,
-                response,
-                char_name=char.name,
-                user_name=user_name,
-            )
-        except Exception as exc:
-            logger.error(f"Failed to append chat.md for /summary: {exc}")
+        await _append_command_pair_locked(
+            session_id,
+            content,
+            response,
+            char_name=char.name,
+            user_name=user_name,
+        )
         return await _row_to_out(session)
 
     elif cmd == "/undo":
@@ -958,16 +1002,13 @@ async def _handle_command(
                 profile = await load_character_profile(session_id, name)
                 parts_out.append(profile + f"\n({len(profile)} chars)")
             response = "\n\n---\n".join(parts_out)
-        try:
-            await _append_command_pair(
-                session_id,
-                content,
-                response,
-                char_name=char.name,
-                user_name=user_name,
-            )
-        except Exception as exc:
-            logger.error(f"Failed to append chat.md for /chars: {exc}")
+        await _append_command_pair_locked(
+            session_id,
+            content,
+            response,
+            char_name=char.name,
+            user_name=user_name,
+        )
         return await _row_to_out(session)
 
     else:

@@ -62,6 +62,7 @@ class WorldBook(Base):
 
 class Session(Base):
     __tablename__ = "sessions"
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     character_id: Mapped[int] = mapped_column(
@@ -73,7 +74,8 @@ class Session(Base):
     persona_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("personas.id"), nullable=True)
     user_name: Mapped[str] = mapped_column(String(256), default="用户")  # protagonist name
     user_persona: Mapped[str] = mapped_column(Text, default="")  # protagonist description
-    messages: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of message dicts
+    # Read-only V1 fallback. New V2 sessions keep authoritative history in chat.md.
+    messages: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     summary: Mapped[str] = mapped_column(Text, default="")  # rolling summary of older messages
     summary_up_to: Mapped[int] = mapped_column(Integer, default=0)  # messages[0:N] already summarised
     backend_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("backends.id"), nullable=True)

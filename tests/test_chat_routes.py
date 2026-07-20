@@ -16,6 +16,7 @@ from app.schemas.api import SessionCreate, SessionMessageIn
 from app.services import memory
 from app.services.chat_service import ChatService, DomainContext, TurnRequest
 from app.services.md_store import (
+    ChatRecord,
     InvalidationIntentError,
     MarkdownMemoryStore,
     MemoryState,
@@ -66,6 +67,64 @@ class DB:
         return None
 
 
+class AmbiguousCreateDB:
+    def __init__(
+        self,
+        character: Character,
+        *,
+        session_id: int,
+        failure_stage: str,
+        failure: BaseException,
+    ) -> None:
+        self.character = character
+        self.session_id = session_id
+        self.failure_stage = failure_stage
+        self.failure = failure
+        self.added: Session | None = None
+        self.rows: dict[int, Session] = {}
+        self.deleted: Session | None = None
+        self.commits = 0
+        self.rollback_calls = 0
+
+    async def get(self, model, object_id):
+        if model is Character and object_id == self.character.id:
+            return self.character
+        if model is Session:
+            return self.rows.get(object_id)
+        return None
+
+    async def execute(self, statement):
+        return ScalarResult([])
+
+    def add(self, session):
+        self.added = session
+
+    async def flush(self):
+        assert self.added is not None
+        self.added.id = self.session_id
+        self.added.created_at = dt.datetime(2026, 7, 20)
+
+    async def commit(self):
+        self.commits += 1
+        assert self.added is not None
+        if self.deleted is not None:
+            self.rows.pop(self.deleted.id, None)
+        else:
+            self.rows[self.added.id] = self.added
+        if self.commits == 1 and self.failure_stage == "commit":
+            raise self.failure
+
+    async def refresh(self, value):
+        if self.failure_stage == "refresh":
+            raise self.failure
+
+    async def rollback(self):
+        self.rollback_calls += 1
+
+    async def delete(self, value):
+        self.deleted = value
+
+
 def entities() -> tuple[Session, Character]:
     session = Session(
         id=1,
@@ -92,13 +151,17 @@ def entities() -> tuple[Session, Character]:
 
 
 @pytest.mark.asyncio
-async def test_create_session_with_first_message_keeps_legacy_command_path_working(
+async def test_create_session_with_first_message_seeds_complete_markdown_history(
     route_env,
 ) -> None:
     _, character = entities()
     character.first_message = "你好，{{user}}。"
 
     class CreateDB:
+        def __init__(self) -> None:
+            self.session: Session | None = None
+            self.committed = False
+
         async def get(self, model, object_id):
             return character if model is Character else None
 
@@ -106,20 +169,416 @@ async def test_create_session_with_first_message_keeps_legacy_command_path_worki
             return ScalarResult([])
 
         def add(self, session):
+            self.session = session
+
+        async def flush(self):
+            assert self.session is not None
+            session = self.session
             session.id = 9
             session.created_at = dt.datetime(2026, 7, 20)
 
         async def commit(self):
-            return None
+            assert self.session is not None
+            if self.session.id is None:
+                self.session.id = 9
+                self.session.created_at = dt.datetime(2026, 7, 20)
+            self.committed = True
 
         async def refresh(self, value):
             return None
 
+    db = CreateDB()
     response = await sessions.create_session(
-        SessionCreate(character_id=character.id, user_name="逸山"), CreateDB()
+        SessionCreate(character_id=character.id, user_name="逸山"), db
     )
 
-    assert response.messages[0].content == "你好，逸山。"
+    assert db.committed
+    assert db.session is not None
+    assert db.session.messages is None
+    assert [(message.role, message.content) for message in response.messages] == [
+        ("assistant", "你好，逸山。"),
+        ("user", "(OOC: 确认开始)"),
+        (
+            "assistant",
+            "背景已经收到并通过校验，我将按照故事背景展开叙事。请开始你的行动。",
+        ),
+    ]
+    assert [
+        (record.role, record.content)
+        for record in await route_env.store.load_chat(9)
+    ] == [
+        ("assistant", "你好，逸山。"),
+        ("user", "(OOC: 确认开始)"),
+        (
+            "assistant",
+            "背景已经收到并通过校验，我将按照故事背景展开叙事。请开始你的行动。",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_session_rolls_back_when_markdown_seed_fails(
+    route_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, character = entities()
+    character.first_message = "你好，{{user}}。"
+
+    class CreateDB:
+        def __init__(self) -> None:
+            self.added: Session | None = None
+            self.persisted: list[Session] = []
+            self.rolled_back = False
+
+        async def get(self, model, object_id):
+            return character if model is Character else None
+
+        async def execute(self, statement):
+            return ScalarResult([])
+
+        def add(self, session):
+            self.added = session
+
+        async def flush(self):
+            assert self.added is not None
+            self.added.id = 10
+            self.added.created_at = dt.datetime(2026, 7, 20)
+
+        async def commit(self):
+            assert self.added is not None
+            if self.added.id is None:
+                self.added.id = 10
+            self.persisted.append(self.added)
+
+        async def rollback(self):
+            self.rolled_back = True
+
+        async def refresh(self, value):
+            return None
+
+    async def fail_seed(*args, **kwargs):
+        raise RuntimeError("secret markdown failure")
+
+    monkeypatch.setattr(route_env.store, "create_chat", fail_seed, raising=False)
+    db = CreateDB()
+
+    with pytest.raises(HTTPException) as captured:
+        await sessions.create_session(
+            SessionCreate(character_id=character.id, user_name="逸山"), db
+        )
+
+    assert captured.value.status_code == 500
+    assert captured.value.detail == "Failed to initialize session"
+    assert "secret" not in captured.value.detail
+    assert db.rolled_back
+    assert db.persisted == []
+    assert db.added is not None
+    assert db.added.messages is None
+    assert not route_env.store.file_path(10, "chat.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_create_only_markdown_seed_never_reuses_or_deletes_existing_chat(
+    route_env,
+) -> None:
+    await route_env.store.append_pair(
+        14,
+        "已有问题",
+        "已有回答",
+        char_name="已有角色",
+        user_name="已有用户",
+    )
+
+    with pytest.raises(FileExistsError):
+        await route_env.store.create_chat(
+            14,
+            [
+                ChatRecord(
+                    number=0,
+                    role="assistant",
+                    content="不得采用的新历史",
+                    timestamp="2026-07-20 00:00",
+                    name="新角色",
+                )
+            ],
+        )
+
+    assert [record.content for record in await route_env.store.load_chat(14)] == [
+        "已有问题",
+        "已有回答",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_session_removes_seeded_markdown_when_commit_fails(
+    route_env,
+) -> None:
+    _, character = entities()
+    character.first_message = "你好，{{user}}。"
+
+    class CreateDB:
+        def __init__(self) -> None:
+            self.added: Session | None = None
+            self.rolled_back = False
+
+        async def get(self, model, object_id):
+            return character if model is Character else None
+
+        async def execute(self, statement):
+            return ScalarResult([])
+
+        def add(self, session):
+            self.added = session
+
+        async def flush(self):
+            assert self.added is not None
+            self.added.id = 11
+
+        async def commit(self):
+            raise RuntimeError("secret commit failure")
+
+        async def rollback(self):
+            self.rolled_back = True
+
+    db = CreateDB()
+
+    with pytest.raises(HTTPException) as captured:
+        await sessions.create_session(
+            SessionCreate(character_id=character.id, user_name="逸山"), db
+        )
+
+    assert captured.value.status_code == 500
+    assert captured.value.detail == "Failed to initialize session"
+    assert db.rolled_back
+    assert not route_env.store.file_path(11, "chat.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_create_session_removes_committed_row_and_seed_when_refresh_fails(
+    route_env,
+) -> None:
+    _, character = entities()
+    character.first_message = "你好，{{user}}。"
+
+    class CreateDB:
+        def __init__(self) -> None:
+            self.added: Session | None = None
+            self.persisted: list[Session] = []
+            self.deleted = False
+
+        async def get(self, model, object_id):
+            if model is Character:
+                return character
+            if model is Session and self.persisted:
+                return self.persisted[0]
+            return None
+
+        async def execute(self, statement):
+            return ScalarResult([])
+
+        def add(self, session):
+            self.added = session
+
+        async def flush(self):
+            assert self.added is not None
+            self.added.id = 12
+
+        async def commit(self):
+            if self.deleted:
+                self.persisted.clear()
+            else:
+                assert self.added is not None
+                self.persisted[:] = [self.added]
+
+        async def refresh(self, value):
+            raise RuntimeError("secret refresh failure")
+
+        async def delete(self, value):
+            assert value is self.added
+            self.deleted = True
+
+        async def rollback(self):
+            return None
+
+    db = CreateDB()
+
+    with pytest.raises(HTTPException) as captured:
+        await sessions.create_session(
+            SessionCreate(character_id=character.id, user_name="逸山"), db
+        )
+
+    assert captured.value.status_code == 500
+    assert captured.value.detail == "Failed to initialize session"
+    assert db.deleted
+    assert db.persisted == []
+    assert not route_env.store.file_path(12, "chat.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_create_session_rejects_preexisting_markdown_for_reused_id(
+    route_env,
+) -> None:
+    _, character = entities()
+    character.first_message = "你好，{{user}}。"
+    await route_env.store.append_pair(
+        13,
+        "孤儿旧问题",
+        "孤儿旧回答",
+        char_name="旧角色",
+        user_name="旧用户",
+    )
+
+    class CreateDB:
+        def __init__(self) -> None:
+            self.added: Session | None = None
+            self.committed = False
+            self.rolled_back = False
+
+        async def get(self, model, object_id):
+            return character if model is Character else None
+
+        async def execute(self, statement):
+            return ScalarResult([])
+
+        def add(self, session):
+            self.added = session
+
+        async def flush(self):
+            assert self.added is not None
+            self.added.id = 13
+            self.added.created_at = dt.datetime(2026, 7, 20)
+
+        async def commit(self):
+            self.committed = True
+
+        async def rollback(self):
+            self.rolled_back = True
+
+        async def refresh(self, value):
+            return None
+
+    db = CreateDB()
+
+    with pytest.raises(HTTPException) as captured:
+        await sessions.create_session(
+            SessionCreate(character_id=character.id, user_name="逸山"), db
+        )
+
+    assert captured.value.status_code == 500
+    assert captured.value.detail == "Failed to initialize session"
+    assert not db.committed
+    assert db.rolled_back
+    assert [record.content for record in await route_env.store.load_chat(13)] == [
+        "孤儿旧问题",
+        "孤儿旧回答",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_db_compensation_never_deletes_preexisting_chat_or_logs_secrets(
+    route_env,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _, character = entities()
+    character.first_message = "你好，{{user}}。"
+    await route_env.store.append_pair(
+        14,
+        "预存问题",
+        "预存回答",
+        char_name="旧角色",
+        user_name="旧用户",
+    )
+
+    class CleanupFailureDB:
+        def __init__(self) -> None:
+            self.session: Session | None = None
+
+        async def get(self, model, object_id):
+            if model is Character:
+                return character
+            if model is Session:
+                raise RuntimeError("secret lookup failure")
+            return None
+
+        async def execute(self, statement):
+            return ScalarResult([])
+
+        def add(self, session):
+            self.session = session
+
+        async def flush(self):
+            assert self.session is not None
+            self.session.id = 14
+
+        async def rollback(self):
+            raise RuntimeError("secret rollback failure")
+
+    with pytest.raises(HTTPException) as captured:
+        await sessions.create_session(
+            SessionCreate(character_id=character.id, user_name="逸山"),
+            CleanupFailureDB(),
+        )
+
+    assert captured.value.detail == "Failed to initialize session"
+    assert [record.content for record in await route_env.store.load_chat(14)] == [
+        "预存问题",
+        "预存回答",
+    ]
+    assert "secret lookup failure" not in caplog.text
+    assert "secret rollback failure" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_create_session_compensates_when_commit_persists_then_raises(
+    route_env,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _, character = entities()
+    character.first_message = "你好，{{user}}。"
+    db = AmbiguousCreateDB(
+        character,
+        session_id=15,
+        failure_stage="commit",
+        failure=RuntimeError("secret commit acknowledgement failure"),
+    )
+
+    with pytest.raises(HTTPException) as captured:
+        await sessions.create_session(
+            SessionCreate(character_id=character.id, user_name="逸山"), db
+        )
+
+    assert captured.value.status_code == 500
+    assert captured.value.detail == "Failed to initialize session"
+    assert db.rows == {}
+    assert db.rollback_calls >= 1
+    assert not route_env.store.file_path(15, "chat.md").exists()
+    assert "secret commit acknowledgement failure" not in caplog.text
+
+
+@pytest.mark.parametrize("failure_stage", ["commit", "refresh"])
+@pytest.mark.asyncio
+async def test_create_session_cancellation_completes_compensation_before_propagating(
+    route_env,
+    failure_stage: str,
+) -> None:
+    _, character = entities()
+    character.first_message = "你好，{{user}}。"
+    session_id = 16 if failure_stage == "commit" else 17
+    db = AmbiguousCreateDB(
+        character,
+        session_id=session_id,
+        failure_stage=failure_stage,
+        failure=asyncio.CancelledError(),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await sessions.create_session(
+            SessionCreate(character_id=character.id, user_name="逸山"), db
+        )
+
+    assert db.rows == {}
+    assert db.rollback_calls >= 1
+    assert not route_env.store.file_path(session_id, "chat.md").exists()
 
 
 @pytest.fixture
@@ -667,6 +1126,121 @@ async def test_command_receipt_waits_for_turn_and_appends_one_complete_pair(
 
 
 @pytest.mark.asyncio
+async def test_remember_side_effect_and_receipt_wait_for_same_session_turn_lock(
+    route_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, character = entities()
+    original_turn_lock_for = route_env.store.turn_lock_for
+    turn_lock = await original_turn_lock_for(session.id)
+    lock_requested = asyncio.Event()
+
+    async def tracked_turn_lock_for(session_id: int):
+        lock_requested.set()
+        return await original_turn_lock_for(session_id)
+
+    monkeypatch.setattr(route_env.store, "turn_lock_for", tracked_turn_lock_for)
+
+    async with turn_lock:
+        command = asyncio.create_task(
+            sessions.send_message(
+                session.id,
+                SessionMessageIn(content="/remember 锁内记忆"),
+                DB(session, character),
+            )
+        )
+        await asyncio.wait_for(lock_requested.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        assert not command.done()
+        assert await route_env.store.read_text(session.id, "memory.md") == ""
+        assert await route_env.store.load_chat(session.id) == []
+
+    response = await command
+
+    assert "锁内记忆" in await route_env.store.read_text(session.id, "memory.md")
+    assert [(record.role, record.content) for record in await route_env.store.load_chat(1)] == [
+        ("user", "/remember 锁内记忆"),
+        ("assistant", "✓ Remembered: 锁内记忆"),
+    ]
+    assert response.messages[-1].content == "✓ Remembered: 锁内记忆"
+
+
+@pytest.mark.asyncio
+async def test_command_append_failure_returns_safe_error_without_rolling_back_side_effect(
+    route_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, character = entities()
+
+    async def fail_append(*args, **kwargs):
+        raise RuntimeError("secret append failure")
+
+    monkeypatch.setattr(route_env.store, "append_pair", fail_append)
+
+    with pytest.raises(HTTPException) as captured:
+        await sessions.send_message(
+            session.id,
+            SessionMessageIn(content="/remember 已发生的副作用"),
+            DB(session, character),
+        )
+
+    assert captured.value.status_code == 500
+    assert captured.value.detail == "Failed to record command"
+    assert "secret" not in captured.value.detail
+    assert "已发生的副作用" in await route_env.store.read_text(
+        session.id, "memory.md"
+    )
+    assert await route_env.store.load_chat(session.id) == []
+
+
+@pytest.mark.asyncio
+async def test_summary_clear_clears_markdown_and_appends_one_complete_pair(
+    route_env,
+) -> None:
+    session, character = entities()
+    await route_env.store.write_text(session.id, "summary.md", "旧摘要")
+
+    response = await sessions.send_message(
+        session.id,
+        SessionMessageIn(content="/summary clear"),
+        DB(session, character),
+    )
+
+    assert await route_env.store.read_text(session.id, "summary.md") == ""
+    assert [(record.role, record.content) for record in await route_env.store.load_chat(1)] == [
+        ("user", "/summary clear"),
+        ("assistant", "🗑️ 摘要已清空。"),
+    ]
+    assert response.messages[-2].content == "/summary clear"
+    assert response.messages[-1].content == "🗑️ 摘要已清空。"
+
+
+@pytest.mark.asyncio
+async def test_command_turn_lock_does_not_block_a_different_session(
+    route_env,
+) -> None:
+    first, character = entities()
+    second, _ = entities()
+    second.id = 2
+    first_lock = await route_env.store.turn_lock_for(first.id)
+
+    async with first_lock:
+        response = await asyncio.wait_for(
+            sessions.send_message(
+                second.id,
+                SessionMessageIn(content="/remember 第二会话"),
+                DB(second, character),
+            ),
+            timeout=1,
+        )
+
+    assert response.messages[-1].content == "✓ Remembered: 第二会话"
+    assert "第二会话" in await route_env.store.read_text(second.id, "memory.md")
+    assert await route_env.store.load_chat(first.id) == []
+
+
+@pytest.mark.asyncio
 async def test_summary_update_uses_v2_semantics_and_preserves_valid_summary(
     route_env,
     monkeypatch,
@@ -897,6 +1471,77 @@ async def test_http_feishu_lazily_imports_v1_database_history(
         f"{REQUIRED_OPENING}\n\n新回答",
     ]
     assert session.messages == original_database_history
+
+
+@pytest.mark.asyncio
+async def test_feishu_session_creation_rejects_orphan_before_sending_success_card(
+    route_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, character = entities()
+    character.first_message = "你好，{{user}}。"
+    await route_env.store.append_pair(
+        20,
+        "孤儿问题",
+        "孤儿回答",
+        char_name="旧角色",
+        user_name="旧用户",
+    )
+
+    class CardDB:
+        def __init__(self) -> None:
+            self.session: Session | None = None
+            self.rolled_back = False
+
+        async def get(self, model, object_id):
+            if model is Character and object_id == character.id:
+                return character
+            return None
+
+        async def execute(self, statement, params=None):
+            return ScalarResult([])
+
+        def add(self, session):
+            self.session = session
+
+        async def flush(self):
+            assert self.session is not None
+            self.session.id = 20
+
+        async def commit(self):
+            assert self.session is not None
+            if self.session.id is None:
+                self.session.id = 20
+
+        async def rollback(self):
+            self.rolled_back = True
+
+    sent_cards: list[dict[str, Any]] = []
+
+    async def send_card(chat_id, card):
+        sent_cards.append(card)
+
+    monkeypatch.setattr(feishu.feishu_client, "send_interactive_card", send_card)
+    db = CardDB()
+
+    with pytest.raises(HTTPException) as captured:
+        await feishu._handle_card_action(
+            {
+                "action": {"option": str(character.id), "value": {}},
+                "open_chat_id": "chat-orphan",
+            },
+            db,
+        )
+
+    assert captured.value.status_code == 500
+    assert captured.value.detail == "Failed to initialize session"
+    assert db.rolled_back
+    assert sent_cards == []
+    assert [record.content for record in await route_env.store.load_chat(20)] == [
+        "孤儿问题",
+        "孤儿回答",
+    ]
+    assert feishu.create_session_with_markdown is sessions.create_session_with_markdown
 
 
 @pytest.mark.parametrize(

@@ -454,9 +454,19 @@ async def test_http_feishu_first_message_writes_only_markdown_history(
         def add(self, value: Session) -> None:
             self.session = value
 
+        async def flush(self) -> None:
+            assert self.session is not None
+            self.session.id = 12
+
         async def commit(self) -> None:
             if self.session is not None and self.session.id is None:
                 self.session.id = 12
+
+        async def refresh(self, value: Session) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
 
     db = CardDB()
 
@@ -475,7 +485,7 @@ async def test_http_feishu_first_message_writes_only_markdown_history(
     )
 
     assert db.session is not None
-    assert db.session.messages == "[]"
+    assert db.session.messages is None
     records = await store.load_chat(12)
     assert [(record.role, record.content, record.name) for record in records] == [
         ("assistant", "你好，User。", "灵汐")

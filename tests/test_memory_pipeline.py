@@ -4627,12 +4627,12 @@ async def test_app_lifespan_manages_memory_worker_and_engine(
         async def stop(self):
             events.append("stop")
 
-    async def no_missing_columns(conn, table, column):
-        return False
+    async def migrate(engine):
+        events.append("migration")
 
     monkeypatch.setattr(settings, "memory_v2_enabled", True)
     monkeypatch.setattr(main, "engine", Engine())
-    monkeypatch.setattr(main, "_column_missing", no_missing_columns)
+    monkeypatch.setattr(main, "_migrate_database", migrate)
     monkeypatch.setattr(main, "MemoryPipeline", Pipeline, raising=False)
     monkeypatch.setattr(main, "MemoryTaskManager", Manager, raising=False)
     monkeypatch.setattr(main, "memory_pipeline", None)
@@ -4655,6 +4655,7 @@ async def test_app_lifespan_manages_memory_worker_and_engine(
 
     assert events == [
         "database",
+        "migration",
         "pipeline",
         "manager",
         "start",
@@ -4711,12 +4712,12 @@ async def test_app_lifespan_cleans_up_when_startup_scan_fails(
         async def stop(self):
             events.append("stop")
 
-    async def no_missing_columns(conn, table, column):
-        return False
+    async def migrate(engine):
+        events.append("migration")
 
     monkeypatch.setattr(settings, "memory_v2_enabled", True)
     monkeypatch.setattr(main, "engine", Engine())
-    monkeypatch.setattr(main, "_column_missing", no_missing_columns)
+    monkeypatch.setattr(main, "_migrate_database", migrate)
     monkeypatch.setattr(main, "MemoryPipeline", Pipeline)
     monkeypatch.setattr(main, "MemoryTaskManager", Manager)
     monkeypatch.setattr(main, "memory_pipeline", None)
@@ -4728,6 +4729,7 @@ async def test_app_lifespan_cleans_up_when_startup_scan_fails(
 
     assert events == [
         "database",
+        "migration",
         "pipeline",
         "manager",
         "start",

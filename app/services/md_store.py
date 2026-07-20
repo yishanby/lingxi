@@ -12,7 +12,7 @@ import re
 import shutil
 import tempfile
 import unicodedata
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -931,6 +931,28 @@ class MarkdownMemoryStore:
                 user_name=user_name,
                 msg_type=msg_type,
             )
+
+    async def create_chat(
+        self,
+        session_id: int,
+        records: Sequence[ChatRecord],
+    ) -> None:
+        """Create a new authoritative chat document without adopting an old one."""
+        document = render_chat_records(list(records))
+        async with self.transaction(session_id) as transaction:
+            chat_path = self.file_path(session_id, "chat.md")
+            if chat_path.exists():
+                raise FileExistsError("chat.md already exists")
+            try:
+                await transaction.write_text("chat.md", document)
+            except BaseException:
+                try:
+                    await transaction.delete_file("chat.md")
+                except BaseException as cleanup_exc:
+                    raise RuntimeError(
+                        "failed to roll back chat creation"
+                    ) from cleanup_exc
+                raise
 
     async def import_legacy_chat(
         self,

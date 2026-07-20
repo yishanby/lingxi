@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +19,11 @@ from app.services import feishu_client
 from app.services.chat_service import ChatService, ContextBudgetExceeded
 from app.services.llm import chat_completion
 from app.services.output_guard import OutputGuardError
+from app.services.md_store import ChatRecord
+from app.services.session_creation import (
+    SessionInitializationError,
+    create_session_with_markdown,
+)
 from app.services.token_tracker import record_usage
 
 logger = logging.getLogger(__name__)
@@ -347,25 +353,31 @@ async def _handle_card_action(body: dict[str, Any], db: AsyncSession) -> None:
         character_id=char_id,
         worldbook_ids="[]",
         feishu_chat_id=open_chat_id,
-        messages="[]",
+        messages=None,
         status="active",
     )
-    db.add(session)
-    await db.commit()
+    initial_records: list[ChatRecord] = []
+    first_msg = ""
+    if char.first_message:
+        first_msg = char.first_message.replace("{{user}}", "User").replace("{{char}}", char.name)
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+        initial_records.append(
+            ChatRecord(0, "assistant", first_msg, now, char.name)
+        )
+    try:
+        await create_session_with_markdown(
+            db,
+            memory_service.md_store,
+            session,
+            initial_records,
+        )
+    except SessionInitializationError as exc:
+        raise HTTPException(500, "Failed to initialize session") from exc
 
     # Send first message if character has one
     if char.first_message:
-        first_msg = char.first_message.replace("{{user}}", "User").replace("{{char}}", char.name)
         card = feishu_client.build_character_reply_card(char.name, first_msg)
         await feishu_client.send_interactive_card(open_chat_id, card)
-
-        # Markdown is authoritative; sessions.messages remains a read-only V1 fallback.
-        await memory_service.md_store.append_record(
-            session.id,
-            "assistant",
-            first_msg,
-            name=char.name,
-        )
     else:
         await feishu_client.send_text_message(
             open_chat_id,
