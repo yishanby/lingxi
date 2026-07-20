@@ -12,7 +12,7 @@ from app.services.prompt_policy import REQUIRED_OPENING
 
 
 class OutputGuardError(RuntimeError):
-    """Raised when a model still refuses after the guard's single retry."""
+    """Raised when model output is still unacceptable after one retry."""
 
     def __init__(
         self,
@@ -412,16 +412,21 @@ async def complete_with_guard(
     call: LLMCall,
     messages: list[dict[str, Any]],
 ) -> LLMResult:
-    """Call a model, retry one clear refusal, and normalize its reply."""
+    """Call a model, retry one refused/empty reply, and normalize success."""
     first = await call(copy.deepcopy(messages))
-    if not has_refusal(first["content"]):
+    if has_substantive_output(first["content"]) and not has_refusal(
+        first["content"]
+    ):
         return _guarded_result(first, retry_count=0)
 
     retry_messages = copy.deepcopy(messages)
     retry_messages.append({"role": "user", "content": _RETRY_CORRECTION})
     second = await call(retry_messages)
     aggregate_usage = _aggregate_usage(first, second)
-    if has_refusal(second["content"]):
+    if (
+        not has_substantive_output(second["content"])
+        or has_refusal(second["content"])
+    ):
         raise OutputGuardError(
             "Model refused after one retry",
             usage=aggregate_usage,

@@ -574,6 +574,98 @@ def test_complete_with_guard_retries_once_and_aggregates_usage(
     assert messages == original_messages
 
 
+@pytest.mark.parametrize(
+    "first_kind",
+    ["blank", "opening"],
+    ids=["blank", "opening-only"],
+)
+def test_complete_with_guard_retries_non_substantive_first_candidate_and_aggregates_usage(
+    fixed_opening: str,
+    first_kind: str,
+) -> None:
+    guard = _guard()
+    first_content = " \n\t " if first_kind == "blank" else f" {fixed_opening}\r\n\t"
+    first_usage = {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+    second_usage = {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
+    results: list[Result] = [
+        {"content": first_content, "usage": first_usage},
+        {
+            "content": "正文",
+            "usage": second_usage,
+            "model": "second-model",
+        },
+    ]
+    received: list[list[dict[str, Any]]] = []
+
+    async def call(call_messages: list[dict[str, Any]]) -> Result:
+        received.append(copy.deepcopy(call_messages))
+        return results[len(received) - 1]
+
+    result = asyncio.run(
+        guard.complete_with_guard(call, [{"role": "user", "content": "继续。"}])
+    )
+
+    assert len(received) == 2
+    assert received[1][:-1] == received[0]
+    assert received[1][-1]["role"] == "user"
+    assert result == {
+        "content": f"{fixed_opening}\n\n正文",
+        "usage": {
+            "prompt_tokens": 7,
+            "completion_tokens": 8,
+            "total_tokens": 15,
+        },
+        "model": "second-model",
+        "retry_count": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "second_kind",
+    ["blank", "opening"],
+    ids=["blank", "opening-only"],
+)
+def test_complete_with_guard_raises_after_two_non_substantive_candidates(
+    fixed_opening: str,
+    second_kind: str,
+) -> None:
+    guard = _guard()
+    second_content = "\r\n\t" if second_kind == "blank" else fixed_opening
+    results: list[Result] = [
+        {
+            "content": "",
+            "usage": {"prompt_tokens": 2, "completion_tokens": 0, "total_tokens": 2},
+        },
+        {
+            "content": second_content,
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+        },
+    ]
+    calls = 0
+
+    async def call(call_messages: list[dict[str, Any]]) -> Result:
+        nonlocal calls
+        result = results[calls]
+        calls += 1
+        return result
+
+    with pytest.raises(guard.OutputGuardError) as exc_info:
+        asyncio.run(
+            guard.complete_with_guard(
+                call,
+                [{"role": "user", "content": "继续。"}],
+            )
+        )
+
+    assert calls == 2
+    assert exc_info.value.retry_count == 1
+    assert exc_info.value.usage == {
+        "prompt_tokens": 7,
+        "completion_tokens": 1,
+        "total_tokens": 8,
+    }
+
+
 def test_complete_with_guard_raises_after_exactly_two_refusals() -> None:
     guard = _guard()
     messages: list[dict[str, Any]] = [{"role": "user", "content": "继续。"}]

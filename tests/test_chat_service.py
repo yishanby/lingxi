@@ -139,6 +139,29 @@ async def test_send_provider_failure_leaves_markdown_unchanged(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_send_two_non_substantive_candidates_leave_markdown_unchanged(
+    tmp_path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    manager = MemoryManager()
+    candidates = ["", REQUIRED_OPENING]
+    calls = 0
+
+    async def complete(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal calls
+        content = candidates[calls]
+        calls += 1
+        return {"content": content, "usage": USAGE}
+
+    with pytest.raises(OutputGuardError):
+        await ChatService(store, manager, completion=complete).send(request())
+
+    assert calls == 2
+    assert await store.load_chat(1) == []
+    assert manager.submitted == []
+
+
+@pytest.mark.asyncio
 async def test_send_recovers_unresolved_intent_before_context_and_releases_pipeline_lock(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
