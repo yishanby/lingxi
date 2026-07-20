@@ -366,3 +366,57 @@ async def test_feishu_context_budget_error_is_safe_and_does_not_persist(
     assert "mandatory" not in sent[-1]
     assert "secret" not in sent[-1]
     assert await route_env.store.load_chat(1) == []
+
+
+@pytest.mark.asyncio
+async def test_feishu_backend_resolution_failure_sends_safe_error_without_side_effects(
+    route_env, monkeypatch
+) -> None:
+    session, character = entities()
+    session.feishu_chat_id = "chat-1"
+    db = DB(session, character)
+    sent: list[str] = []
+
+    async def fail_backend(backend_id, db):
+        raise RuntimeError("context-secret provider-key")
+
+    async def send_text(chat_id, text):
+        sent.append(text)
+
+    monkeypatch.setattr(sessions, "_resolve_backend", fail_backend)
+    monkeypatch.setattr(feishu.feishu_client, "send_text_message", send_text)
+
+    await feishu._handle_message(feishu_event("继续。"), db)
+
+    assert sent == ["生成失败，请稍后重试。"]
+    assert "context-secret" not in sent[0]
+    assert "provider-key" not in sent[0]
+    assert await route_env.store.load_chat(1) == []
+    assert route_env.manager.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_feishu_context_preparation_failure_sends_safe_error_without_side_effects(
+    route_env, monkeypatch
+) -> None:
+    session, character = entities()
+    session.feishu_chat_id = "chat-1"
+    db = DB(session, character)
+    sent: list[str] = []
+
+    async def fail_context(**kwargs):
+        raise RuntimeError("context-secret provider-key")
+
+    async def send_text(chat_id, text):
+        sent.append(text)
+
+    monkeypatch.setattr(sessions, "_prepare_turn_request", fail_context)
+    monkeypatch.setattr(feishu.feishu_client, "send_text_message", send_text)
+
+    await feishu._handle_message(feishu_event("继续。"), db)
+
+    assert sent == ["生成失败，请稍后重试。"]
+    assert "context-secret" not in sent[0]
+    assert "provider-key" not in sent[0]
+    assert await route_env.store.load_chat(1) == []
+    assert route_env.manager.submitted == []

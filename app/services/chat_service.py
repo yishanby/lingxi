@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -36,7 +37,7 @@ _USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens")
 
 
 class MemorySubmitter(Protocol):
-    async def submit(self, session_id: int) -> None: ...
+    def submit(self, session_id: int) -> Awaitable[None] | None: ...
 
 
 class ContextBuilderLike(Protocol):
@@ -293,7 +294,9 @@ class ChatService:
         if self.memory_manager is None:
             return
         try:
-            await self.memory_manager.submit(session_id)
+            result = self.memory_manager.submit(session_id)
+            if inspect.isawaitable(result):
+                await result
         except Exception:
             logger.exception(
                 "Committed chat turn but failed to submit managed memory for session %s",

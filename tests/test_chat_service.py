@@ -32,6 +32,14 @@ class MemoryManager:
             raise RuntimeError("memory queue unavailable")
 
 
+class SyncMemoryManager:
+    def __init__(self) -> None:
+        self.submitted: list[int] = []
+
+    def submit(self, session_id: int) -> None:
+        self.submitted.append(session_id)
+
+
 class CapturingBuilder:
     def __init__(self, messages: list[dict[str, str]] | None = None) -> None:
         self.sources: list[Any] = []
@@ -272,6 +280,24 @@ async def test_memory_submit_failure_does_not_rollback_or_fail_committed_turn(
 
 
 @pytest.mark.asyncio
+async def test_send_supports_synchronous_memory_submitter_without_false_failure(
+    tmp_path, caplog
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    manager = SyncMemoryManager()
+
+    async def complete(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        return {"content": "正文", "usage": USAGE}
+
+    result = await ChatService(store, manager, completion=complete).send(request())
+
+    assert result.content.endswith("正文")
+    assert manager.submitted == [1]
+    assert len(await store.load_chat(1)) == 2
+    assert "failed to submit managed memory" not in caplog.text.casefold()
+
+
+@pytest.mark.asyncio
 async def test_context_budget_failure_is_typed_and_has_no_side_effects(tmp_path) -> None:
     class FailingBuilder:
         def build(self, sources: Any) -> Any:
@@ -322,6 +348,28 @@ async def test_stream_success_normalizes_opening_persists_then_emits_done(
         f"{REQUIRED_OPENING}\n\n正文继续",
     ]
     assert manager.submitted == [1]
+
+
+@pytest.mark.asyncio
+async def test_stream_supports_synchronous_memory_submitter_without_false_failure(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr("app.services.chat_service.settings.stream_guard_chars", 1)
+    store = MarkdownMemoryStore(tmp_path)
+    manager = SyncMemoryManager()
+
+    async def stream(messages: list[dict[str, Any]]):
+        yield "正文"
+        yield {"usage": USAGE}
+
+    events = await collect(
+        ChatService(store, manager, stream_completion=stream).stream(request())
+    )
+
+    assert events[-1].done
+    assert manager.submitted == [1]
+    assert len(await store.load_chat(1)) == 2
+    assert "failed to submit managed memory" not in caplog.text.casefold()
 
 
 @pytest.mark.asyncio

@@ -122,31 +122,31 @@ async def _handle_message(event: dict[str, Any], db: AsyncSession) -> None:
 
     from app.routers import sessions as sessions_router
 
-    backend = await sessions_router._resolve_backend(session.backend_id, db)
-    turn_request = await sessions_router._prepare_turn_request(
-        session=session,
-        char=char,
-        content=text,
-        msg_type="ic",
-        db=db,
-    )
-
-    async def complete(messages):
-        return await chat_completion(
-            provider=backend["provider"],
-            api_key=backend["api_key"],
-            model=backend["model"],
-            base_url=backend["base_url"],
-            messages=messages,
-            params=dict(backend["params"]),
+    try:
+        backend = await sessions_router._resolve_backend(session.backend_id, db)
+        turn_request = await sessions_router._prepare_turn_request(
+            session=session,
+            char=char,
+            content=text,
+            msg_type="ic",
+            db=db,
         )
 
-    service = ChatService(
-        memory_service.md_store,
-        sessions_router._managed_memory_manager(),
-        completion=complete,
-    )
-    try:
+        async def complete(messages):
+            return await chat_completion(
+                provider=backend["provider"],
+                api_key=backend["api_key"],
+                model=backend["model"],
+                base_url=backend["base_url"],
+                messages=messages,
+                params=dict(backend["params"]),
+            )
+
+        service = ChatService(
+            memory_service.md_store,
+            sessions_router._managed_memory_manager(),
+            completion=complete,
+        )
         turn = await service.send(turn_request)
     except ContextBudgetExceeded:
         await feishu_client.send_text_message(
