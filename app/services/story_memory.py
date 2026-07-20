@@ -393,7 +393,6 @@ async def update_summary_from_episodes(
     max_tokens: int,
 ) -> int:
     """Update the rolling summary from a strictly validated episode sequence."""
-    _validate_nonnegative_integer(last_summary_message, label="summary checkpoint")
     if type(max_tokens) is not int or max_tokens <= 0:
         raise ValueError("summary token budget must be a positive integer")
 
@@ -418,6 +417,16 @@ async def update_summary_from_episodes(
                 )
             episodes.append(episode)
             previous_end = episode.end
+
+        _validate_nonnegative_integer(
+            last_summary_message,
+            label="summary checkpoint",
+        )
+        valid_checkpoints = {episode.end for episode in episodes}
+        if last_summary_message and last_summary_message not in valid_checkpoints:
+            raise ValueError(
+                "summary checkpoint must be zero or match an existing episode end"
+            )
 
         pending = [
             episode for episode in episodes if episode.end > last_summary_message

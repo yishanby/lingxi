@@ -909,6 +909,130 @@ async def test_summary_with_no_pending_episodes_does_not_call_or_write(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("ranges", "checkpoint"),
+    [
+        ([], -1),
+        ([], 1),
+        ([(1, 1, 20)], 10),
+        ([(1, 1, 20)], 21),
+        ([(1, 1, 20)], 100),
+        ([(1, 1, 20), (2, 21, 40)], 10),
+        ([(1, 1, 20), (2, 21, 40)], 30),
+        ([(1, 1, 20), (2, 21, 40)], 41),
+    ],
+    ids=[
+        "empty-negative",
+        "empty-nonzero",
+        "single-middle",
+        "single-gap",
+        "single-beyond",
+        "multiple-first-middle",
+        "multiple-second-middle",
+        "multiple-beyond",
+    ],
+)
+async def test_summary_checkpoint_must_be_zero_or_existing_episode_end(
+    tmp_path: Path,
+    ranges: list[tuple[int, int, int]],
+    checkpoint: int,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    for number, start, end in ranges:
+        await store.write_text(
+            1,
+            f"episodes/episode-{number:06d}.md",
+            episode_document(number, start, end),
+        )
+    old = "旧摘要保持不变\n"
+    await store.write_text(1, "summary.md", old)
+    calls = 0
+
+    async def must_not_complete(_messages: list[dict[str, str]]) -> str:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("completion must not be called")
+
+    with pytest.raises(ValueError, match="summary checkpoint"):
+        await update_summary_from_episodes(
+            store,
+            1,
+            checkpoint,
+            must_not_complete,
+            max_tokens=100,
+        )
+
+    assert calls == 0
+    assert await store.read_text(1, "summary.md") == old
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ranges", "checkpoint"),
+    [
+        ([], 0),
+        ([(1, 1, 20)], 20),
+        ([(1, 1, 20), (2, 21, 40)], 40),
+    ],
+    ids=["empty-zero", "single-final-end", "multiple-final-end"],
+)
+async def test_summary_accepts_zero_or_final_episode_end_without_work(
+    tmp_path: Path,
+    ranges: list[tuple[int, int, int]],
+    checkpoint: int,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    for number, start, end in ranges:
+        await store.write_text(
+            1,
+            f"episodes/episode-{number:06d}.md",
+            episode_document(number, start, end),
+        )
+    old = "保持原样（无结尾换行）"
+    await store.write_text(1, "summary.md", old)
+
+    async def must_not_complete(_messages: list[dict[str, str]]) -> str:
+        raise AssertionError("completion must not be called")
+
+    assert await update_summary_from_episodes(
+        store,
+        1,
+        checkpoint,
+        must_not_complete,
+        max_tokens=100,
+    ) == checkpoint
+    assert await store.read_text(1, "summary.md") == old
+
+
+@pytest.mark.asyncio
+async def test_summary_validates_episode_chain_before_checkpoint(
+    tmp_path: Path,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    await store.write_text(
+        1,
+        "episodes/episode-000001.md",
+        episode_document(1, 2, 21),
+    )
+    old = "旧摘要\n"
+    await store.write_text(1, "summary.md", old)
+
+    async def must_not_complete(_messages: list[dict[str, str]]) -> str:
+        raise AssertionError("completion must not be called")
+
+    with pytest.raises(ValueError, match="episode"):
+        await update_summary_from_episodes(
+            store,
+            1,
+            10,
+            must_not_complete,
+            max_tokens=100,
+        )
+
+    assert await store.read_text(1, "summary.md") == old
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "documents",
     [
         [("episode-000001.md", "# Episode 000001\n\nno metadata\n")],
