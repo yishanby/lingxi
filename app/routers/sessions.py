@@ -32,7 +32,7 @@ from app.services.chat_service import (
 )
 from app.services import memory as memory_service
 from app.services.llm import LLMError, chat_completion, chat_completion_stream
-from app.services.md_store import ChatRecord
+from app.services.md_store import ChatRecord, LegacyChatImportError
 from app.services.output_guard import OutputGuardError
 from app.services.token_tracker import record_usage
 from app.services.memory import (
@@ -45,7 +45,6 @@ from app.services.memory import (
     list_character_names,
     load_assets,
     load_assets_summary,
-    load_chat_md,
     load_character_profile,
     load_mentioned_character_profiles,
     load_memory,
@@ -69,18 +68,44 @@ _OOC_INSTRUCTION = (
 )
 
 
-def _chat_md_to_messages(raw: list[dict]) -> list[MessageItem]:
-    """Convert load_chat_md dicts to MessageItem list."""
-    return [
-        MessageItem(role=m["role"], content=m["content"], timestamp=m.get("timestamp"))
-        for m in raw
+async def _ensure_session_history(
+    session: Session,
+    char_name: str | None = None,
+) -> list[ChatRecord]:
+    """Lazily import a DB-only V1 history; an existing chat.md always wins."""
+    return await memory_service.md_store.import_legacy_chat(
+        session.id,
+        session.messages,
+        char_name=char_name or f"Character#{session.character_id}",
+        user_name=session.user_name or "用户",
+    )
+
+
+async def _load_session_messages(
+    session: Session,
+    char_name: str | None = None,
+    *,
+    tolerate_invalid_legacy: bool = False,
+) -> list[MessageItem]:
+    """Load authoritative messages, lazily importing a V1 DB fallback."""
+    try:
+        records = await _ensure_session_history(session, char_name)
+    except LegacyChatImportError:
+        if not tolerate_invalid_legacy:
+            raise
+        logger.warning(
+            "Skipping invalid V1 history while listing session %s",
+            session.id,
+        )
+        records = []
+    messages = [
+        MessageItem(
+            role=record.role,
+            content=record.content,
+            timestamp=record.timestamp if record.timestamp != "unknown" else None,
+        )
+        for record in records
     ]
-
-
-async def _load_session_messages(session_id: int) -> list[MessageItem]:
-    """Load messages from chat.md for a session."""
-    raw = await load_chat_md(session_id)
-    messages = _chat_md_to_messages(raw)
     # Filter out model refusal messages that poison subsequent context
     messages = _filter_refusals(messages)
     return messages
@@ -162,8 +187,17 @@ def _is_refusal(text: str) -> bool:
     return any(m.lower() in lower for m in REFUSAL_MARKERS)
 
 
-async def _row_to_out(s: Session) -> SessionOut:
-    messages = await _load_session_messages(s.id)
+async def _row_to_out(
+    s: Session,
+    char_name: str | None = None,
+    *,
+    tolerate_invalid_legacy: bool = False,
+) -> SessionOut:
+    messages = await _load_session_messages(
+        s,
+        char_name,
+        tolerate_invalid_legacy=tolerate_invalid_legacy,
+    )
     return SessionOut(
         id=s.id,
         character_id=s.character_id,
@@ -271,7 +305,7 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
         except Exception as exc:
             logger.error(f"Failed to write first message to chat.md: {exc}")
 
-    return await _row_to_out(session)
+    return await _row_to_out(session, char.name)
 
 
 @router.get("")
@@ -283,11 +317,22 @@ async def list_sessions(
     if lite:
         sessions = []
         for s in result.scalars().all():
-            raw = await load_chat_md(s.id)
-            msg_count = len(raw)
+            char = await db.get(Character, s.character_id)
+            try:
+                records = await _ensure_session_history(
+                    s,
+                    char.name if char else None,
+                )
+            except LegacyChatImportError:
+                logger.warning(
+                    "Skipping invalid V1 history while listing session %s",
+                    s.id,
+                )
+                records = []
+            msg_count = len(records)
             last_summary = ""
-            if raw:
-                last_content = raw[-1].get("content", "")
+            if records:
+                last_content = records[-1].content
                 last_summary = last_content.replace("\n", " ")[:50]
             sessions.append({
                 "id": s.id,
@@ -301,7 +346,17 @@ async def list_sessions(
             })
         from fastapi.responses import JSONResponse
         return JSONResponse(content=sessions)
-    return [await _row_to_out(s) for s in result.scalars().all()]
+    output = []
+    for s in result.scalars().all():
+        char = await db.get(Character, s.character_id)
+        output.append(
+            await _row_to_out(
+                s,
+                char.name if char else None,
+                tolerate_invalid_legacy=True,
+            )
+        )
+    return output
 
 
 @router.get("/{session_id}", response_model=SessionOut)
@@ -309,7 +364,8 @@ async def get_session(session_id: int, db: AsyncSession = Depends(get_db)):
     session = await db.get(Session, session_id)
     if not session:
         raise HTTPException(404, "Session not found")
-    return await _row_to_out(session)
+    char = await db.get(Character, session.character_id)
+    return await _row_to_out(session, char.name if char else None)
 
 
 @router.delete("/{session_id}", status_code=204)
@@ -340,7 +396,8 @@ async def update_session_status(
         session.feishu_chat_id = body["feishu_chat_id"]
     await db.commit()
     await db.refresh(session)
-    return await _row_to_out(session)
+    char = await db.get(Character, session.character_id)
+    return await _row_to_out(session, char.name if char else None)
 
 
 def _managed_memory_manager():
@@ -498,11 +555,12 @@ async def send_message(
 
     content = body.content.strip()
     if content.startswith("/"):
-        messages = await _load_session_messages(session_id)
+        messages = await _load_session_messages(session, char.name)
         return await _handle_command(
             content, session, session_id, char, messages, body.backend_id, db,
         )
 
+    await _ensure_session_history(session, char.name)
     msg_type = "ooc" if _OOC_PATTERN.match(content) else "ic"
     backend = await _resolve_backend(body.backend_id or session.backend_id, db)
     turn_request = TurnRequest(
@@ -555,7 +613,28 @@ async def send_message(
         backend=backend,
         usage=result.usage,
     )
-    return await _row_to_out(session)
+    return await _row_to_out(session, char.name)
+
+
+async def _append_command_pair(
+    session_id: int,
+    user_content: str,
+    assistant_content: str,
+    *,
+    char_name: str,
+    user_name: str,
+) -> None:
+    turn_lock = await memory_service.md_store.turn_lock_for(session_id)
+    async with turn_lock:
+        await memory_service.md_store.recover_invalidation(session_id)
+        await memory_service.md_store.append_pair(
+            session_id,
+            user_content,
+            assistant_content,
+            char_name=char_name,
+            user_name=user_name,
+        )
+
 
 async def _handle_command(
     content: str,
@@ -693,10 +772,14 @@ async def _handle_command(
             memory = await load_memory(session_id)
             response = memory if memory else "(No memories recorded yet)"
 
-        now = datetime.datetime.utcnow().isoformat()
         try:
-            await append_chat_md(session_id, "user", content, char_name=char.name, user_name=user_name)
-            await append_chat_md(session_id, "assistant", response, char_name=char.name, user_name=user_name)
+            await _append_command_pair(
+                session_id,
+                content,
+                response,
+                char_name=char.name,
+                user_name=user_name,
+            )
         except Exception as exc:
             logger.error(f"Failed to append chat.md for /memory: {exc}")
         return await _row_to_out(session)
@@ -707,10 +790,14 @@ async def _handle_command(
         else:
             await append_manual_memory(session_id, arg)
             response = f"✓ Remembered: {arg}"
-        now = datetime.datetime.utcnow().isoformat()
         try:
-            await append_chat_md(session_id, "user", content, char_name=char.name, user_name=user_name)
-            await append_chat_md(session_id, "assistant", response, char_name=char.name, user_name=user_name)
+            await _append_command_pair(
+                session_id,
+                content,
+                response,
+                char_name=char.name,
+                user_name=user_name,
+            )
         except Exception as exc:
             logger.error(f"Failed to append chat.md for /remember: {exc}")
         return await _row_to_out(session)
@@ -723,8 +810,13 @@ async def _handle_command(
         else:
             response = "还没有资产记录。资产会在对话中自动跟踪更新。"
         try:
-            await append_chat_md(session_id, "user", content, char_name=char.name, user_name=user_name)
-            await append_chat_md(session_id, "assistant", response, char_name=char.name, user_name=user_name)
+            await _append_command_pair(
+                session_id,
+                content,
+                response,
+                char_name=char.name,
+                user_name=user_name,
+            )
         except Exception as exc:
             logger.error(f"Failed to append chat.md for /assets: {exc}")
         return await _row_to_out(session)
@@ -753,8 +845,13 @@ async def _handle_command(
             response = summary if summary else "(还没有摘要)"
 
         try:
-            await append_chat_md(session_id, "user", content, char_name=char.name, user_name=user_name)
-            await append_chat_md(session_id, "assistant", response, char_name=char.name, user_name=user_name)
+            await _append_command_pair(
+                session_id,
+                content,
+                response,
+                char_name=char.name,
+                user_name=user_name,
+            )
         except Exception as exc:
             logger.error(f"Failed to append chat.md for /summary: {exc}")
         return await _row_to_out(session)
@@ -862,8 +959,13 @@ async def _handle_command(
                 parts_out.append(profile + f"\n({len(profile)} chars)")
             response = "\n\n---\n".join(parts_out)
         try:
-            await append_chat_md(session_id, "user", content, char_name=char.name, user_name=user_name)
-            await append_chat_md(session_id, "assistant", response, char_name=char.name, user_name=user_name)
+            await _append_command_pair(
+                session_id,
+                content,
+                response,
+                char_name=char.name,
+                user_name=user_name,
+            )
         except Exception as exc:
             logger.error(f"Failed to append chat.md for /chars: {exc}")
         return await _row_to_out(session)
@@ -953,6 +1055,7 @@ async def send_message_stream(
         raise HTTPException(500, "Character associated with session not found")
 
     content = body.content.strip()
+    await _ensure_session_history(session, char.name)
     msg_type = "ooc" if _OOC_PATTERN.match(content) else "ic"
     backend = await _resolve_backend(body.backend_id or session.backend_id, db)
     turn_request = TurnRequest(

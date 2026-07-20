@@ -73,7 +73,7 @@ def entities() -> tuple[Session, Character]:
         worldbook_ids="[]",
         user_name="逸山",
         user_persona="",
-        messages='[{"role":"assistant","content":"STALE_DB"}]',
+        messages="[]",
         summary="",
         status="active",
         created_at=dt.datetime(2026, 7, 20),
@@ -407,6 +407,131 @@ async def test_established_session_without_examples_does_not_load_history_seed(
 
 
 @pytest.mark.asyncio
+async def test_rest_lazily_imports_v1_database_history_before_new_turn(
+    route_env,
+    monkeypatch,
+) -> None:
+    session, character = entities()
+    legacy = [
+        {
+            "role": "user",
+            "content": "V1_USER_MARKER",
+            "timestamp": "2026-07-01T10:11:12",
+        },
+        {
+            "role": "assistant",
+            "content": "V1_ASSISTANT_MARKER",
+            "timestamp": "2026-07-01T10:12:13",
+        },
+    ]
+    session.messages = json.dumps(legacy)
+    original_database_history = session.messages
+    captured: list[list[dict[str, Any]]] = []
+
+    async def complete(**kwargs):
+        captured.append(kwargs["messages"])
+        return {"content": "新回答", "usage": {}}
+
+    monkeypatch.setattr(sessions, "chat_completion", complete)
+
+    await sessions.send_message(
+        1,
+        SessionMessageIn(content="继续旧故事。"),
+        DB(session, character),
+    )
+
+    provider_text = "\n".join(
+        str(message.get("content", "")) for message in captured[0]
+    )
+    assert "V1_USER_MARKER" in provider_text
+    assert "V1_ASSISTANT_MARKER" in provider_text
+    assert [record.content for record in await route_env.store.load_chat(1)] == [
+        "V1_USER_MARKER",
+        "V1_ASSISTANT_MARKER",
+        "继续旧故事。",
+        f"{REQUIRED_OPENING}\n\n新回答",
+    ]
+    assert session.messages == original_database_history
+
+
+@pytest.mark.asyncio
+async def test_existing_markdown_ignores_malformed_v1_database_fallback(
+    route_env,
+    monkeypatch,
+) -> None:
+    session, character = entities()
+    session.messages = "{malformed legacy json"
+    await route_env.store.append_pair(
+        1,
+        "MD_USER_MARKER",
+        "MD_ASSISTANT_MARKER",
+        char_name="灵汐",
+        user_name="逸山",
+    )
+    captured: list[list[dict[str, Any]]] = []
+
+    async def complete(**kwargs):
+        captured.append(kwargs["messages"])
+        return {"content": "新回答", "usage": {}}
+
+    monkeypatch.setattr(sessions, "chat_completion", complete)
+
+    await sessions.send_message(
+        1,
+        SessionMessageIn(content="继续。"),
+        DB(session, character),
+    )
+
+    provider_text = "\n".join(
+        str(message.get("content", "")) for message in captured[0]
+    )
+    assert "MD_USER_MARKER" in provider_text
+    assert "MD_ASSISTANT_MARKER" in provider_text
+
+
+@pytest.mark.parametrize("lite", [False, True])
+@pytest.mark.asyncio
+async def test_session_list_isolates_malformed_unrelated_v1_history(
+    route_env,
+    lite: bool,
+) -> None:
+    malformed, character = entities()
+    malformed.id = 2
+    malformed.messages = "{malformed legacy json"
+    valid, _ = entities()
+    valid.messages = json.dumps(
+        [
+            {"role": "user", "content": "VALID_V1_USER"},
+            {"role": "assistant", "content": "VALID_V1_ASSISTANT"},
+        ]
+    )
+
+    class ListDB:
+        async def get(self, model, object_id):
+            if model is Character and object_id == character.id:
+                return character
+            return None
+
+        async def execute(self, statement):
+            return ScalarResult([malformed, valid])
+
+    response = await sessions.list_sessions(lite=lite, db=ListDB())
+
+    if lite:
+        payload = json.loads(response.body)
+        by_id = {item["id"]: item for item in payload}
+        assert by_id[2]["msg_count"] == 0
+        assert by_id[1]["msg_count"] == 2
+    else:
+        by_id = {item.id: item for item in response}
+        assert by_id[2].messages == []
+        assert [message.content for message in by_id[1].messages] == [
+            "VALID_V1_USER",
+            "VALID_V1_ASSISTANT",
+        ]
+
+
+@pytest.mark.asyncio
 async def test_new_session_without_examples_loads_history_seed_once(
     route_env, monkeypatch
 ) -> None:
@@ -489,6 +614,91 @@ async def test_sessions_context_preparation_is_serialized_and_sees_prior_commit(
         "第一问",
         f"{REQUIRED_OPENING}\n\n正文",
     ]
+
+
+@pytest.mark.asyncio
+async def test_command_receipt_waits_for_turn_and_appends_one_complete_pair(
+    route_env,
+    monkeypatch,
+) -> None:
+    session, character = entities()
+    loader_started = asyncio.Event()
+    release_loader = asyncio.Event()
+
+    async def blocking_memory(session_id, content, recent):
+        loader_started.set()
+        await release_loader.wait()
+        return ""
+
+    async def complete(**kwargs):
+        return {"content": "普通回答", "usage": {}}
+
+    monkeypatch.setattr(sessions, "load_memory_relevant", blocking_memory)
+    monkeypatch.setattr(sessions, "chat_completion", complete)
+
+    ordinary = asyncio.create_task(
+        sessions.send_message(
+            1,
+            SessionMessageIn(content="普通问题"),
+            DB(session, character),
+        )
+    )
+    await loader_started.wait()
+    command = asyncio.create_task(
+        sessions.send_message(
+            1,
+            SessionMessageIn(content="/assets"),
+            DB(session, character),
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert not command.done()
+    release_loader.set()
+    await asyncio.gather(ordinary, command)
+
+    records = await route_env.store.load_chat(1)
+    assert [(record.role, record.content) for record in records] == [
+        ("user", "普通问题"),
+        ("assistant", f"{REQUIRED_OPENING}\n\n普通回答"),
+        ("user", "/assets"),
+        ("assistant", "还没有资产记录。资产会在对话中自动跟踪更新。"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_summary_update_uses_v2_semantics_and_preserves_valid_summary(
+    route_env,
+    monkeypatch,
+) -> None:
+    session, character = entities()
+    await route_env.store.append_pair(
+        1,
+        "旧问题",
+        "旧回答",
+        char_name="灵汐",
+        user_name="逸山",
+    )
+    await route_env.store.write_text(1, "summary.md", "应保留的整体剧情。\n")
+    prompts: list[list[dict[str, Any]]] = []
+
+    async def invalid_summary(**kwargs):
+        prompts.append(kwargs["messages"])
+        return {"content": "<script>剧情已完成</script>", "usage": {}}
+
+    monkeypatch.setattr(memory, "chat_completion", invalid_summary)
+    monkeypatch.setattr(sessions, "load_summary", memory.load_summary)
+
+    response = await sessions.send_message(
+        1,
+        SessionMessageIn(content="/summary update"),
+        DB(session, character),
+    )
+
+    assert "不判断剧情线或伏笔是否完成" in prompts[0][0]["content"]
+    assert await route_env.store.read_text(1, "summary.md") == "应保留的整体剧情。\n"
+    assert response.messages[-2].content == "/summary update"
+    assert response.messages[-1].content.startswith("❌ 更新失败:")
 
 
 @pytest.mark.asyncio
@@ -619,6 +829,7 @@ async def test_feishu_ordinary_chat_uses_markdown_and_preserves_token_footer(
 ) -> None:
     session, character = entities()
     session.feishu_chat_id = "chat-1"
+    session.messages = '[{"role":"assistant","content":"STALE_DB"}]'
     db = DB(session, character)
 
     async def resolve_backend(backend_id, db):
@@ -644,6 +855,48 @@ async def test_feishu_ordinary_chat_uses_markdown_and_preserves_token_footer(
     assert route_env.manager.submitted == [1]
     assert cards
     assert "Token" in json.dumps(cards, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_http_feishu_lazily_imports_v1_database_history(
+    route_env,
+    monkeypatch,
+) -> None:
+    session, character = entities()
+    session.feishu_chat_id = "chat-1"
+    session.messages = json.dumps(
+        [
+            {"role": "user", "content": "V1_FEISHU_USER"},
+            {"role": "assistant", "content": "V1_FEISHU_ASSISTANT"},
+        ]
+    )
+    original_database_history = session.messages
+    captured: list[list[dict[str, Any]]] = []
+
+    async def complete(**kwargs):
+        captured.append(kwargs["messages"])
+        return {"content": "新回答", "usage": {}}
+
+    async def send_card(chat_id, card):
+        return None
+
+    monkeypatch.setattr(feishu, "chat_completion", complete)
+    monkeypatch.setattr(feishu.feishu_client, "send_interactive_card", send_card)
+
+    await feishu._handle_message(feishu_event("继续。"), DB(session, character))
+
+    provider_text = "\n".join(
+        str(message.get("content", "")) for message in captured[0]
+    )
+    assert "V1_FEISHU_USER" in provider_text
+    assert "V1_FEISHU_ASSISTANT" in provider_text
+    assert [record.content for record in await route_env.store.load_chat(1)] == [
+        "V1_FEISHU_USER",
+        "V1_FEISHU_ASSISTANT",
+        "继续。",
+        f"{REQUIRED_OPENING}\n\n新回答",
+    ]
+    assert session.messages == original_database_history
 
 
 @pytest.mark.parametrize(

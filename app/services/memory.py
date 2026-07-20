@@ -14,6 +14,7 @@ from typing import Any
 from app.services.llm import chat_completion
 from app.config import settings
 from app.services.md_store import MarkdownMemoryStore, MemoryState
+from app.services.story_memory import validate_generated_summary
 from app.services.stage_receipts import (
     ChatSourceIdentity,
     StageUpdateResult,
@@ -1316,13 +1317,14 @@ async def remove_last_chat_md_entries(session_id: int, count: int = 2) -> None:
 # ── Rolling Summary ────────────────────────────────────────────────────────
 
 SUMMARY_SYSTEM_PROMPT = (
-    "你是一个故事回顾助手。根据已有的故事摘要和新的对话内容，生成一份更新后的故事回顾。\n\n"
+    "你是一个故事回顾助手。根据已有的故事摘要和新的对话内容，生成可独立阅读的完整整体剧情回顾。\n\n"
     "要求：\n"
     "- 以故事回顾的方式书写，不要写成干巴巴的列表\n"
     "- 保持故事连贯性：记录角色、关系、情节发展、情感状态\n"
     "- 关注对角色扮演续写最重要的信息\n"
+    "- 不判断剧情线或伏笔是否完成，不输出 [open]、[closed] 或 [done] 标记\n"
+    "- 不输出任何真实 Markdown 标题，不输出代码之外的原始 HTML\n"
     "- 使用与对话相同的语言\n"
-    "- 控制在2000字符以内\n"
     "- 直接输出回顾内容，不要加任何前缀说明"
 )
 
@@ -1352,63 +1354,62 @@ async def update_rolling_summary(
     backend_config: dict[str, Any],
     max_history_chars: int,
 ) -> None:
-    """Summarize messages that will be truncated and save to summary.md."""
-    try:
-        existing_summary = await load_summary(session_id)
+    """Generate one validated overall-plot summary from legacy command input."""
+    existing_summary = await load_summary(session_id)
 
-        # Figure out which messages will be kept (from the end)
-        kept_chars = 0
-        cut_index = len(messages)
-        for i in range(len(messages) - 1, -1, -1):
-            msg_len = len(messages[i].get("content", ""))
-            if kept_chars + msg_len > max_history_chars:
-                cut_index = i + 1
-                break
-            kept_chars += msg_len
+    # Figure out which messages will be kept (from the end)
+    kept_chars = 0
+    cut_index = len(messages)
+    for i in range(len(messages) - 1, -1, -1):
+        msg_len = len(messages[i].get("content", ""))
+        if kept_chars + msg_len > max_history_chars:
+            cut_index = i + 1
+            break
+        kept_chars += msg_len
 
-        truncated_messages = messages[:cut_index]
-        if not truncated_messages:
-            return
+    truncated_messages = messages[:cut_index]
+    if not truncated_messages:
+        return
 
-        # Build text of truncated messages
-        truncated_text = "\n".join(
-            f"{m.get('role', 'user')}: {m.get('content', '')}"
-            for m in truncated_messages
-        )
+    # Build text of truncated messages
+    truncated_text = "\n".join(
+        f"{m.get('role', 'user')}: {m.get('content', '')}"
+        for m in truncated_messages
+    )
 
-        # Truncate to avoid exceeding API request size limits
-        max_text_chars = 80000
-        if len(truncated_text) > max_text_chars:
-            truncated_text = truncated_text[-max_text_chars:]
-            nl = truncated_text.find("\n")
-            if nl > 0:
-                truncated_text = truncated_text[nl + 1:]
+    # Truncate to avoid exceeding API request size limits
+    max_text_chars = 80000
+    if len(truncated_text) > max_text_chars:
+        truncated_text = truncated_text[-max_text_chars:]
+        nl = truncated_text.find("\n")
+        if nl > 0:
+            truncated_text = truncated_text[nl + 1:]
 
-        user_prompt_parts = []
-        if existing_summary:
-            user_prompt_parts.append(f"## 已有故事摘要\n{existing_summary}")
-        user_prompt_parts.append(f"## 需要总结的新对话\n{truncated_text}")
-        user_prompt_parts.append("请生成更新后的完整故事回顾。")
+    user_prompt_parts = []
+    if existing_summary:
+        user_prompt_parts.append(f"已有故事摘要：\n{existing_summary}")
+    user_prompt_parts.append(f"需要总结的新对话：\n{truncated_text}")
+    user_prompt_parts.append("请生成更新后的完整整体剧情回顾。")
 
-        llm_messages = [
-            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": "\n\n".join(user_prompt_parts)},
-        ]
+    llm_messages = [
+        {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": "\n\n".join(user_prompt_parts)},
+    ]
 
-        new_summary = (await chat_completion(
-            provider=backend_config["provider"],
-            api_key=backend_config["api_key"],
-            model=backend_config["model"],
-            base_url=backend_config["base_url"],
-            messages=llm_messages,
-            params=backend_config.get("params", {}),
-        ))["content"]
-
-        await save_summary(session_id, new_summary)
-        logger.info(f"Rolling summary updated for session {session_id}")
-
-    except Exception as exc:
-        logger.error(f"Rolling summary update failed for session {session_id}: {exc}")
+    result = await chat_completion(
+        provider=backend_config["provider"],
+        api_key=backend_config["api_key"],
+        model=backend_config["model"],
+        base_url=backend_config["base_url"],
+        messages=llm_messages,
+        params=backend_config.get("params", {}),
+    )
+    document = validate_generated_summary(
+        result.get("content"),
+        max_tokens=settings.summary_max_tokens,
+    )
+    await save_summary(session_id, document)
+    logger.info("Rolling summary updated for session %s", session_id)
 
 
 async def append_manual_memory(session_id: int, text: str) -> None:

@@ -123,6 +123,7 @@ async def _handle_message(event: dict[str, Any], db: AsyncSession) -> None:
     from app.routers import sessions as sessions_router
 
     try:
+        await sessions_router._ensure_session_history(session, char.name)
         backend = await sessions_router._resolve_backend(session.backend_id, db)
         turn_request = sessions_router.TurnRequest(
             session_id=session.id,
@@ -210,6 +211,13 @@ async def _handle_command(
         )
         session = result.scalar_one_or_none()
         if session:
+            from app.routers import sessions as sessions_router
+
+            char = await db.get(Character, session.character_id)
+            await sessions_router._ensure_session_history(
+                session,
+                char.name if char else None,
+            )
             turn_lock = await memory_service.md_store.turn_lock_for(session.id)
             async with turn_lock:
                 records = await memory_service.md_store.load_chat(session.id)
@@ -220,9 +228,6 @@ async def _handle_command(
                     )
                 else:
                     await memory_service.md_store.invalidate_after(session.id, 0)
-            # Keep the V1 column empty for compatibility; Markdown is authoritative.
-            session.messages = "[]"
-            await db.commit()
             await feishu_client.send_text_message(chat_id, "Session reset. Chat history cleared.")
         else:
             await feishu_client.send_text_message(chat_id, "No active session to reset.")
@@ -256,9 +261,15 @@ async def _handle_command(
         )
         session = result.scalar_one_or_none()
         if session:
+            from app.routers import sessions as sessions_router
+
             char = await db.get(Character, session.character_id)
+            records = await sessions_router._ensure_session_history(
+                session,
+                char.name if char else None,
+            )
             name = char.name if char else "Unknown"
-            msg_count = len(await memory_service.md_store.load_chat(session.id))
+            msg_count = len(records)
             await feishu_client.send_text_message(
                 chat_id, f"Character: {name}\nMessages: {msg_count}\nStatus: {session.status}"
             )
@@ -348,18 +359,13 @@ async def _handle_card_action(body: dict[str, Any], db: AsyncSession) -> None:
         card = feishu_client.build_character_reply_card(char.name, first_msg)
         await feishu_client.send_interactive_card(open_chat_id, card)
 
-        # Markdown is authoritative; the V1 column remains compatibility-only.
+        # Markdown is authoritative; sessions.messages remains a read-only V1 fallback.
         await memory_service.md_store.append_record(
             session.id,
             "assistant",
             first_msg,
             name=char.name,
         )
-        session.messages = json.dumps(
-            [{"role": "assistant", "content": first_msg}],
-            ensure_ascii=False,
-        )
-        await db.commit()
     else:
         await feishu_client.send_text_message(
             open_chat_id,

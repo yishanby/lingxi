@@ -613,6 +613,23 @@ def _truncate_summary(text: str, max_tokens: int) -> str:
     return updated[:low].rstrip()
 
 
+def validate_generated_summary(text: object, *, max_tokens: int) -> str:
+    """Validate and bound one generated overall-plot summary document."""
+    if type(max_tokens) is not int or max_tokens <= 0:
+        raise ValueError("summary token budget must be a positive integer")
+    raw = _completion_text(text, label="summary")
+    _reject_generated_raw_html(raw, label="summary")
+    _validate_generated_headings(raw, (), label="summary")
+    _reject_machine_markers(raw, label="summary")
+    updated = _truncate_summary(raw, max_tokens)
+    if not updated:
+        raise ValueError("summary completion was empty after truncation")
+    _reject_generated_raw_html(updated, label="summary")
+    _validate_generated_headings(updated, (), label="summary")
+    _reject_machine_markers(updated, label="summary")
+    return updated + "\n"
+
+
 async def load_summary_episode_chain(
     store: MarkdownMemoryStore,
     transaction: MarkdownMemoryTransaction,
@@ -709,17 +726,10 @@ async def update_summary_from_episodes(
                 ),
             },
         ]
-        raw = _completion_text(await complete(messages), label="summary")
-        _reject_generated_raw_html(raw, label="summary")
-        _validate_generated_headings(raw, (), label="summary")
-        _reject_machine_markers(raw, label="summary")
-        updated = _truncate_summary(raw, max_tokens)
-        if not updated:
-            raise ValueError("summary completion was empty after truncation")
-        _reject_generated_raw_html(updated, label="summary")
-        _validate_generated_headings(updated, (), label="summary")
-        _reject_machine_markers(updated, label="summary")
-        document = updated + "\n"
+        document = validate_generated_summary(
+            await complete(messages),
+            max_tokens=max_tokens,
+        )
         await transaction.write_text("summary.md", document)
         return StageUpdateResult(
             stage="summary",

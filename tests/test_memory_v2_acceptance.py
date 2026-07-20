@@ -378,6 +378,111 @@ async def test_web_and_http_feishu_write_identical_markdown_record_shapes(
 
 
 @pytest.mark.asyncio
+async def test_http_feishu_reset_leaves_v1_messages_as_read_only_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    active = _session(1, chat_id="chat-1")
+    legacy_messages = active.messages
+    await store.append_pair(
+        1,
+        "旧问题",
+        "旧回答",
+        char_name="灵汐",
+        user_name="用户",
+    )
+
+    class CommandDB:
+        async def get(self, model, object_id):
+            if model is Character and object_id == active.character_id:
+                return SimpleNamespace(name="灵汐")
+            return None
+
+        async def execute(self, statement):
+            return _ScalarResult(active)
+
+        async def commit(self):
+            return None
+
+    sent: list[str] = []
+
+    async def send_text(chat_id: str, text: str) -> None:
+        sent.append(text)
+
+    monkeypatch.setattr(memory, "md_store", store)
+    monkeypatch.setattr(feishu.feishu_client, "send_text_message", send_text)
+
+    await feishu._handle_command(
+        "/reset",
+        "chat-1",
+        "sender-1",
+        CommandDB(),
+    )
+
+    assert await store.load_chat(1) == []
+    assert active.messages == legacy_messages
+    assert sent == ["Session reset. Chat history cleared."]
+
+
+@pytest.mark.asyncio
+async def test_http_feishu_first_message_writes_only_markdown_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MarkdownMemoryStore(tmp_path)
+    character = Character(
+        id=7,
+        name="灵汐",
+        description="",
+        personality="",
+        scenario="",
+        first_message="你好，{{user}}。",
+        example_dialogues="",
+        system_prompt="",
+    )
+
+    class CardDB:
+        def __init__(self) -> None:
+            self.session: Session | None = None
+
+        async def get(self, model, object_id):
+            if model is Character and object_id == character.id:
+                return character
+            return None
+
+        def add(self, value: Session) -> None:
+            self.session = value
+
+        async def commit(self) -> None:
+            if self.session is not None and self.session.id is None:
+                self.session.id = 12
+
+    db = CardDB()
+
+    async def send_card(chat_id: str, card: dict[str, Any]) -> None:
+        return None
+
+    monkeypatch.setattr(memory, "md_store", store)
+    monkeypatch.setattr(feishu.feishu_client, "send_interactive_card", send_card)
+
+    await feishu._handle_card_action(
+        {
+            "action": {"option": "7", "value": {}},
+            "open_chat_id": "chat-1",
+        },
+        db,
+    )
+
+    assert db.session is not None
+    assert db.session.messages == "[]"
+    records = await store.load_chat(12)
+    assert [(record.role, record.content, record.name) for record in records] == [
+        ("assistant", "你好，User。", "灵汐")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stream_failure_leaves_authoritative_chat_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -684,8 +789,8 @@ def test_readme_documents_md_memory_v2_contract() -> None:
         "RAG_INDEX_INTERVAL_MESSAGES",
         "ASSETS_INTERVAL_MESSAGES",
         "TOTAL_TOKEN_BUDGET",
+        "REPLY_TOKEN_RESERVE",
         "MIN_RECENT_MESSAGES",
-        "OUTPUT_RETRY_COUNT",
         "STREAM_GUARD_CHARS",
     ):
         assert variable in readme

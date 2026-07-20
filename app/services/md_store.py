@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import hashlib
+import json
 import os
 import re
 import tempfile
 import unicodedata
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -90,6 +91,10 @@ class InvalidationIntent:
 
 class InvalidationIntentError(ValueError):
     """A persisted invalidation journal cannot be trusted or resolved."""
+
+
+class LegacyChatImportError(ValueError):
+    """A DB-only V1 history cannot be safely imported into Markdown."""
 
 
 _TIMESTAMP_PATTERN = r"(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}|unknown)"
@@ -253,6 +258,22 @@ def _validate_record(record: ChatRecord) -> None:
         raise ValueError("invalid chat record timestamp")
     if not isinstance(record.content, str):
         raise ValueError("invalid chat record content")
+
+
+def _legacy_timestamp(value: object) -> str:
+    if isinstance(value, str) and _VALID_TIMESTAMP.fullmatch(value):
+        return value
+    parsed: dt.datetime | None = None
+    if isinstance(value, dt.datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = dt.datetime.fromisoformat(
+                value.strip().replace("Z", "+00:00")
+            )
+        except ValueError:
+            pass
+    return parsed.strftime("%Y-%m-%d %H:%M") if parsed is not None else "unknown"
 
 
 def _validate_memory_state(state: MemoryState) -> None:
@@ -566,6 +587,83 @@ class MarkdownMemoryStore:
                 user_name=user_name,
                 msg_type=msg_type,
             )
+
+    async def import_legacy_chat(
+        self,
+        session_id: int,
+        legacy_messages: str | None,
+        *,
+        char_name: str,
+        user_name: str,
+    ) -> list[ChatRecord]:
+        """Atomically seed a missing chat.md from the read-only V1 DB fallback."""
+        async with self.transaction(session_id) as transaction:
+            chat_path = self.file_path(session_id, "chat.md")
+            if chat_path.exists():
+                return await transaction.load_chat()
+
+            if not legacy_messages:
+                return []
+            try:
+                messages = json.loads(legacy_messages)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise LegacyChatImportError(
+                    "legacy chat history is invalid JSON"
+                ) from exc
+            if not isinstance(messages, list):
+                raise LegacyChatImportError("legacy chat history must be a list")
+
+            records: list[ChatRecord] = []
+            for message in messages:
+                if not isinstance(message, Mapping):
+                    raise LegacyChatImportError(
+                        "legacy chat history must contain objects"
+                    )
+                role = message.get("role")
+                content = message.get("content")
+                if role not in {"user", "assistant", "system"} or not isinstance(
+                    content, str
+                ):
+                    raise LegacyChatImportError(
+                        "legacy chat history contains an invalid message"
+                    )
+                raw_name = message.get("name")
+                name = (
+                    raw_name
+                    if isinstance(raw_name, str) and raw_name
+                    else user_name
+                    if role == "user"
+                    else char_name
+                    if role == "assistant"
+                    else "System"
+                )
+                raw_type = message.get("msg_type", "ic")
+                msg_type = (
+                    raw_type
+                    if role == "user" and raw_type in {"ic", "ooc"}
+                    else "ic"
+                )
+                records.append(
+                    ChatRecord(
+                        number=0,
+                        role=role,
+                        content=content,
+                        timestamp=_legacy_timestamp(message.get("timestamp")),
+                        name=name,
+                        msg_type=msg_type,
+                    )
+                )
+
+            if records:
+                try:
+                    document = render_chat_records(records)
+                except ValueError as exc:
+                    raise LegacyChatImportError(
+                        "legacy chat history contains invalid metadata"
+                    ) from exc
+                await transaction.write_text("chat.md", document)
+                return await transaction.load_chat()
+            return []
 
     async def load_chat(self, session_id: int) -> list[ChatRecord]:
         async with self.transaction(session_id) as transaction:
