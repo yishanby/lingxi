@@ -334,6 +334,18 @@ class MemoryPipeline:
             records = await transaction.load_chat()
 
         total = records[-1].number if records else 0
+
+        # Skip sessions with excessively long histories that would exceed
+        # LLM context limits (413/502 errors seen for >100k tokens).
+        _MAX_RECORDS_FOR_PIPELINE = 500
+        if total > _MAX_RECORDS_FOR_PIPELINE:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Skipping memory pipeline for session %s: %d messages exceeds limit",
+                session_id, total,
+            )
+            return
+
         source = chat_source_identity(records)
         try:
             state = await self._recover_invalidation(

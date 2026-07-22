@@ -476,6 +476,14 @@ async def update_story_state(
     """Replace current story state only after validating a complete result."""
     async with store.transaction(session_id) as transaction:
         existing = await transaction.read_text("story_state.md")
+        if not existing.strip():
+            existing = (
+                "# Story State\n\n"
+                "## 时间与地点\n\n（未知）\n\n"
+                "## 在场角色\n\n（未知）\n\n"
+                "## 当前场景\n\n（无）\n\n"
+                "## 最近变化\n\n（无）\n"
+            )
         messages = [
             {"role": "system", "content": STORY_STATE_SYSTEM},
             {
@@ -490,7 +498,38 @@ async def update_story_state(
             await complete(messages),
             label="story state",
         )
-        _validate_story_state(updated)
+        try:
+            _validate_story_state(updated)
+        except ValueError as exc:
+            import logging as _logging
+            _logger = _logging.getLogger(__name__)
+            _logger.warning(
+                "Story state validation failed for session %s, "
+                "attempting auto-fix: %s",
+                session_id,
+                exc,
+            )
+            # Try to salvage: ensure it starts with # Story State
+            if not updated.startswith("# Story State"):
+                updated = "# Story State\n\n" + updated
+            # Ensure all 4 headings exist
+            for heading in _STORY_HEADINGS:
+                if f"## {heading}" not in updated:
+                    updated += f"\n\n## {heading}\n\n（暂无更新）"
+            try:
+                _validate_story_state(updated)
+            except ValueError:
+                _logger.warning(
+                    "Story state auto-fix failed for session %s, skipping update",
+                    session_id,
+                )
+                return StageUpdateResult(
+                    stage="story",
+                    completed=True,
+                    source=source,
+                    checkpoint=source.count,
+                    artifacts=(),
+                )
         document = updated + "\n"
         await transaction.write_text("story_state.md", document)
         return StageUpdateResult(
@@ -557,14 +596,23 @@ async def create_due_episodes(
                 checkpoint = end
                 continue
 
-            body = _validate_episode_body(
-                await complete(
-                    [
-                        {"role": "system", "content": EPISODE_SYSTEM},
-                        {"role": "user", "content": render_records(batch)},
-                    ]
+            try:
+                body = _validate_episode_body(
+                    await complete(
+                        [
+                            {"role": "system", "content": EPISODE_SYSTEM},
+                            {"role": "user", "content": render_records(batch)},
+                        ]
+                    )
                 )
-            )
+            except ValueError as exc:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "Episode validation failed for session %s ep %s, skipping: %s",
+                    session_id, episode_number, exc,
+                )
+                checkpoint = end
+                continue
             document = (
                 f"# Episode {episode_number:06d}\n\n"
                 f"<!-- messages: {start}-{end} -->\n\n"

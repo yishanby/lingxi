@@ -88,9 +88,9 @@ class MemoryTaskManager:
 
     async def scan_pending_sessions(self) -> None:
         """Submit every persisted numeric session with checkpointed work due."""
-        store = self.pipeline.store
-        if not store.base.exists():
-            return
+        # Disabled on startup: dozens of backlogged sessions flood the LLM
+        # proxy queue.  Pipeline will run on-demand when new messages arrive.
+        return
         for directory in sorted(store.base.iterdir(), key=lambda path: path.name):
             if not directory.is_dir() or not directory.name.isdecimal():
                 continue
@@ -125,6 +125,9 @@ class MemoryTaskManager:
             cancelled = False
             self.running.add(session_id)
             try:
+                # Delay pipeline execution to avoid competing with
+                # user requests for the LLM proxy (which is serial).
+                await asyncio.sleep(15)
                 backend = await self.backend_resolver(session_id)
                 await self.pipeline.run(session_id, backend)
             except asyncio.CancelledError:

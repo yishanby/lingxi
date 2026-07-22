@@ -497,21 +497,24 @@ async def _prepare_domain_context(
     profiles = await load_mentioned_character_profiles(session.id, content, recent)
 
     rag_context = ""
-    try:
-        from app.services.rag import load_index, search as rag_search
-
-        index = await load_index(session.id)
-        if index.get("chunks"):
-            results = await rag_search(session.id, content, top_k=5)
-            rag_context = "\n\n---\n\n".join(
-                result["text"] for result in results if result["score"] > 0.2
-            )
-    except Exception as exc:
-        logger.warning(
-            "RAG search failed for session %s (%s)",
-            session.id,
-            type(exc).__name__,
-        )
+    # RAG disabled — md-memory-v2 context (story_state + episodes + profiles)
+    # already covers character recall; RAG embedding adds ~2-5s latency per turn.
+    # To re-enable, uncomment the block below.
+    # try:
+    #     from app.services.rag import load_index, search as rag_search
+    #
+    #     index = await load_index(session.id)
+    #     if index.get("chunks"):
+    #         results = await rag_search(session.id, content, top_k=5)
+    #         rag_context = "\n\n---\n\n".join(
+    #             result["text"] for result in results if result["score"] > 0.2
+    #         )
+    # except Exception as exc:
+    #     logger.warning(
+    #         "RAG search failed for session %s (%s)",
+    #         session.id,
+    #         type(exc).__name__,
+    #     )
 
     return DomainContext(
         user_persona=session.user_persona or "",
