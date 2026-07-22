@@ -69,6 +69,7 @@ _LEGACY_ENGLISH_REFUSAL_OPENINGS = (
     "i cannot and will not",
     "i will not engage",
     "i need to be direct",
+    "i need to decline",
     "i appreciate you testing my boundaries",
     "violates my values",
     "i'm designed to decline",
@@ -120,6 +121,9 @@ _LEGACY_CHINESE_REFUSAL_OPENINGS = (
     "如果你对以下方面感兴趣",
     "其他类型的创意写作",
     "我无法继续生成",
+    "我需要说明为什么我无法",
+    "我无法绕过的核心问题",
+    "这些边界不会因为",
 )
 _AMBIGUOUS_CHINESE_TOPIC_OPENINGS = (
     "违反明确同意",
@@ -139,7 +143,7 @@ _CHINESE_REFUSAL_OPENING_VARIANTS = (
 _ENGLISH_FIRST_PERSON_REFUSAL_CONTEXT = re.compile(
     r"\bi\s+(?:(?:cannot|can't|will not|won't|am not able to)\s+"
     r"(?:provide|create|assist|continue|produce|support|help|depict)\b|"
-    r"(?:must\s+)?decline\b|(?:need to|must)\s+stop\b|am stopping\b)|"
+    r"(?:must\s+)?decline\b|(?:need to|must)\s+(?:stop|decline)\b|am stopping\b)|"
     r"\bis not (?:content|something|a scenario) i can "
     r"(?:provide|create|assist|continue|produce|support|help|depict)\b",
     re.IGNORECASE,
@@ -362,6 +366,26 @@ def has_refusal(text: str) -> bool:
         )
     )
     if clear_refusal:
+        return True
+
+    # Also check if the body *contains* (not just starts with) strong refusal
+    # patterns — models sometimes wrap refusals in polite preambles.
+    _STRONG_ENGLISH_REFUSAL_CONTAINS = (
+        "i need to decline",
+        "i cannot and will not",
+        "i will not engage",
+        "i can't engage with this",
+        "core issues i can't work around",
+        "core issues i cannot work around",
+    )
+    _STRONG_CHINESE_REFUSAL_CONTAINS = (
+        "\u6211\u9700\u8981\u8bf4\u660e\u4e3a\u4ec0\u4e48\u6211\u65e0\u6cd5",
+        "\u6211\u65e0\u6cd5\u7ed5\u8fc7\u7684\u6838\u5fc3\u95ee\u9898",
+        "\u8fd9\u4e9b\u8fb9\u754c\u4e0d\u4f1a\u56e0\u4e3a",
+    )
+    if any(opening in folded for opening in _STRONG_ENGLISH_REFUSAL_CONTAINS):
+        return True
+    if any(opening in body for opening in _STRONG_CHINESE_REFUSAL_CONTAINS):
         return True
 
     has_ambiguous_topic = any(
